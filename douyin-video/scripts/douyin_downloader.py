@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-抖音无水印视频下载和文案提取工具
+Douyin watermark-free video downloader and transcript extractor
 
-功能:
-1. 从抖音分享链接获取无水印视频下载链接
-2. 下载视频并提取音频
-3. 使用硅基流动 API 从音频中提取文本
-4. 自动保存文案到文件 (一个视频一个文件夹)
+Features:
+1. Get watermark-free video download link from douyin share link
+2. Download video and extract audio
+3. Extract text from audio via speech-to-text API
+4. Auto save transcript to file (one folder per video)
 
-环境变量:
-- API_KEY: 硅基流动 API 密钥 (用于文案提取功能)
+Environment variables:
+- API_KEY: API key for transcript extraction (any service compatible
+  with OpenAI /v1/audio/transcriptions endpoint)
+- API_BASE_URL: (optional) custom transcription endpoint URL
+- ASR_MODEL: (optional) custom model name
 
-使用示例:
-  # 获取下载链接 (无需 API 密钥)
-  python douyin_downloader.py --link "抖音分享链接" --action info
+Usage:
+  # Get download link (no API key required)
+  python douyin_downloader.py --link "douyin share link" --action info
 
-  # 下载视频
-  python douyin_downloader.py --link "抖音分享链接" --action download --output ./videos
+  # Download video
+  python douyin_downloader.py --link "douyin share link" --action download --output ./videos
 
-  # 提取文案并保存到文件 (需要 API_KEY 环境变量)
-  python douyin_downloader.py --link "抖音分享链接" --action extract --output ./output
+  # Extract transcript and save to file (requires API_KEY env var)
+  python douyin_downloader.py --link "douyin share link" --action extract --output ./output
 """
 
 import os
@@ -29,13 +33,14 @@ import json
 import argparse
 import tempfile
 import shutil
+import urllib.parse
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
 
 
 def check_dependencies():
-    """检查必要的依赖是否已安装"""
+    """Check required dependencies are installed"""
     missing = []
     try:
         import requests
@@ -47,8 +52,8 @@ def check_dependencies():
         missing.append("ffmpeg-python")
 
     if missing:
-        print(f"缺少依赖: {', '.join(missing)}")
-        print(f"请运行: pip install {' '.join(missing)}")
+        print(f"Missing dependencies: {', '.join(missing)}")
+        print(f"Run: pip install {' '.join(missing)}")
         sys.exit(1)
 
 
@@ -57,44 +62,58 @@ check_dependencies()
 import requests
 import ffmpeg
 
-# 请求头，模拟移动端访问
+from asr_backends import transcribe_audio_file, resolve_backend
+
+# Ensure bundled ffmpeg is visible even if PATH was not refreshed
+# (the web server process inherits PATH from its parent shell).
+_BUNDLED_FFMPEG_BIN = Path(__file__).resolve().parent.parent.parent / "ffmpeg" / "ffmpeg-9.0.1-full_build" / "bin"
+if _BUNDLED_FFMPEG_BIN.exists():
+    os.environ["PATH"] = f"{_BUNDLED_FFMPEG_BIN}{os.pathsep}{os.environ.get('PATH', '')}"
+
+# Request headers, simulating mobile access
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) EdgiOS/121.0.2277.107 Version/17.0 Mobile/15E148 Safari/604.1'
 }
 
-# 硅基流动 API 配置
-DEFAULT_API_BASE_URL = "https://api.siliconflow.cn/v1/audio/transcriptions"
-DEFAULT_MODEL = "FunAudioLLM/SenseVoiceSmall"
-
 
 class DouyinProcessor:
-    """抖音视频处理器"""
+    """Douyin video processor"""
 
-    def __init__(self, api_key: str = "", api_base_url: Optional[str] = None, model: Optional[str] = None):
+    def __init__(self, api_key: str = "", provider: str = "", model: str = "", api_base_url: str = ""):
         self.api_key = api_key
-        self.api_base_url = api_base_url or DEFAULT_API_BASE_URL
-        self.model = model or DEFAULT_MODEL
+        self.provider = provider
+        self.model = model
+        self.api_base_url = api_base_url
         self.temp_dir = Path(tempfile.mkdtemp())
 
     def __del__(self):
-        """清理临时目录"""
+        """Clean up temp directory"""
         if hasattr(self, 'temp_dir') and self.temp_dir.exists():
             shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def parse_share_url(self, share_text: str) -> dict:
-        """从分享文本中提取无水印视频链接"""
-        # 提取分享链接
+        """Extract watermark-free video link from share text"""
+        # Extract share link
         urls = re.findall(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', share_text)
         if not urls:
-            raise ValueError("未找到有效的分享链接")
+            raise ValueError("No valid share link found")
 
         share_url = urls[0]
-        share_response = requests.get(share_url, headers=HEADERS)
-        video_id = share_response.url.split("?")[0].strip("/").split("/")[-1]
-        share_url = f'https://www.iesdouyin.com/share/video/{video_id}'
 
-        # 获取视频页面内容
-        response = requests.get(share_url, headers=HEADERS)
+        # Smart: user page links that carry a video in modal_id
+        # e.g. https://www.douyin.com/user/self?modal_id=7656204910022708521&...
+        parsed = urllib.parse.urlparse(share_url)
+        query = urllib.parse.parse_qs(parsed.query)
+        if '/user/' in parsed.path and 'modal_id' in query:
+            video_id = query['modal_id'][0]
+            share_url = f'https://www.iesdouyin.com/share/video/{video_id}'
+        else:
+            share_response = requests.get(share_url, headers=HEADERS, timeout=30)
+            video_id = share_response.url.split("?")[0].strip("/").split("/")[-1]
+            share_url = f'https://www.iesdouyin.com/share/video/{video_id}'
+
+        # Get video page content
+        response = requests.get(share_url, headers=HEADERS, timeout=30)
         response.raise_for_status()
 
         pattern = re.compile(
@@ -103,38 +122,58 @@ class DouyinProcessor:
         )
         find_res = pattern.search(response.text)
 
-        if not find_res or not find_res.group(1):
-            raise ValueError("从HTML中解析视频信息失败")
+        def _parse_router_data(html_text: str) -> Optional[dict]:
+            """Parse share-page HTML into video info; None if not usable."""
+            m = pattern.search(html_text)
+            if not m or not m.group(1):
+                return None
+            try:
+                json_data = json.loads(m.group(1).strip())
+            except Exception:
+                return None
+            VIDEO_ID_PAGE_KEY = "video_(id)/page"
+            NOTE_ID_PAGE_KEY = "note_(id)/page"
+            loader = json_data.get("loaderData", {})
+            page_key = None
+            if VIDEO_ID_PAGE_KEY in loader:
+                page_key = VIDEO_ID_PAGE_KEY
+            elif NOTE_ID_PAGE_KEY in loader:
+                page_key = NOTE_ID_PAGE_KEY
+            if page_key is None:
+                return None
+            video_info_res = loader[page_key].get("videoInfoRes")
+            if not video_info_res or not video_info_res.get("item_list"):
+                # Risk-control shell page: videoInfoRes missing/empty
+                return None
+            data = video_info_res["item_list"][0]
+            play = data.get("video", {}).get("play_addr", {})
+            url_list = play.get("url_list") or []
+            if not url_list:
+                return None
+            vid = data.get("aweme_id") or video_id
+            desc = data.get("desc", "").strip() or f"douyin_{vid}"
+            desc = re.sub(r'[\\/:*?"<>|]', '_', desc)
+            return {
+                "url": url_list[0].replace("playwm", "play"),
+                "title": desc,
+                "video_id": str(vid)
+            }
 
-        # 解析JSON数据
-        json_data = json.loads(find_res.group(1).strip())
-        VIDEO_ID_PAGE_KEY = "video_(id)/page"
-        NOTE_ID_PAGE_KEY = "note_(id)/page"
+        video_info = _parse_router_data(response.text)
 
-        if VIDEO_ID_PAGE_KEY in json_data["loaderData"]:
-            original_video_info = json_data["loaderData"][VIDEO_ID_PAGE_KEY]["videoInfoRes"]
-        elif NOTE_ID_PAGE_KEY in json_data["loaderData"]:
-            original_video_info = json_data["loaderData"][NOTE_ID_PAGE_KEY]["videoInfoRes"]
-        else:
-            raise Exception("无法从JSON中解析视频或图集信息")
+        if video_info is None:
+            # Share page is risk-controlled -> browser fallback via
+            # the desktop video detail page (also handles private-ish videos)
+            from video_detail_browser import fetch_video_info_via_browser
+            video_info = fetch_video_info_via_browser(video_id)
 
-        data = original_video_info["item_list"][0]
-
-        # 获取视频信息
-        video_url = data["video"]["play_addr"]["url_list"][0].replace("playwm", "play")
-        desc = data.get("desc", "").strip() or f"douyin_{video_id}"
-
-        # 替换文件名中的非法字符
-        desc = re.sub(r'[\\/:*?"<>|]', '_', desc)
-
-        return {
-            "url": video_url,
-            "title": desc,
-            "video_id": video_id
-        }
+        # Replace illegal characters in filename
+        desc = re.sub(r'[\\/:*?"<>|]', '_', video_info["title"])
+        video_info["title"] = desc
+        return video_info
 
     def download_video(self, video_info: dict, output_dir: Optional[Path] = None, show_progress: bool = True) -> Path:
-        """下载视频"""
+        """Download video (with retry + longer cooldown for network errors)."""
         if output_dir is None:
             output_dir = self.temp_dir
         else:
@@ -145,50 +184,109 @@ class DouyinProcessor:
         filepath = output_dir / filename
 
         if show_progress:
-            print(f"正在下载视频: {video_info['title']}")
+            print(f"Downloading video: {video_info['title']}")
 
-        response = requests.get(video_info['url'], headers=HEADERS, stream=True)
-        response.raise_for_status()
+        # web CDN URLs (douyinvod.com) require a desktop browser UA + Referer;
+        # mobile CDN URLs work with the mobile UA. Try browser headers first.
+        is_web_cdn = 'douyinvod.com' in video_info['url'] or '-web' in video_info['url'][:60]
+        dl_headers = {
+            'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                           'AppleWebKit/537.36 (KHTML, like Gecko) '
+                           'Chrome/120.0.0.0 Safari/537.36'),
+            'Referer': 'https://www.douyin.com/',
+        } if is_web_cdn else HEADERS
 
-        # 获取文件大小
-        total_size = int(response.headers.get('content-length', 0))
+        # Retry up to 3 times: each attempt uses a slightly different
+        # user-agent to dodge simple CDN blocks, and waits longer on
+        # network errors (5xx, connection reset, timeout) - these are
+        # usually "you're rate-limited, slow down" responses.
+        import time
+        attempts = [
+            dl_headers,
+            HEADERS if is_web_cdn else dl_headers,                       # UA swap
+            {**dl_headers, 'User-Agent': HEADERS['User-Agent']},         # alternate UA
+        ]
+        last_err = None
+        for attempt_idx, headers in enumerate(attempts):
+            try:
+                response = requests.get(
+                    video_info['url'], headers=headers, stream=True, timeout=60
+                )
+                if response.status_code == 403 and attempt_idx < len(attempts) - 1:
+                    continue
+                response.raise_for_status()
 
-        # 下载文件
-        downloaded = 0
-        with open(filepath, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if show_progress and total_size > 0:
-                        progress = downloaded / total_size * 100
-                        print(f"\r下载进度: {progress:.1f}%", end="", flush=True)
+                # Get file size
+                total_size = int(response.headers.get('content-length', 0))
 
-        if show_progress:
-            print(f"\n视频下载完成: {filepath}")
-        return filepath
+                # Download file
+                downloaded = 0
+                with open(filepath, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if show_progress and total_size > 0:
+                                pass  # quiet in batch
+                # quick sanity: file should be > 100KB for a real video
+                if filepath.exists() and filepath.stat().st_size > 100_000:
+                    return filepath
+                last_err = RuntimeError(f"downloaded file too small ({filepath.stat().st_size} bytes)")
+            except (requests.exceptions.RequestException, RuntimeError) as e:
+                last_err = e
+                if show_progress:
+                    print(f"  download attempt {attempt_idx+1} failed: {e}")
+            # Cooldown between attempts: longer for the last retry so we
+            # don't hammer the CDN if it's rate-limiting us.
+            time.sleep(2.0 + attempt_idx * 3.0)
+        raise RuntimeError(f"Error downloading video after {len(attempts)} attempts: {last_err}")
 
     def extract_audio(self, video_path: Path, show_progress: bool = True) -> Path:
-        """从视频文件中提取音频"""
+        """Extract audio from video file.
+
+        Applies a voice-optimization filter chain to improve ASR accuracy:
+        - highpass 200Hz: cut rumble/BGM bass
+        - lowpass 3400Hz: keep speech band (phone-quality focus)
+        - afftdn: FFT denoiser for background noise/music
+        - loudnorm: normalize volume so quiet speech is audible
+        """
         audio_path = video_path.with_suffix('.mp3')
 
         if show_progress:
-            print("正在提取音频...")
+            print("Extracting audio (voice optimized)...")
         try:
+            voice_filter = (
+                "highpass=f=200,"
+                "lowpass=f=3400,"
+                "afftdn=nf=-25,"
+                "loudnorm=I=-16:TP=-1.5:LRA=11"
+            )
             (
                 ffmpeg
                 .input(str(video_path))
-                .output(str(audio_path), acodec='libmp3lame', q=0)
+                .output(str(audio_path), acodec='libmp3lame', q=0, af=voice_filter, ar=16000, ac=1)
                 .run(capture_stdout=True, capture_stderr=True, overwrite_output=True)
             )
             if show_progress:
-                print(f"音频提取完成: {audio_path}")
+                print(f"Audio extracted: {audio_path}")
             return audio_path
         except Exception as e:
-            raise Exception(f"提取音频时出错: {str(e)}")
+            # Fallback to plain extraction if the filter chain fails
+            try:
+                (
+                    ffmpeg
+                    .input(str(video_path))
+                    .output(str(audio_path), acodec='libmp3lame', q=0)
+                    .run(capture_stdout=True, capture_stderr=True, overwrite_output=True)
+                )
+                if show_progress:
+                    print(f"Audio extracted (plain): {audio_path}")
+                return audio_path
+            except Exception as e2:
+                raise Exception(f"Error extracting audio: {str(e2)}")
 
     def get_audio_info(self, audio_path: Path) -> dict:
-        """获取音频文件信息（时长和大小）"""
+        """Get audio file info (duration and size)"""
         try:
             probe = ffmpeg.probe(str(audio_path))
             duration = float(probe['format'].get('duration', 0))
@@ -199,15 +297,15 @@ class DouyinProcessor:
 
     def split_audio(self, audio_path: Path, segment_duration: int = 600, show_progress: bool = True) -> list:
         """
-        将音频分割成多个片段
+        Split audio into segments
 
-        参数:
-            audio_path: 音频文件路径
-            segment_duration: 每段时长（秒），默认 10 分钟
-            show_progress: 是否显示进度
+        Args:
+            audio_path: audio file path
+            segment_duration: segment duration in seconds, default 10 minutes
+            show_progress: whether to show progress
 
-        返回:
-            分割后的音频文件路径列表
+        Returns:
+            list of split audio file paths
         """
         audio_info = self.get_audio_info(audio_path)
         duration = audio_info['duration']
@@ -221,7 +319,7 @@ class DouyinProcessor:
 
         if show_progress:
             total_segments = int(duration / segment_duration) + 1
-            print(f"音频时长 {duration:.0f} 秒，将分割为 {total_segments} 段...")
+            print(f"Audio duration {duration:.0f}s, will split into {total_segments} segments...")
 
         while current_time < duration:
             segment_path = self.temp_dir / f"segment_{segment_index}.mp3"
@@ -236,10 +334,10 @@ class DouyinProcessor:
                 segments.append(segment_path)
 
                 if show_progress:
-                    print(f"  分割片段 {segment_index + 1}: {current_time:.0f}s - {min(current_time + segment_duration, duration):.0f}s")
+                    print(f"  Segment {segment_index + 1}: {current_time:.0f}s - {min(current_time + segment_duration, duration):.0f}s")
 
             except Exception as e:
-                raise Exception(f"分割音频片段 {segment_index} 时出错: {str(e)}")
+                raise Exception(f"Error splitting audio segment {segment_index}: {str(e)}")
 
             current_time += segment_duration
             segment_index += 1
@@ -247,94 +345,78 @@ class DouyinProcessor:
         return segments
 
     def transcribe_single_audio(self, audio_path: Path) -> str:
-        """转录单个音频文件"""
-        files = {
-            'file': (audio_path.name, open(audio_path, 'rb'), 'audio/mpeg'),
-            'model': (None, self.model)
-        }
-
-        headers = {
-            "Authorization": f"Bearer {self.api_key}"
-        }
-
-        try:
-            response = requests.post(self.api_base_url, files=files, headers=headers)
-            response.raise_for_status()
-
-            result = response.json()
-            if 'text' in result:
-                return result['text']
-            else:
-                return response.text
-
-        except Exception as e:
-            raise Exception(f"提取文字时出错: {str(e)}")
-        finally:
-            files['file'][1].close()
+        """Transcribe a single audio file via the configured backend"""
+        return transcribe_audio_file(
+            audio_path,
+            api_key=self.api_key,
+            provider=self.provider or None,
+            model=self.model or None,
+            api_base_url=self.api_base_url or None,
+        )
 
     def extract_text_from_audio(self, audio_path: Path, show_progress: bool = True) -> str:
-        """从音频文件中提取文字（支持大文件自动分段）"""
+        """Extract text from audio file (auto-split large files)"""
         if not self.api_key:
-            raise ValueError("未设置 API 密钥，请设置环境变量 API_KEY")
+            raise ValueError("API key not set, please set API_KEY environment variable")
 
-        # 检查文件大小和时长
+        # Check file size and duration
         audio_info = self.get_audio_info(audio_path)
-        max_duration = 3600  # 1 小时
+        max_duration = 3600  # 1 hour
         max_size = 50 * 1024 * 1024  # 50MB
 
-        # 判断是否需要分段
+        # Determine if splitting is needed
         need_split = audio_info['duration'] > max_duration or audio_info['size'] > max_size
 
         if not need_split:
-            # 文件在限制范围内，直接处理
+            # File within limits, process directly
             if show_progress:
-                print("正在识别语音...")
+                print("Recognizing speech...")
             return self.transcribe_single_audio(audio_path)
 
-        # 需要分段处理
+        # Need to split
         if show_progress:
-            print(f"音频文件较大（时长: {audio_info['duration']:.0f}秒, 大小: {audio_info['size'] / 1024 / 1024:.1f}MB）")
-            print("将自动分段处理...")
+            print(f"Audio file is large (duration: {audio_info['duration']:.0f}s, size: {audio_info['size'] / 1024 / 1024:.1f}MB)")
+            print("Will auto-split...")
 
-        # 分割音频
-        segments = self.split_audio(audio_path, segment_duration=540, show_progress=show_progress)  # 9分钟一段，留余量
+        # Split audio
+        segments = self.split_audio(audio_path, segment_duration=540, show_progress=show_progress)  # 9 min per segment
 
-        # 逐段转录
+        # Transcribe each segment
         all_texts = []
         for i, segment_path in enumerate(segments):
             if show_progress:
-                print(f"正在识别第 {i + 1}/{len(segments)} 段...")
+                print(f"Recognizing segment {i + 1}/{len(segments)}...")
 
             text = self.transcribe_single_audio(segment_path)
             all_texts.append(text)
 
-            # 清理分段文件
+            # Clean up segment file
             if segment_path != audio_path:
                 self.cleanup_files(segment_path)
 
-        # 合并文本
+        # Merge texts
         merged_text = ''.join(all_texts)
 
         if show_progress:
-            print(f"语音识别完成，共处理 {len(segments)} 个片段")
+            print(f"Speech recognition done, processed {len(segments)} segments")
 
         return merged_text
 
     def cleanup_files(self, *file_paths: Path):
-        """清理指定的文件"""
+        """Clean up given files"""
         for file_path in file_paths:
             if file_path.exists():
                 file_path.unlink()
 
 
 def get_video_info(share_link: str) -> dict:
-    """获取视频信息和下载链接"""
+    """Get video info and download link"""
     processor = DouyinProcessor()
     return processor.parse_share_url(share_link)
 
 
 def download_video(share_link: str, output_dir: str = ".") -> Path:
-    """下载视频到指定目录"""
+    """Download video to directory"""
     processor = DouyinProcessor()
     video_info = processor.parse_share_url(share_link)
     return processor.download_video(video_info, Path(output_dir))
@@ -343,32 +425,52 @@ def download_video(share_link: str, output_dir: str = ".") -> Path:
 def extract_text(share_link: str, api_key: Optional[str] = None, output_dir: Optional[str] = None,
                  save_video: bool = False, show_progress: bool = True) -> dict:
     """
-    从视频中提取文案并保存到文件
+    Extract transcript from video and save to file
 
-    返回:
-        dict: 包含 video_info, text, output_path 的字典
+    Returns:
+        dict: containing video_info, text, output_path
     """
-    api_key = api_key or os.getenv('API_KEY') or os.getenv('DOUYIN_API_KEY')
+    api_key = api_key or os.getenv('API_KEY') or os.getenv('DASHSCOPE_API_KEY') or os.getenv('ARK_API_KEY')
     if not api_key:
-        raise ValueError("未设置环境变量 API_KEY，请先获取硅基流动 API 密钥")
+        raise ValueError("API key not set. Set API_KEY (works for all providers) "
+                         "or DASHSCOPE_API_KEY / ARK_API_KEY for those providers.")
 
-    processor = DouyinProcessor(api_key)
+    # Backend resolved from env: ASR_PROVIDER (siliconflow|dashscope|ark)
+    # plus ASR_MODEL / API_BASE_URL overrides
+    backend = resolve_backend()
+    processor = DouyinProcessor(
+        backend['api_key'],
+        provider=backend['provider'],
+        model=backend['model'],
+        api_base_url=backend['api_base_url'] or "",
+    )
 
     if show_progress:
-        print("正在解析抖音分享链接...")
+        print("Parsing douyin share link...")
     video_info = processor.parse_share_url(share_link)
 
     if show_progress:
-        print("正在下载视频...")
+        print("Downloading video...")
     video_path = processor.download_video(video_info, show_progress=show_progress)
 
     if show_progress:
-        print("正在提取音频...")
+        print("Extracting audio...")
     audio_path = processor.extract_audio(video_path, show_progress=show_progress)
 
     if show_progress:
-        print("正在从音频中提取文本...")
+        print("Extracting text from audio...")
     text_content = processor.extract_text_from_audio(audio_path, show_progress=show_progress)
+
+    # Record to the global library file (all extractions in one place)
+    from transcript_library import append_record
+    append_record(
+        video_id=video_info["video_id"],
+        title=video_info["title"],
+        text=text_content,
+        source="single",
+        provider=backend['provider'],
+        model=backend['model'],
+    )
 
     result = {
         "video_info": video_info,
@@ -376,40 +478,40 @@ def extract_text(share_link: str, api_key: Optional[str] = None, output_dir: Opt
         "output_path": None
     }
 
-    # 保存到文件
+    # Save to file
     if output_dir:
         output_base = Path(output_dir)
         video_folder = output_base / video_info['video_id']
         video_folder.mkdir(parents=True, exist_ok=True)
 
-        # 保存文案为 Markdown 格式
+        # Save transcript as Markdown
         transcript_path = video_folder / "transcript.md"
         with open(transcript_path, 'w', encoding='utf-8') as f:
             f.write(f"# {video_info['title']}\n\n")
-            f.write(f"| 属性 | 值 |\n")
+            f.write(f"| Attribute | Value |\n")
             f.write(f"|------|----|\n")
-            f.write(f"| 视频ID | `{video_info['video_id']}` |\n")
-            f.write(f"| 提取时间 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} |\n")
-            f.write(f"| 下载链接 | [点击下载]({video_info['url']}) |\n\n")
+            f.write(f"| Video ID | `{video_info['video_id']}` |\n")
+            f.write(f"| Extracted at | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} |\n")
+            f.write(f"| Download link | [Download]({video_info['url']}) |\n\n")
             f.write(f"---\n\n")
-            f.write(f"## 文案内容\n\n")
+            f.write(f"## Transcript\n\n")
             f.write(text_content)
 
         result["output_path"] = str(video_folder)
 
         if show_progress:
-            print(f"文案已保存到: {transcript_path}")
+            print(f"Transcript saved to: {transcript_path}")
 
-        # 保存视频 (可选)
+        # Save video (optional)
         if save_video:
             saved_video_path = video_folder / f"{video_info['video_id']}.mp4"
             shutil.copy2(video_path, saved_video_path)
             if show_progress:
-                print(f"视频已保存到: {saved_video_path}")
+                print(f"Video saved to: {saved_video_path}")
 
-    # 清理临时文件
+    # Clean up temp files
     if show_progress:
-        print("正在清理临时文件...")
+        print("Cleaning temp files...")
     processor.cleanup_files(video_path, audio_path)
 
     return result
@@ -417,31 +519,37 @@ def extract_text(share_link: str, api_key: Optional[str] = None, output_dir: Opt
 
 def main():
     parser = argparse.ArgumentParser(
-        description="抖音无水印视频下载和文案提取工具",
+        description="Douyin watermark-free video downloader and transcript extractor",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-示例:
-  # 获取视频信息和下载链接
-  python douyin_downloader.py --link "抖音分享链接" --action info
+Examples:
+  # Get video info and download link
+  python douyin_downloader.py --link "douyin share link" --action info
 
-  # 下载视频
-  python douyin_downloader.py --link "抖音分享链接" --action download --output ./videos
+  # Download video
+  python douyin_downloader.py --link "douyin share link" --action download --output ./videos
 
-  # 提取文案并保存到文件 (需要设置 API_KEY 环境变量)
-  python douyin_downloader.py --link "抖音分享链接" --action extract --output ./output
+  # Extract transcript and save to file (requires API_KEY env var)
+  python douyin_downloader.py --link "douyin share link" --action extract --output ./output
 
-  # 提取文案并同时保存视频
-  python douyin_downloader.py --link "抖音分享链接" --action extract --output ./output --save-video
+  # Extract transcript and save video too
+  python douyin_downloader.py --link "douyin share link" --action extract --output ./output --save-video
         """
     )
 
-    parser.add_argument("--link", "-l", required=True, help="抖音分享链接或包含链接的文本")
-    parser.add_argument("--action", "-a", choices=["info", "download", "extract"],
-                        default="info", help="操作类型: info(获取信息), download(下载视频), extract(提取文案)")
-    parser.add_argument("--output", "-o", default="./output", help="输出目录 (默认 ./output)")
-    parser.add_argument("--api-key", "-k", help="硅基流动 API 密钥 (也可通过 API_KEY 环境变量设置)")
-    parser.add_argument("--save-video", "-v", action="store_true", help="提取文案时同时保存视频")
-    parser.add_argument("--quiet", "-q", action="store_true", help="安静模式，减少输出")
+    parser.add_argument("--link", "-l", required=True, help="Douyin share link (video or author profile)")
+    parser.add_argument("--action", "-a", choices=["info", "download", "extract", "batch"],
+                        default="info", help="Action: info(get info), download(download video), extract(extract transcript), batch(extract all author videos)")
+    parser.add_argument("--output", "-o", default="./output", help="Output directory (default ./output)")
+    parser.add_argument("--api-key", "-k", help="API key (can also be set via API_KEY env var)")
+    parser.add_argument("--save-video", "-v", action="store_true", help="Also save video when extracting transcript")
+    parser.add_argument("--quiet", "-q", action="store_true", help="Quiet mode, less output")
+    parser.add_argument("--max-videos", "-m", type=int, default=0, help="batch: max videos to process (0 = all)")
+    parser.add_argument("--workers", "-w", type=int, default=3, help="batch: concurrent workers (1 = serial)")
+    parser.add_argument("--force", action="store_true", help="batch: re-extract videos already in history.json")
+    parser.add_argument("--no-headless", action="store_true", help="batch: show browser window (useful for login)")
+    parser.add_argument("--provider", help="ASR provider: siliconflow | dashscope | ark (default from config/env)")
+    parser.add_argument("--asr-model", help="ASR model name override")
 
     args = parser.parse_args()
 
@@ -449,16 +557,62 @@ def main():
         if args.action == "info":
             info = get_video_info(args.link)
             print("\n" + "=" * 50)
-            print("视频信息:")
+            print("Video info:")
             print("=" * 50)
-            print(f"视频ID: {info['video_id']}")
-            print(f"标题: {info['title']}")
-            print(f"下载链接: {info['url']}")
+            print(f"Video ID: {info['video_id']}")
+            print(f"Title: {info['title']}")
+            print(f"Download link: {info['url']}")
             print("=" * 50)
 
         elif args.action == "download":
             video_path = download_video(args.link, args.output)
-            print(f"\n视频已保存到: {video_path}")
+            print(f"\nVideo saved to: {video_path}")
+
+        elif args.action == "batch":
+            from batch_extractor import batch_extract
+
+            def _on_progress(info):
+                if args.quiet:
+                    return
+                stage = info.get("stage")
+                if stage == "list":
+                    print(f"[list] found {info.get('found', 0)} videos")
+                elif stage == "extract":
+                    status = info.get("status")
+                    if info.get("resumed"):
+                        mark = "R"  # resumed from an interrupted run
+                    else:
+                        mark = {"ok": "+", "skip": "=", "fail": "x"}.get(status, "?")
+                    line = f"[{info.get('index')}/{info.get('total')}] {mark} {info.get('aweme_id')} {info.get('title', '')[:40]}"
+                    if status == "fail":
+                        line += f" | error: {info.get('error', '')[:120]}"
+                    elif status == "ok":
+                        line += f" | {info.get('output', '')}"
+                    print(line)
+                elif stage == "done":
+                    print("=" * 50)
+                    done_line = (f"Batch done. ok={info.get('ok')} skip={info.get('skip')} "
+                                 f"fail={info.get('fail')}")
+                    if info.get("resumed"):
+                        done_line += f" resumed={info.get('resumed')}"
+                    print(done_line)
+                    print(f"Output: {info.get('output_dir')}")
+
+            summary = batch_extract(
+                args.link,
+                output_dir=args.output,
+                api_key=args.api_key,
+                provider=args.provider,
+                model=args.asr_model,
+                max_videos=args.max_videos,
+                force=args.force,
+                headless=not args.no_headless,
+                save_video=args.save_video,
+                on_progress=_on_progress,
+            )
+
+            if args.quiet:
+                print(json.dumps(summary, ensure_ascii=False, indent=2))
 
         elif args.action == "extract":
             result = extract_text(
@@ -471,19 +625,19 @@ def main():
 
             if not args.quiet:
                 print("\n" + "=" * 50)
-                print("提取完成!")
+                print("Extraction complete!")
                 print("=" * 50)
-                print(f"视频ID: {result['video_info']['video_id']}")
-                print(f"标题: {result['video_info']['title']}")
+                print(f"Video ID: {result['video_info']['video_id']}")
+                print(f"Title: {result['video_info']['title']}")
                 if result['output_path']:
-                    print(f"保存位置: {result['output_path']}")
+                    print(f"Saved to: {result['output_path']}")
                 print("=" * 50)
-                print("\n文案内容:\n")
+                print("\nTranscript:\n")
                 print(result['text'][:500] + "..." if len(result['text']) > 500 else result['text'])
                 print("\n" + "=" * 50)
 
     except Exception as e:
-        print(f"\n错误: {e}", file=sys.stderr)
+        print(f"\nError: {e}", file=sys.stderr)
         sys.exit(1)
 
 

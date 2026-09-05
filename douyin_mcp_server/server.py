@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-抖音无水印视频下载并提取文本的 MCP 服务器
+Douyin watermark-free video download and text extraction MCP server
 
-该服务器提供以下功能：
-1. 解析抖音分享链接获取无水印视频链接
-2. 下载视频并提取音频
-3. 从音频中提取文本内容
-4. 自动清理中间文件
+Features:
+1. Parse douyin share links to get watermark-free video URLs
+2. Download video and extract audio
+3. Extract text from audio (speech-to-text)
+4. Auto cleanup of temp files
 
-语音识别支持两个后端：
-- API_KEY: 硅基流动 (https://cloud.siliconflow.cn)，与 README/WebUI/Skill 一致
-- DASHSCOPE_API_KEY: 阿里云百炼，兼容 1.2.x 及更早版本的配置
+Speech-to-text backends (switch via env vars):
+- ASR_PROVIDER: siliconflow (default) | dashscope | ark
+- API_KEY: universal key (or DASHSCOPE_API_KEY / ARK_API_KEY per backend)
+- ASR_MODEL / API_BASE_URL: optional overrides
 """
 
 import os
@@ -29,44 +31,68 @@ from mcp.server.fastmcp import Context
 
 from .asr_module import create_asr_instance
 
+# Make shared backends importable (lives in douyin-video/scripts)
+import sys
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent.parent / "douyin-video" / "scripts")
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
 
-# 创建 MCP 服务器实例
+# Runtime operation log (shared with WebUI): log/operation_logs.txt
+from operation_logger import log_operation
+
+# Create MCP server instance
 mcp = FastMCP("Douyin MCP Server",
               dependencies=["requests", "ffmpeg-python", "tqdm", "dashscope"])
 
-# 请求头，模拟移动端访问
+# Request headers, simulating mobile access
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) EdgiOS/121.0.2277.107 Version/17.0 Mobile/15E148 Safari/604.1'
 }
 
-# 默认 API 配置
+# Default API config
 SILICONFLOW_API_URL = "https://api.siliconflow.cn/v1/audio/transcriptions"
 DEFAULT_SILICONFLOW_MODEL = "FunAudioLLM/SenseVoiceSmall"
 DEFAULT_DASHSCOPE_MODEL = "qwen3-asr-flash"
+DEFAULT_ARK_MODEL = "doubao-seed-1-6-250615"
 
 
 def resolve_asr_config(model: Optional[str] = None) -> tuple:
     """
-    根据环境变量解析语音识别后端配置
+    Resolve speech-to-text backend from environment variables.
 
-    返回: (provider, api_key, model)
+    Env vars:
+    - ASR_PROVIDER: siliconflow (default) | dashscope | ark
+    - API_KEY: universal key (or DASHSCOPE_API_KEY / ARK_API_KEY per backend)
+
+    Returns: (provider, api_key, model)
     """
-    api_key = os.getenv('API_KEY')
-    if api_key:
-        return 'siliconflow', api_key, model or DEFAULT_SILICONFLOW_MODEL
+    provider = (os.getenv('ASR_PROVIDER') or 'siliconflow').lower()
 
-    dashscope_key = os.getenv('DASHSCOPE_API_KEY')
-    if dashscope_key:
-        return 'dashscope', dashscope_key, model or DEFAULT_DASHSCOPE_MODEL
+    key = os.getenv('API_KEY')
+    if provider == 'dashscope':
+        key = key or os.getenv('DASHSCOPE_API_KEY')
+    elif provider == 'ark':
+        key = key or os.getenv('ARK_API_KEY')
 
-    raise ValueError(
-        "未设置 API 密钥：请设置环境变量 API_KEY（硅基流动，https://cloud.siliconflow.cn）"
-        "或 DASHSCOPE_API_KEY（阿里云百炼）"
-    )
+    if not key:
+        raise ValueError(
+            "API key not set: set API_KEY (universal, works for all backends), "
+            "or per-backend DASHSCOPE_API_KEY (Alibaba Bailian) / "
+            "ARK_API_KEY (Volcengine Ark), and pick backend via ASR_PROVIDER "
+            "(siliconflow|dashscope|ark)"
+        )
+
+    default_model = {
+        'siliconflow': DEFAULT_SILICONFLOW_MODEL,
+        'dashscope': DEFAULT_DASHSCOPE_MODEL,
+        'ark': DEFAULT_ARK_MODEL,
+    }.get(provider, DEFAULT_SILICONFLOW_MODEL)
+
+    return provider, key, model or default_model
 
 
 class DouyinProcessor:
-    """抖音视频处理器"""
+    """Douyin video processor"""
 
     def __init__(self, api_key: str = "", provider: str = "siliconflow", model: Optional[str] = None):
         self.api_key = api_key
@@ -75,23 +101,23 @@ class DouyinProcessor:
         self.temp_dir = Path(tempfile.mkdtemp())
 
     def __del__(self):
-        """清理临时目录"""
+        """Clean up temp directory"""
         if hasattr(self, 'temp_dir') and self.temp_dir.exists():
             shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def parse_share_url(self, share_text: str) -> dict:
-        """从分享文本中提取无水印视频链接"""
-        # 提取分享链接
+        """Extract watermark-free video link from share text"""
+        # Extract share link
         urls = re.findall(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', share_text)
         if not urls:
-            raise ValueError("未找到有效的分享链接")
+            raise ValueError("No valid share link found")
 
         share_url = urls[0]
         share_response = requests.get(share_url, headers=HEADERS)
         video_id = share_response.url.split("?")[0].strip("/").split("/")[-1]
         share_url = f'https://www.iesdouyin.com/share/video/{video_id}'
 
-        # 获取视频页面内容
+        # Get video page content
         response = requests.get(share_url, headers=HEADERS)
         response.raise_for_status()
 
@@ -102,9 +128,9 @@ class DouyinProcessor:
         find_res = pattern.search(response.text)
 
         if not find_res or not find_res.group(1):
-            raise ValueError("从HTML中解析视频信息失败")
+            raise ValueError("Failed to parse video info from HTML")
 
-        # 解析JSON数据
+        # Parse JSON data
         json_data = json.loads(find_res.group(1).strip())
         VIDEO_ID_PAGE_KEY = "video_(id)/page"
         NOTE_ID_PAGE_KEY = "note_(id)/page"
@@ -114,15 +140,15 @@ class DouyinProcessor:
         elif NOTE_ID_PAGE_KEY in json_data["loaderData"]:
             original_video_info = json_data["loaderData"][NOTE_ID_PAGE_KEY]["videoInfoRes"]
         else:
-            raise Exception("无法从JSON中解析视频或图集信息")
+            raise Exception("Cannot parse video or gallery info from JSON")
 
         data = original_video_info["item_list"][0]
 
-        # 获取视频信息
+        # Get video info
         video_url = data["video"]["play_addr"]["url_list"][0].replace("playwm", "play")
         desc = data.get("desc", "").strip() or f"douyin_{video_id}"
 
-        # 替换文件名中的非法字符
+        # Replace illegal characters in filename
         desc = re.sub(r'[\\/:*?"<>|]', '_', desc)
 
         return {
@@ -132,7 +158,7 @@ class DouyinProcessor:
         }
 
     def download_video(self, video_info: dict) -> Path:
-        """下载视频到临时目录"""
+        """Download video to temp directory"""
         filename = f"{video_info['video_id']}.mp4"
         filepath = self.temp_dir / filename
 
@@ -147,7 +173,7 @@ class DouyinProcessor:
         return filepath
 
     def extract_audio(self, video_path: Path) -> Path:
-        """从视频文件中提取音频"""
+        """Extract audio from video file"""
         audio_path = video_path.with_suffix('.mp3')
 
         try:
@@ -159,48 +185,22 @@ class DouyinProcessor:
             )
             return audio_path
         except Exception as e:
-            raise Exception(f"提取音频时出错: {str(e)}")
+            raise Exception(f"Error extracting audio: {str(e)}")
 
     def transcribe_audio(self, audio_path: Path, context: Optional[str] = None) -> str:
-        """从音频文件中提取文字"""
-        if self.provider == 'dashscope':
-            return self._transcribe_dashscope(audio_path, context)
-        return self._transcribe_siliconflow(audio_path)
+        """Extract text from audio file (unified multi-backend entry)"""
+        from asr_backends import transcribe_audio_file
 
-    def _transcribe_siliconflow(self, audio_path: Path) -> str:
-        """使用硅基流动 API 转录音频"""
-        headers = {"Authorization": f"Bearer {self.api_key}"}
-
-        with open(audio_path, 'rb') as audio_file:
-            files = {
-                'file': (audio_path.name, audio_file, 'audio/mpeg'),
-                'model': (None, self.model)
-            }
-            response = requests.post(SILICONFLOW_API_URL, files=files, headers=headers)
-
-        if response.status_code != 200:
-            raise Exception(f"语音识别请求失败 (HTTP {response.status_code}): {response.text[:200]}")
-
-        result = response.json()
-        if 'text' not in result:
-            raise Exception(f"语音识别返回异常: {response.text[:200]}")
-        return result['text'] or "未识别到文本内容"
-
-    def _transcribe_dashscope(self, audio_path: Path, context: Optional[str] = None) -> str:
-        """使用阿里云百炼 qwen3-asr 转录音频"""
-        asr = create_asr_instance(self.api_key, self.model)
-        result = asr.recognize_file(
-            file_path=audio_path,
+        return transcribe_audio_file(
+            audio_path,
+            api_key=self.api_key,
+            provider=self.provider or None,
+            model=self.model or None,
             context=context,
-            enable_lid=True,
-            enable_itn=False
         )
-        if not result["success"]:
-            raise Exception(f"语音识别失败: {result['error']}")
-        return result["text"] or "未识别到文本内容"
 
     def cleanup_files(self, *file_paths: Path):
-        """清理指定的文件"""
+        """Clean up given files"""
         for file_path in file_paths:
             if file_path.exists():
                 file_path.unlink()
@@ -209,31 +209,34 @@ class DouyinProcessor:
 @mcp.tool()
 def get_douyin_download_link(share_link: str) -> str:
     """
-    获取抖音视频的无水印下载链接
+    Get watermark-free download link for a douyin video
 
-    参数:
-    - share_link: 抖音分享链接或包含链接的文本
+    Args:
+    - share_link: douyin share link or text containing the link
 
-    返回:
-    - 包含下载链接和视频信息的JSON字符串
+    Returns:
+    - JSON string with download link and video info
     """
     try:
-        processor = DouyinProcessor()  # 获取下载链接不需要API密钥
+        processor = DouyinProcessor()  # no API key needed
         video_info = processor.parse_share_url(share_link)
 
+        log_operation("mcp.get_download_link", video_id=video_info["video_id"],
+                      title=video_info["title"], download_url=video_info["url"])
         return json.dumps({
             "status": "success",
             "video_id": video_info["video_id"],
             "title": video_info["title"],
             "download_url": video_info["url"],
-            "description": f"视频标题: {video_info['title']}",
-            "usage_tip": "可以直接使用此链接下载无水印视频"
+            "description": f"Video title: {video_info['title']}",
+            "usage_tip": "You can download the watermark-free video via this link"
         }, ensure_ascii=False, indent=2)
 
     except Exception as e:
+        log_operation("mcp.get_download_link", status="error", error=str(e))
         return json.dumps({
             "status": "error",
-            "error": f"获取下载链接失败: {str(e)}"
+            "error": f"Failed to get download link: {str(e)}"
         }, ensure_ascii=False, indent=2)
 
 
@@ -245,17 +248,18 @@ async def extract_douyin_text(
     ctx: Context = None
 ) -> str:
     """
-    从抖音分享链接提取视频中的文本内容
+    Extract text content from a douyin share link
 
-    参数:
-    - share_link: 抖音分享链接或包含链接的文本
-    - model: 语音识别模型（可选，硅基流动默认 FunAudioLLM/SenseVoiceSmall，百炼默认 qwen3-asr-flash）
-    - context: 上下文文本，用于提高识别准确率（可选，仅百炼后端支持）
+    Args:
+    - share_link: douyin share link or text containing the link
+    - model: speech-to-text model (optional; defaults depend on provider)
+    - context: context text to improve accuracy (optional, dashscope backend only)
 
-    返回:
-    - 提取的文本内容
+    Returns:
+    - Extracted text content
 
-    注意: 需要设置环境变量 API_KEY（硅基流动）或 DASHSCOPE_API_KEY（阿里云百炼）
+    Note: requires API_KEY (universal) or provider-specific key env var,
+    and ASR_PROVIDER to pick backend (siliconflow|dashscope|ark)
     """
     video_path = None
     audio_path = None
@@ -263,36 +267,43 @@ async def extract_douyin_text(
         provider, api_key, model_name = resolve_asr_config(model)
         processor = DouyinProcessor(api_key, provider, model_name)
 
-        # 解析视频链接
+        # Parse video link
         if ctx:
-            await ctx.info("正在解析抖音分享链接...")
+            await ctx.info("Parsing douyin share link...")
         video_info = await asyncio.to_thread(processor.parse_share_url, share_link)
+        log_operation("mcp.extract_text", status="parsing", provider=provider,
+                      model=model_name, video_id=video_info["video_id"],
+                      title=video_info["title"])
 
-        # 下载视频并提取音频
+        # Download video and extract audio
         if ctx:
-            await ctx.info(f"正在下载视频: {video_info['title']}")
+            await ctx.info(f"Downloading video: {video_info['title']}")
         video_path = await asyncio.to_thread(processor.download_video, video_info)
 
         if ctx:
-            await ctx.info("正在提取音频...")
+            await ctx.info("Extracting audio...")
         audio_path = await asyncio.to_thread(processor.extract_audio, video_path)
 
-        # 语音识别
+        # Speech recognition
         if ctx:
-            await ctx.info("正在从音频中提取文本...")
-        full_context = f"视频标题: {video_info['title']}"
+            await ctx.info("Extracting text from audio...")
+        full_context = f"Video title: {video_info['title']}"
         if context:
             full_context = f"{context}\n{full_context}"
         text_content = await asyncio.to_thread(processor.transcribe_audio, audio_path, full_context)
 
         if ctx:
-            await ctx.info("文本提取完成!")
+            await ctx.info("Text extraction complete!")
+        log_operation("mcp.extract_text", provider=provider, model=model_name,
+                      video_id=video_info["video_id"], title=video_info["title"],
+                      text_length=len(text_content))
         return text_content
 
     except Exception as e:
-        raise Exception(f"提取抖音视频文本失败: {str(e)}")
+        log_operation("mcp.extract_text", status="error", error=str(e))
+        raise Exception(f"Failed to extract douyin video text: {str(e)}")
     finally:
-        # 清理临时文件
+        # Clean up temp files
         for path in (video_path, audio_path):
             if path is not None and path.exists():
                 path.unlink(missing_ok=True)
@@ -306,29 +317,29 @@ def recognize_audio_file(
     model: Optional[str] = None
 ) -> str:
     """
-    识别本地音频文件中的文本
+    Recognize text in a local audio file
 
-    参数:
-    - file_path: 本地音频文件路径
-    - context: 上下文文本，用于提高识别准确率（可选）
-    - language: 指定语言代码（如 'zh', 'en'），可选，默认自动检测
-    - model: 语音识别模型（可选，默认使用qwen3-asr-flash）
+    Args:
+    - file_path: local audio file path
+    - context: context text to improve accuracy (optional)
+    - language: language code like 'zh', 'en' (optional, auto-detected by default)
+    - model: speech-to-text model (optional, uses qwen3-asr-flash by default)
 
-    返回:
-    - 识别的文本内容
+    Returns:
+    - Recognized text content
 
-    注意: 需要设置环境变量 DASHSCOPE_API_KEY
+    Note: requires DASHSCOPE_API_KEY (Alibaba Bailian)
     """
     try:
-        # 从环境变量获取API密钥
+        # Get API key from environment
         api_key = os.getenv('DASHSCOPE_API_KEY')
         if not api_key:
-            raise ValueError("未设置环境变量 DASHSCOPE_API_KEY，请在配置中添加阿里云百炼API密钥")
+            raise ValueError("DASHSCOPE_API_KEY not set, please add the Alibaba Bailian API key to your config")
 
-        # 创建ASR实例
+        # Create ASR instance
         asr = create_asr_instance(api_key, model or DEFAULT_DASHSCOPE_MODEL)
 
-        # 识别音频文件
+        # Recognize audio file
         result = asr.recognize_file(
             file_path=file_path,
             context=context,
@@ -338,6 +349,8 @@ def recognize_audio_file(
         )
 
         if result["success"]:
+            log_operation("mcp.recognize_file", file_path=file_path,
+                          text_length=len(result["text"]), request_id=result.get("request_id"))
             return json.dumps({
                 "status": "success",
                 "text": result["text"],
@@ -346,15 +359,18 @@ def recognize_audio_file(
                 "request_id": result.get("request_id")
             }, ensure_ascii=False, indent=2)
         else:
+            log_operation("mcp.recognize_file", status="error", file_path=file_path,
+                          error=result["error"])
             return json.dumps({
                 "status": "error",
                 "error": result["error"]
             }, ensure_ascii=False, indent=2)
 
     except Exception as e:
+        log_operation("mcp.recognize_file", status="error", error=str(e))
         return json.dumps({
             "status": "error",
-            "error": f"识别音频文件失败: {str(e)}"
+            "error": f"Failed to recognize audio file: {str(e)}"
         }, ensure_ascii=False, indent=2)
 
 
@@ -366,29 +382,29 @@ def recognize_audio_url(
     model: Optional[str] = None
 ) -> str:
     """
-    识别在线音频URL中的文本
+    Recognize text in an online audio URL
 
-    参数:
-    - audio_url: 音频URL链接
-    - context: 上下文文本，用于提高识别准确率（可选）
-    - language: 指定语言代码（如 'zh', 'en'），可选，默认自动检测
-    - model: 语音识别模型（可选，默认使用qwen3-asr-flash）
+    Args:
+    - audio_url: audio URL link
+    - context: context text to improve accuracy (optional)
+    - language: language code like 'zh', 'en' (optional, auto-detected by default)
+    - model: speech-to-text model (optional, uses qwen3-asr-flash by default)
 
-    返回:
-    - 识别的文本内容
+    Returns:
+    - Recognized text content
 
-    注意: 需要设置环境变量 DASHSCOPE_API_KEY
+    Note: requires DASHSCOPE_API_KEY (Alibaba Bailian)
     """
     try:
-        # 从环境变量获取API密钥
+        # Get API key from environment
         api_key = os.getenv('DASHSCOPE_API_KEY')
         if not api_key:
-            raise ValueError("未设置环境变量 DASHSCOPE_API_KEY，请在配置中添加阿里云百炼API密钥")
+            raise ValueError("DASHSCOPE_API_KEY not set, please add the Alibaba Bailian API key to your config")
 
-        # 创建ASR实例
+        # Create ASR instance
         asr = create_asr_instance(api_key, model or DEFAULT_DASHSCOPE_MODEL)
 
-        # 识别音频URL
+        # Recognize audio URL
         result = asr.recognize_url(
             audio_url=audio_url,
             context=context,
@@ -398,6 +414,8 @@ def recognize_audio_url(
         )
 
         if result["success"]:
+            log_operation("mcp.recognize_url", audio_url=audio_url,
+                          text_length=len(result["text"]), request_id=result.get("request_id"))
             return json.dumps({
                 "status": "success",
                 "text": result["text"],
@@ -406,33 +424,38 @@ def recognize_audio_url(
                 "request_id": result.get("request_id")
             }, ensure_ascii=False, indent=2)
         else:
+            log_operation("mcp.recognize_url", status="error", audio_url=audio_url,
+                          error=result["error"])
             return json.dumps({
                 "status": "error",
                 "error": result["error"]
             }, ensure_ascii=False, indent=2)
 
     except Exception as e:
+        log_operation("mcp.recognize_url", status="error", error=str(e))
         return json.dumps({
             "status": "error",
-            "error": f"识别音频URL失败: {str(e)}"
+            "error": f"Failed to recognize audio URL: {str(e)}"
         }, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
 def parse_douyin_video_info(share_link: str) -> str:
     """
-    解析抖音分享链接，获取视频基本信息
+    Parse douyin share link, get basic video info
 
-    参数:
-    - share_link: 抖音分享链接或包含链接的文本
+    Args:
+    - share_link: douyin share link or text containing the link
 
-    返回:
-    - 视频信息（JSON格式字符串）
+    Returns:
+    - Video info (JSON format string)
     """
     try:
-        processor = DouyinProcessor()  # 不需要API密钥来解析链接
+        processor = DouyinProcessor()  # no API key needed
         video_info = processor.parse_share_url(share_link)
 
+        log_operation("mcp.parse_video_info", video_id=video_info["video_id"],
+                      title=video_info["title"], download_url=video_info["url"])
         return json.dumps({
             "video_id": video_info["video_id"],
             "title": video_info["title"],
@@ -441,6 +464,7 @@ def parse_douyin_video_info(share_link: str) -> str:
         }, ensure_ascii=False, indent=2)
 
     except Exception as e:
+        log_operation("mcp.parse_video_info", status="error", error=str(e))
         return json.dumps({
             "status": "error",
             "error": str(e)
@@ -450,13 +474,13 @@ def parse_douyin_video_info(share_link: str) -> str:
 @mcp.resource("douyin://video/{video_id}")
 def get_video_info(video_id: str) -> str:
     """
-    获取指定视频ID的详细信息
+    Get detailed info of a video by ID
 
-    参数:
-    - video_id: 抖音视频ID
+    Args:
+    - video_id: douyin video ID
 
-    返回:
-    - 视频详细信息
+    Returns:
+    - Video details
     """
     share_url = f"https://www.iesdouyin.com/share/video/{video_id}"
     try:
@@ -464,37 +488,39 @@ def get_video_info(video_id: str) -> str:
         video_info = processor.parse_share_url(share_url)
         return json.dumps(video_info, ensure_ascii=False, indent=2)
     except Exception as e:
-        return f"获取视频信息失败: {str(e)}"
+        return f"Failed to get video info: {str(e)}"
 
 
 @mcp.prompt()
 def douyin_text_extraction_guide() -> str:
-    """抖音视频文本提取使用指南"""
+    """Douyin video text extraction usage guide"""
     return """
-# 抖音视频文本提取使用指南
+# Douyin Video Text Extraction Guide
 
-## 功能说明
-这个MCP服务器可以从抖音分享链接中提取视频的文本内容，以及获取无水印下载链接。
+## Features
+This MCP server extracts text from douyin video share links,
+and fetches watermark-free download links.
 
-## 环境变量配置
-语音识别支持两个后端，设置其中一个即可：
-- `API_KEY`: 硅基流动 API 密钥（推荐，获取地址 https://cloud.siliconflow.cn）
-- `DASHSCOPE_API_KEY`: 阿里云百炼 API 密钥（兼容旧版本配置）
+## Environment Variables
+Speech-to-text supports three backends, configure one:
+- `API_KEY` + `ASR_PROVIDER=siliconflow`: SiliconFlow (default, https://cloud.siliconflow.cn)
+- `DASHSCOPE_API_KEY` + `ASR_PROVIDER=dashscope`: Alibaba Bailian qwen3-asr
+- `ARK_API_KEY` + `ASR_PROVIDER=ark`: Volcengine Ark doubao models
 
-## 使用步骤
-1. 复制抖音视频的分享链接
-2. 在Claude Desktop配置中设置环境变量 API_KEY（或 DASHSCOPE_API_KEY）
-3. 使用相应的工具进行操作
+## Usage Steps
+1. Copy the douyin video share link
+2. Set env vars in the Claude Desktop config
+3. Use the appropriate tools
 
-## 工具说明
-- `extract_douyin_text`: 完整的文本提取流程（需要API密钥）
-- `get_douyin_download_link`: 获取无水印视频下载链接（无需API密钥）
-- `parse_douyin_video_info`: 仅解析视频基本信息
-- `recognize_audio_file`: 识别本地音频文件（需要 DASHSCOPE_API_KEY）
-- `recognize_audio_url`: 识别在线音频URL（需要 DASHSCOPE_API_KEY）
-- `douyin://video/{video_id}`: 获取指定视频的详细信息
+## Tools
+- `extract_douyin_text`: full text extraction flow (API key required)
+- `get_douyin_download_link`: watermark-free download link (no API key)
+- `parse_douyin_video_info`: parse basic video info only
+- `recognize_audio_file`: recognize local audio file (DASHSCOPE_API_KEY)
+- `recognize_audio_url`: recognize online audio URL (DASHSCOPE_API_KEY)
+- `douyin://video/{video_id}`: get video details
 
-## Claude Desktop 配置示例
+## Claude Desktop Config Example
 ```json
 {
   "mcpServers": {
@@ -502,22 +528,23 @@ def douyin_text_extraction_guide() -> str:
       "command": "uvx",
       "args": ["douyin-mcp-server"],
       "env": {
-        "API_KEY": "your-siliconflow-api-key"
+        "ASR_PROVIDER": "siliconflow",
+        "API_KEY": "your-api-key"
       }
     }
   }
 }
 ```
 
-## 注意事项
-- 需要提供有效的 API 密钥（通过环境变量）
-- 支持大部分抖音视频格式
-- 获取下载链接无需API密钥
+## Notes
+- A valid API key is required (via environment variables)
+- Most douyin video formats are supported
+- Getting download links needs no API key
 """
 
 
 def main():
-    """启动MCP服务器"""
+    """Start MCP server"""
     mcp.run()
 
 

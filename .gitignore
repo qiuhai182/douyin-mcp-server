@@ -21,6 +21,7 @@ wheels/
 *.egg
 
 # Virtual environments
+.venv/
 venv/
 env/
 ENV/
@@ -51,5 +52,35 @@ temp/
 .env
 output/
 context/
+log/
 prompt.md
 *.mp3
+
+# ---- Project-specific: runtime data & caches ----
+# Browser automation profile cache (cookies, cache, session data)
+.douyin_profile/
+
+# Cookies backup (contains login session - never commit)
+.douyin_cookies.json
+douyin_login_state.json
+
+# Extraction history & caches
+history.json
+profile_cache.json
+operation_logs.jsonl
+
+# WebUI runtime config (contains API keys - never commit)
+web_ui_config.json
+
+# Temp run artifacts
+_start.out
+_start.err
+*.tmp
+
+# Downloadable third-party binaries (fetched at runtime / manual download)
+ffmpeg/
+
+# Probe / one-off debug scripts
+.probe*.py
+_dbg*.py
+_migrate*.py

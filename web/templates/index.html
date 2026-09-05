@@ -175,7 +175,7 @@
                     </div>
                     <div>
                         <h3 class="text-lg font-semibold text-douyin-gray-900">API 配置</h3>
-                        <p class="text-xs text-douyin-gray-400">配置硅基流动 API Key</p>
+                        <p class="text-xs text-douyin-gray-400">选择语音识别服务商并配置密钥</p>
                     </div>
                 </div>
                 <button @click="showSettings = false" class="w-8 h-8 rounded-full hover:bg-douyin-gray-100 flex items-center justify-center">
@@ -185,15 +185,38 @@
                 </button>
             </div>
 
-            <!-- API Key Input -->
+            <!-- Provider Selector -->
             <div class="space-y-4">
                 <div>
-                    <label class="block text-sm font-medium text-douyin-gray-700 mb-2">API Key</label>
+                    <label class="block text-sm font-medium text-douyin-gray-700 mb-2">服务商</label>
+                    <div class="grid grid-cols-3 gap-2">
+                        <template x-for="(meta, pid) in providerConfig.providers" :key="pid">
+                            <button @click="selectProvider(pid)"
+                                    class="px-2 py-2.5 rounded-xl text-xs font-medium border transition-smooth"
+                                    :class="activeProvider === pid
+                                        ? 'border-douyin-red bg-red-50 text-douyin-red'
+                                        : 'border-douyin-gray-200 text-douyin-gray-600 hover:bg-douyin-gray-50'">
+                                <span x-text="meta.label.split(' ')[0]"></span>
+                                <span x-show="meta.has_key" class="block text-[10px] text-green-600 mt-0.5">已配置</span>
+                                <span x-show="!meta.has_key" class="block text-[10px] text-douyin-gray-400 mt-0.5">未配置</span>
+                            </button>
+                        </template>
+                    </div>
+                </div>
+
+                <!-- API Key Input (per provider) -->
+                <div>
+                    <label class="block text-sm font-medium text-douyin-gray-700 mb-2">
+                        API Key
+                        <span class="text-douyin-gray-400 font-normal" x-text="'（' + (providerConfig.providers[activeProvider]?.label || '') + '）'"></span>
+                    </label>
                     <div class="relative">
                         <input
                             :type="showApiKey ? 'text' : 'password'"
                             x-model="apiKeyInput"
-                            placeholder="sk-xxxxxxxxxxxxxxxx"
+                            :placeholder="providerConfig.providers[activeProvider]?.has_key
+                                ? ('已保存: ' + providerConfig.providers[activeProvider]?.api_key_masked + '（留空保持不变）')
+                                : 'sk-xxxxxxxxxxxxxxxx'"
                             class="w-full px-4 py-3 pr-20 text-sm border border-douyin-gray-200 rounded-xl focus-ring transition-smooth font-mono"
                         >
                         <div class="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1">
@@ -216,26 +239,75 @@
                             </button>
                         </div>
                     </div>
-                    <p class="mt-2 text-xs text-douyin-gray-400">API Key 仅保存在浏览器本地，不会上传到服务器</p>
+                    <p class="mt-2 text-xs text-douyin-gray-400">密钥保存在服务器配置文件 web_ui_config.json 中，切换服务商即时生效</p>
+                </div>
+
+                <!-- Model Input (per provider, optional) -->
+                <div>
+                    <label class="block text-sm font-medium text-douyin-gray-700 mb-2">
+                        模型 <span class="text-douyin-gray-400 font-normal">（可选，默认 <span x-text="providerConfig.providers[activeProvider]?.default_model || ''"></span>）</span>
+                    </label>
+                    <input
+                        x-model="modelInput"
+                        :placeholder="providerConfig.providers[activeProvider]?.default_model || ''"
+                        class="w-full px-4 py-3 text-sm border border-douyin-gray-200 rounded-xl focus-ring transition-smooth font-mono"
+                    >
+                </div>
+
+                <!-- Base URL Input (per provider, optional) -->
+                <div>
+                    <label class="block text-sm font-medium text-douyin-gray-700 mb-2">
+                        接口地址 <span class="text-douyin-gray-400 font-normal">（可选，用于中转站/自建服务）</span>
+                    </label>
+                    <input
+                        x-model="baseUrlInput"
+                        :placeholder="providerConfig.providers[activeProvider]?.api_base_url || ''"
+                        class="w-full px-4 py-3 text-sm border border-douyin-gray-200 rounded-xl focus-ring transition-smooth font-mono text-xs"
+                    >
+                </div>
+
+                <!-- Polish Settings -->
+                <div class="border border-douyin-gray-100 rounded-xl p-4 space-y-3">
+                    <div class="flex items-center justify-between">
+                        <label class="text-sm font-medium text-douyin-gray-700">文案润色（AI 纠错）</label>
+                        <button @click="polishInput.enabled = !polishInput.enabled"
+                                class="relative inline-flex h-6 w-11 items-center rounded-full transition-smooth"
+                                :class="polishInput.enabled ? 'bg-green-500' : 'bg-douyin-gray-200'">
+                            <span class="inline-block h-4 w-4 transform rounded-full bg-white transition-transform"
+                                  :class="polishInput.enabled ? 'translate-x-6' : 'translate-x-1'"></span>
+                        </button>
+                    </div>
+                    <div x-show="polishInput.enabled" class="space-y-2">
+                        <p class="text-xs text-douyin-gray-400">转写完成后用大模型纠错（修同音字/加标点），需一个兼容 OpenAI chat 的接口与模型</p>
+                        <input x-model="polishInput.model"
+                               placeholder="模型，如 Qwen/Qwen3-8B（留空用默认）"
+                               class="w-full px-3 py-2 text-xs border border-douyin-gray-200 rounded-lg font-mono">
+                        <input x-model="polishInput.api_base_url"
+                               placeholder="接口地址（留空用硅基流动）"
+                               class="w-full px-3 py-2 text-xs border border-douyin-gray-200 rounded-lg font-mono">
+                        <input :type="showApiKey ? 'text' : 'password'" x-model="polishInput.api_key"
+                               :placeholder="polishConfigured ? '已保存润色 Key（留空保持不变）' : '润色用的 API Key'"
+                               class="w-full px-3 py-2 text-xs border border-douyin-gray-200 rounded-lg font-mono">
+                    </div>
                 </div>
 
                 <!-- Status Indicator -->
-                <div class="p-4 rounded-xl" :class="apiKeyInput ? 'bg-green-50 border border-green-100' : 'bg-douyin-gray-50'">
+                <div class="p-4 rounded-xl" :class="providerConfig.providers[activeProvider]?.has_key || apiKeyInput ? 'bg-green-50 border border-green-100' : 'bg-douyin-gray-50'">
                     <div class="flex items-center gap-3">
                         <div class="w-10 h-10 rounded-lg flex items-center justify-center"
-                             :class="apiKeyInput ? 'bg-green-100' : 'bg-douyin-gray-200'">
-                            <svg x-show="apiKeyInput" class="w-5 h-5 text-green-600" fill="currentColor" viewBox="0 0 20 20">
+                             :class="providerConfig.providers[activeProvider]?.has_key || apiKeyInput ? 'bg-green-100' : 'bg-douyin-gray-200'">
+                            <svg x-show="providerConfig.providers[activeProvider]?.has_key || apiKeyInput" class="w-5 h-5 text-green-600" fill="currentColor" viewBox="0 0 20 20">
                                 <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd"/>
                             </svg>
-                            <svg x-show="!apiKeyInput" class="w-5 h-5 text-douyin-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <svg x-show="!(providerConfig.providers[activeProvider]?.has_key || apiKeyInput)" class="w-5 h-5 text-douyin-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
                             </svg>
                         </div>
                         <div>
-                            <p class="text-sm font-medium" :class="apiKeyInput ? 'text-green-700' : 'text-douyin-gray-600'"
-                               x-text="apiKeyInput ? 'API Key 已配置' : '未配置 API Key'"></p>
-                            <p class="text-xs" :class="apiKeyInput ? 'text-green-600' : 'text-douyin-gray-400'"
-                               x-text="apiKeyInput ? '可以使用文案提取功能' : '仅可获取视频信息'"></p>
+                            <p class="text-sm font-medium" :class="providerConfig.providers[activeProvider]?.has_key || apiKeyInput ? 'text-green-700' : 'text-douyin-gray-600'"
+                               x-text="(providerConfig.providers[activeProvider]?.has_key || apiKeyInput) ? '当前服务商已配置' : '当前服务商未配置'"></p>
+                            <p class="text-xs" :class="providerConfig.providers[activeProvider]?.has_key || apiKeyInput ? 'text-green-600' : 'text-douyin-gray-400'"
+                               x-text="(providerConfig.providers[activeProvider]?.has_key || apiKeyInput) ? '可以使用文案提取功能' : '仅可获取视频信息'"></p>
                         </div>
                     </div>
                 </div>
@@ -336,14 +408,14 @@
                                 </svg>
                             </button>
                         </div>
-                        <p class="mt-2 text-xs text-douyin-gray-400">提示：按 <kbd class="px-1.5 py-0.5 bg-douyin-gray-100 rounded text-douyin-gray-600">⌘</kbd> + <kbd class="px-1.5 py-0.5 bg-douyin-gray-100 rounded text-douyin-gray-600">Enter</kbd> 快速提取</p>
+                        <p class="mt-2 text-xs text-douyin-gray-400">提示：按 <kbd class="px-1.5 py-0.5 bg-douyin-gray-100 rounded text-douyin-gray-600">?</kbd> + <kbd class="px-1.5 py-0.5 bg-douyin-gray-100 rounded text-douyin-gray-600">Enter</kbd> 快速提取</p>
                     </div>
 
                     <!-- Action Buttons -->
                     <div class="flex gap-3">
                         <button
                             @click="extractInfo"
-                            :disabled="!url || loading"
+                            :disabled="!url || loading || batchRunning"
                             class="flex-1 h-11 bg-douyin-gray-100 hover:bg-douyin-gray-200 text-douyin-gray-700 font-medium text-sm rounded-xl transition-smooth disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
@@ -352,13 +424,77 @@
                         </button>
                         <button
                             @click="extractText"
-                            :disabled="!url || loading || !apiKeyConfigured"
+                            :disabled="!url || loading || !apiKeyConfigured || batchRunning"
                             class="flex-1 h-11 bg-gradient-douyin hover:opacity-90 text-white font-medium text-sm rounded-xl transition-smooth disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 shadow-lg shadow-douyin-red/20">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
                             </svg>
                             提取文案
                         </button>
+                    </div>
+
+                    <!-- Batch Extract Button (author profile links) -->
+                    <div class="mt-3">
+                        <button
+                            @click="batchExtract"
+                            :disabled="!url || loading || batchRunning || !apiKeyConfigured"
+                            class="w-full h-11 border-2 border-douyin-red/30 hover:border-douyin-red hover:bg-red-50 text-douyin-red font-medium text-sm rounded-xl transition-smooth disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/>
+                            </svg>
+                            <span x-text="batchRunning ? '批量提取中...' : '批量提取作者全部文案'"></span>
+                        </button>
+                        <label class="mt-2 flex items-center gap-2 text-xs text-douyin-gray-500 cursor-pointer select-none">
+                            <input type="checkbox" x-model="batchUseCache" class="accent-douyin-red w-3.5 h-3.5">
+                            <span>使用缓存视频列表补齐（不重新滚动主页，只重试上次失败的视频）</span>
+                        </label>
+                        <p class="mt-2 text-xs text-douyin-gray-400">粘贴作者主页链接后使用；自动跳过已提取成功的视频，失败的会自动重试。若抓取不全，先点「登录抖音」一次（浏览器缓存会永久记住，不再弹窗）。</p>
+                        <button
+                            @click="douyinLogin"
+                            :disabled="batchRunning"
+                            class="mt-2 w-full h-9 border border-douyin-gray-200 hover:border-douyin-gray-400 text-douyin-gray-600 text-xs rounded-lg transition-smooth disabled:opacity-50 flex items-center justify-center gap-2">
+                            <span x-text="douyinLoginBtn.douyinLoginBtnLabel || douyinLoginLabel"></span>
+                        </button>
+                        <p class="mt-1 text-xs" :class="douyinLoggedIn ? 'text-green-600' : 'text-douyin-gray-400'"
+                           x-text="douyinLoginStatusText"></p>
+                    </div>
+
+                    <!-- Batch Progress Panel -->
+                    <div x-show="batchRunning || batchLogs.length" x-transition
+                         class="mt-4 bg-douyin-gray-50 rounded-xl p-4">
+                        <div class="flex items-center justify-between mb-2">
+                            <p class="text-sm font-medium text-douyin-gray-700">
+                                批量进度
+                                <span x-show="batchTotal" class="text-douyin-gray-400 font-normal">
+                                    (<span x-text="batchDone"></span>/<span x-text="batchTotal"></span>)
+                                </span>
+                            </p>
+                            <div class="flex items-center gap-2">
+                            <button x-show="batchRunning && !batchPaused" @click="batchPause()"
+                                    class="text-xs px-2.5 py-1 rounded-lg bg-amber-50 text-amber-700 hover:bg-amber-100 border border-amber-200 transition-smooth flex items-center gap-1">
+                                <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
+                                    <path d="M6 4h4v16H6zM14 4h4v16h-4z"/>
+                                </svg>
+                                暂停
+                            </button>
+                            <button x-show="batchRunning && batchPaused" @click="batchResume()"
+                                    class="text-xs px-2.5 py-1 rounded-lg bg-green-50 text-green-700 hover:bg-green-100 border border-green-200 transition-smooth flex items-center gap-1 animate-pulse-soft">
+                                <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
+                                    <path d="M8 5v14l11-7z"/>
+                                </svg>
+                                继续
+                            </button>
+                            <span x-show="batchPaused" class="text-xs text-amber-600">已暂停（当前视频完成后生效）</span>
+                            <button x-show="!batchRunning && batchLogs.length" @click="batchLogs = []; batchTotal = 0; batchDone = 0"
+                                    class="text-xs text-douyin-gray-400 hover:text-douyin-gray-600">清空</button>
+                        </div>
+                        </div>
+                        <div class="max-h-56 overflow-y-auto font-mono text-xs space-y-1" id="batch-log">
+                            <template x-for="(log, idx) in batchLogs" :key="idx">
+                                <p :class="log.type === 'error' ? 'text-red-500' : log.type === 'skip' ? 'text-douyin-gray-400' : log.type === 'ok' ? 'text-green-600' : log.type === 'warn' ? 'text-yellow-500' : 'text-douyin-gray-600'"
+                                   x-text="log.text"></p>
+                            </template>
+                        </div>
                     </div>
 
                     <!-- API Warning -->
@@ -605,7 +741,7 @@
     <!-- Footer -->
     <footer class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         <div class="flex flex-col sm:flex-row items-center justify-between gap-4 text-sm text-douyin-gray-400">
-            <p>Made with <span class="text-douyin-red">♥</span> by <a href="https://github.com/yzfly" target="_blank" class="hover:text-douyin-red transition-colors">yzfly</a></p>
+            <p>Made with <span class="text-douyin-red">?</span> by <a href="https://github.com/yzfly" target="_blank" class="hover:text-douyin-red transition-colors">yzfly</a></p>
             <div class="flex items-center gap-4">
                 <a href="https://github.com/yzfly/douyin-mcp-server" target="_blank" class="hover:text-douyin-red transition-colors flex items-center gap-1">
                     <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
@@ -636,20 +772,88 @@
                 showApiKey: false,
                 apiKey: '',
                 apiKeyInput: '',
+                modelInput: '',
+                baseUrlInput: '',
+                activeProvider: 'siliconflow',
+                providerConfig: { providers: {} },
                 serverApiKeyConfigured: false,
+                batchRunning: false,
+                batchLogs: [],
+                batchTotal: 0,
+                batchDone: 0,
+                batchUseCache: false,
+                douyinLoggedIn: false,
+                douyinLoginLabel: '登录抖音（可选，抓取不全时使用）',
+                polishInput: { enabled: false, api_key: '', api_base_url: '', model: '' },
+                polishConfigured: false,
+
+                get polishEnabled() {
+                    return this.providerConfig.polish?.enabled || false;
+                },
+
+                get douyinLoginStatusText() {
+                    if (this.douyinLoggedIn) return '抖音会话有效（浏览器缓存），可直接批量';
+                    return '未登录：匿名只能抓到部分列表';
+                },
+
+                get douyinLoginBtn() {
+                    return {};
+                },
+
+                async checkDouyinLogin() {
+                    try {
+                        const res = await fetch('/api/douyin/login-status');
+                        const data = await res.json();
+                        this.douyinLoggedIn = !!data.logged_in;
+                    } catch (e) { /* ignore */ }
+                },
+
+                async douyinLogin() {
+                    if (this.batchRunning) return;
+                    const prevLabel = this.douyinLoginLabel;
+                    this.douyinLoginLabel = '浏览器窗口已打开，请在窗口中登录...';
+                    this.addBatchLog('正在打开浏览器窗口，请在其中登录抖音（扫码/短信/密码均可）...', 'warn');
+                    try {
+                        const res = await fetch('/api/douyin/login', { method: 'POST' });
+                        const reader = res.body.getReader();
+                        const decoder = new TextDecoder();
+                        let buf = '';
+                        for (;;) {
+                            const { done, value } = await reader.read();
+                            if (done) break;
+                            buf += decoder.decode(value, { stream: true });
+                            let idx;
+                            while ((idx = buf.indexOf('\n\n')) >= 0) {
+                                const line = buf.slice(0, idx).trim();
+                                buf = buf.slice(idx + 2);
+                                if (!line.startsWith('data:')) continue;
+                                try {
+                                    const evt = JSON.parse(line.slice(5));
+                                    if (evt.stage === 'notice') {
+                                        this.addBatchLog(evt.message, 'warn');
+                                    } else if (evt.stage === 'done') {
+                                        this.douyinLoggedIn = !!evt.ok;
+                                        this.addBatchLog(evt.ok ? '抖音登录成功，会话已保存到浏览器缓存' : '登录未完成或超时，可重试', evt.ok ? 'ok' : 'error');
+                                        this.showToast(evt.ok ? '抖音登录成功' : '登录未完成');
+                                    } else if (evt.stage === 'error') {
+                                        this.addBatchLog('登录失败: ' + (evt.error || ''), 'error');
+                                    }
+                                } catch (e) { /* ignore */ }
+                            }
+                        }
+                    } catch (e) {
+                        this.addBatchLog('登录失败: ' + (e.message || e), 'error');
+                    } finally {
+                        this.douyinLoginLabel = prevLabel;
+                    }
+                },
 
                 get apiKeyConfigured() {
-                    return this.serverApiKeyConfigured || !!this.apiKey;
+                    const cur = this.providerConfig.providers[this.activeProvider];
+                    return (cur && cur.has_key) || !!this.apiKeyInput || !!this.apiKey || this.serverApiKeyConfigured;
                 },
 
                 async checkHealth() {
-                    // Load API key from localStorage
-                    const savedKey = localStorage.getItem('douyin_api_key');
-                    if (savedKey) {
-                        this.apiKey = savedKey;
-                        this.apiKeyInput = savedKey;
-                    }
-
                     try {
                         const res = await fetch('/api/health');
                         const data = await res.json();
@@ -657,24 +861,225 @@
                     } catch (e) {
                         console.error('Health check failed:', e);
                     }
+                    await this.loadConfig();
+                    await this.checkDouyinLogin();
                 },
 
-                saveApiKey() {
-                    if (this.apiKeyInput) {
-                        this.apiKey = this.apiKeyInput;
-                        localStorage.setItem('douyin_api_key', this.apiKeyInput);
-                        this.showSettings = false;
-                        this.showToast('API Key 已保存');
-                    } else {
-                        this.showToast('请输入 API Key');
+                async loadConfig() {
+                    try {
+                        const res = await fetch('/api/config');
+                        this.providerConfig = await res.json();
+                        this.activeProvider = this.providerConfig.active_provider || 'siliconflow';
+                        this.syncProviderInputs();
+                        // Load polish settings
+                        const polish = this.providerConfig.polish || {};
+                        this.polishConfigured = !!polish.api_key;
+                        this.polishInput.enabled = !!polish.enabled;
+                        this.polishInput.model = polish.model || '';
+                        this.polishInput.api_base_url = polish.api_base_url || '';
+                        this.polishInput.api_key = '';
+                    } catch (e) {
+                        console.error('Load config failed:', e);
                     }
                 },
 
-                clearApiKey() {
-                    this.apiKey = '';
+                syncProviderInputs() {
+                    // Prefill inputs with stored (non-secret) model/base URL;
+                    // key field stays empty with masked hint in placeholder.
+                    const cur = this.providerConfig.providers[this.activeProvider] || {};
+                    this.modelInput = (cur.model && cur.model !== cur.default_model) ? cur.model : '';
+                    this.baseUrlInput = (cur.api_base_url && cur.api_base_url !== '') ? cur.api_base_url : '';
                     this.apiKeyInput = '';
-                    localStorage.removeItem('douyin_api_key');
-                    this.showToast('API Key 已清除');
+                },
+
+                selectProvider(pid) {
+                    this.activeProvider = pid;
+                    this.syncProviderInputs();
+                },
+
+                async saveConfig() {
+                    const cur = this.providerConfig.providers[this.activeProvider] || {};
+                    const payload = {
+                        active_provider: this.activeProvider,
+                        providers: {
+                            [this.activeProvider]: {
+                                api_key: this.apiKeyInput,  // empty = keep stored
+                                model: this.modelInput,
+                                api_base_url: this.baseUrlInput,
+                            }
+                        },
+                        polish: {
+                            enabled: this.polishInput.enabled,
+                            api_key: this.polishInput.api_key,  // empty = keep stored
+                            api_base_url: this.polishInput.api_base_url,
+                            model: this.polishInput.model,
+                        }
+                    };
+                    try {
+                        const res = await fetch('/api/config', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(payload)
+                        });
+                        if (!res.ok) {
+                            const err = await res.json().catch(() => ({}));
+                            throw new Error(err.detail || '保存失败');
+                        }
+                        await this.loadConfig();
+                        this.showSettings = false;
+                        this.showToast('配置已保存并生效');
+                    } catch (e) {
+                        this.showToast(e.message || '保存失败');
+                    }
+                },
+
+                saveApiKey() {
+                    this.saveConfig();
+                },
+
+                async clearApiKey() {
+                    try {
+                        await fetch('/api/config', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                active_provider: this.activeProvider,
+                                providers: { [this.activeProvider]: { api_key: '-' } }
+                            })
+                        });
+                        await this.loadConfig();
+                        this.showToast('已清除当前服务商的 API Key');
+                    } catch (e) {
+                        this.showToast('清除失败');
+                    }
+                },
+
+                addBatchLog(text, type = 'info') {
+                    this.batchLogs.push({ text, type });
+                    if (this.batchLogs.length > 500) this.batchLogs.shift();
+                    this.$nextTick(() => {
+                        const el = document.getElementById('batch-log');
+                        if (el) el.scrollTop = el.scrollHeight;
+                    });
+                },
+
+                async batchPause() {
+                    try {
+                        const res = await fetch('/api/profile/batch/pause', { method: 'POST' });
+                        if (!res.ok) {
+                            const err = await res.json().catch(() => ({}));
+                            throw new Error(err.detail || '暂停失败');
+                        }
+                        this.batchPaused = true;
+                        this.addBatchLog('已请求暂停：当前视频完成后停止拉取新视频...', 'warn');
+                    } catch (e) {
+                        this.showToast(e.message || '暂停失败');
+                    }
+                },
+
+                async batchResume() {
+                    try {
+                        const res = await fetch('/api/profile/batch/resume', { method: 'POST' });
+                        if (!res.ok) {
+                            const err = await res.json().catch(() => ({}));
+                            throw new Error(err.detail || '继续失败');
+                        }
+                        this.batchPaused = false;
+                        this.addBatchLog('已继续，开始处理剩余视频...', 'ok');
+                    } catch (e) {
+                        this.showToast(e.message || '继续失败');
+                    }
+                },
+
+                async batchExtract() {
+                    if (!this.url || this.batchRunning) return;
+                    if (!this.apiKeyConfigured) {
+                        this.showSettings = true;
+                        return;
+                    }
+
+                    this.batchRunning = true;
+                    this.batchPaused = false;
+                    this.batchLogs = [];
+                    this.batchTotal = 0;
+                    this.batchDone = 0;
+                    this.resetState();
+                    this.loading = true;
+                    this.loadingText = '批量提取中，正在读取作者视频列表...';
+
+                    try {
+                        const res = await fetch('/api/profile/batch', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                url: this.url,
+                                provider: this.activeProvider,
+                                use_cache: this.batchUseCache
+                            })
+                        });
+
+                        if (!res.ok) {
+                            const err = await res.json().catch(() => ({}));
+                            throw new Error(err.detail || '批量任务启动失败');
+                        }
+
+                        // Read SSE-style stream
+                        const reader = res.body.getReader();
+                        const decoder = new TextDecoder();
+                        let buf = '';
+                        while (true) {
+                            const { done, value } = await reader.read();
+                            if (done) break;
+                            buf += decoder.decode(value, { stream: true });
+                            const lines = buf.split('\n');
+                            buf = lines.pop() || '';
+                            for (const line of lines) {
+                                if (!line.startsWith('data: ')) continue;
+                                let evt;
+                                try { evt = JSON.parse(line.slice(6)); } catch (e) { continue; }
+                                this.handleBatchEvent(evt);
+                            }
+                        }
+                    } catch (e) {
+                        this.addBatchLog('批量任务失败: ' + (e.message || e), 'error');
+                        this.error = e.message || '批量任务失败';
+                    } finally {
+                        this.batchRunning = false;
+                        this.loading = false;
+                    }
+                },
+
+                handleBatchEvent(evt) {
+                    const stage = evt.stage;
+                    if (stage === 'list') {
+                        if (evt.notice) {
+                            this.addBatchLog(evt.notice, 'warn');
+                            return;
+                        }
+                        const n = evt.found || 0;
+                        this.addBatchLog(`已发现 ${n} 个视频...`);
+                    } else if (stage === 'extract') {
+                        if (evt.index === 1 && evt.total) {
+                            this.batchTotal = evt.total;
+                            this.addBatchLog(`开始处理 ${evt.total} 个视频（已跳过之前提取过的）`);
+                        }
+                        if (evt.status === 'ok') {
+                            this.batchDone++;
+                            this.addBatchLog(`[OK] ${evt.aweme_id} ${evt.title || ''}`, 'ok');
+                        } else if (evt.status === 'skip') {
+                            this.batchDone++;
+                            this.addBatchLog(`[跳过] ${evt.aweme_id} ${evt.title || ''}（已提取过）`, 'skip');
+                        } else if (evt.status === 'fail') {
+                            this.batchDone++;
+                            this.addBatchLog(`[失败] ${evt.aweme_id} ${evt.title || ''} - ${evt.error || ''}`, 'error');
+                        }
+                    } else if (stage === 'done') {
+                        this.addBatchLog(`完成：成功 ${evt.ok}，跳过 ${evt.skip}，失败 ${evt.fail}。输出目录: ${evt.output_dir}`, 'ok');
+                        this.showToast(`批量完成：成功 ${evt.ok}，跳过 ${evt.skip}，失败 ${evt.fail}`);
+                    } else if (stage === 'error') {
+                        this.addBatchLog('错误: ' + (evt.error || '未知'), 'error');
+                        this.error = evt.error || '批量任务出错';
+                    }
                 },
 
                 resetState() {
@@ -753,7 +1158,7 @@
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({
                                 url: this.url,
-                                api_key: this.apiKey  // Send local API key if available
+                                provider: this.activeProvider  // use provider selected in settings
                             })
                         });
                         const data = await res.json();
