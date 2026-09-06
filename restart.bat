@@ -6,7 +6,7 @@ title Douyin MCP Server - Restart
 cd /d "%~dp0"
 
 echo Stopping existing WebUI processes...
-powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'web\\app\.py' } | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop; Write-Output ('  stopped ' + $_.ProcessId) } catch {} }"
+powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'tray_server\.py|web\\app\.py' } | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop; Write-Output ('  stopped ' + $_.ProcessId) } catch {} }"
 
 rem give the port a moment to be released
 rem (ping-based sleep: see note in start.bat about timeout + Ctrl+C)
