@@ -11,6 +11,12 @@ logs/webui.log. Interact via the tray icon:
   - menu "打开运行日志"                    -> open logs/webui.log
   - menu "退出"                            -> graceful server shutdown
 
+On every start the app also ensures its logon autostart entry (HKCU Run
+value "Douyin WebUI") exists and points at the CURRENT paths - a missing
+or stale entry (project moved, venv rebuilt) is rewritten automatically.
+Delete the entry via Task Manager > Startup apps to opt out; the next
+manual launch will re-assert it.
+
 Usage:
     .venv\\Scripts\\pythonw.exe tray_server.py
     (start.bat does this for you)
@@ -81,6 +87,46 @@ def _port_free() -> bool:
             return False
 
 
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_VALUE_NAME = "Douyin WebUI"
+
+
+def _ensure_autostart():
+    """Create/repair the logon autostart entry (default behavior).
+
+    Runs on every program start: the HKCU Run value "Douyin WebUI" is
+    compared against the current pythonw/tray_server paths and rewritten
+    when missing or stale (project moved, venv rebuilt). Failures are
+    logged but never block the server from starting.
+    """
+    try:
+        import winreg
+
+        pythonw = ROOT / ".venv" / "Scripts" / "pythonw.exe"
+        if not pythonw.exists():
+            print("[tray] autostart skipped: .venv\\Scripts\\pythonw.exe not found")
+            return
+        expected = f'"{pythonw}" "{ROOT / "tray_server.py"}"'
+
+        current = None
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                                winreg.KEY_READ) as k:
+                current = winreg.QueryValueEx(k, RUN_VALUE_NAME)[0]
+        except FileNotFoundError:
+            pass
+
+        if current == expected:
+            print("[tray] autostart entry OK")
+            return
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                            winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, RUN_VALUE_NAME, 0, winreg.REG_SZ, expected)
+        print(f"[tray] autostart entry {'repaired' if current else 'created'}: {expected}")
+    except Exception as e:
+        print(f"[tray] autostart setup failed: {e}")
+
+
 def _load_webapp():
     """Import web/app.py by path (the web directory is not a package)."""
     spec = importlib.util.spec_from_file_location(
@@ -124,6 +170,8 @@ def _fatal(message: str):
 
 
 def main():
+    _ensure_autostart()
+
     if _already_running():
         # Double launch: just reveal the existing console.
         _open_console()
