@@ -486,6 +486,20 @@ async def extract_transcript(req: VideoRequest):
                 provider=backend['provider'],
                 model=backend['model'],
             )
+            # Save into the per-author directory (one dir per UP) and
+            # refresh that author's catalog; never fail the request on it.
+            try:
+                from batch_extractor import save_transcript
+                author = (video_info.get("author") or "").strip() or "未知作者"
+                safe_author = re.sub(r'[\\/:*?"<>|]', '_', author).strip() or "未知作者"
+                author_dir = (Path(__file__).resolve().parent.parent
+                              / "output" / safe_author)
+                save_transcript(author_dir, video_info["video_id"],
+                                video_info["title"], author, text)
+            except Exception as e:
+                log_operation("video.extract.save_md_failed",
+                              video_id=video_info["video_id"],
+                              error=str(e)[:200])
             return video_info, text
 
         video_info, text = await asyncio.to_thread(_run)

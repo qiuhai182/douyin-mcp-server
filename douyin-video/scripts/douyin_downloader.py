@@ -153,9 +153,15 @@ class DouyinProcessor:
             vid = data.get("aweme_id") or video_id
             desc = data.get("desc", "").strip() or f"douyin_{vid}"
             desc = re.sub(r'[\\/:*?"<>|]', '_', desc)
+            author = ""
+            try:
+                author = ((data.get("author") or {}).get("nickname") or "").strip()
+            except Exception:
+                author = ""
             return {
                 "url": url_list[0].replace("playwm", "play"),
                 "title": desc,
+                "author": author,
                 "video_id": str(vid)
             }
 

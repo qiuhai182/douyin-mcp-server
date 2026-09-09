@@ -13,7 +13,7 @@ from typing import Optional
 
 
 def fetch_video_info_via_browser(video_id: str, timeout_ms: int = 60000) -> dict:
-    """Get {url, title, video_id} for one video via headless browser.
+    """Get {url, title, author, video_id} for one video via headless browser.
 
     Returns the same dict shape as DouyinProcessor.parse_share_url.
     Raises RuntimeError if nothing could be captured.
@@ -81,6 +81,7 @@ def fetch_video_info_via_browser(video_id: str, timeout_ms: int = 60000) -> dict
                     entry = {
                         "url": url_list[0] if url_list else "",
                         "title": (detail.get("desc") or "").strip(),
+                        "author": ((detail.get("author") or {}).get("nickname") or "").strip(),
                     }
                     if aweme_id == str(video_id):
                         found[aweme_id] = entry
@@ -100,7 +101,8 @@ def fetch_video_info_via_browser(video_id: str, timeout_ms: int = 60000) -> dict
     if str(video_id) in found:
         info = found[str(video_id)]
         if info.get("url"):
-            return {"url": info["url"], "title": info["title"], "video_id": str(video_id)}
+            return {"url": info["url"], "title": info["title"],
+                    "author": info.get("author", ""), "video_id": str(video_id)}
 
     # detail XHR may not fire if page loaded from cache; try slug from URL state
     raise RuntimeError(

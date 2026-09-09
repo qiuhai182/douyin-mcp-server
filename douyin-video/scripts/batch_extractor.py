@@ -17,6 +17,7 @@ History file layout (history.json):
 }
 """
 
+import re
 import time
 import json
 import shutil
@@ -259,6 +260,7 @@ def update_catalog(author_dir: Path, author: str = "") -> int:
         N-<aweme_id>.md
           标题: <title>
           简介: <desc line 2 (optional)>
+          解析日期: <md's "| Extracted at |" timestamp (optional)>
     Returns the number of entries written.
     """
     author_dir = Path(author_dir)
@@ -287,13 +289,47 @@ def update_catalog(author_dir: Path, author: str = "") -> int:
         # Skip metadata-table lines that sometimes follow the title
         if desc2.startswith("|"):
             desc2 = ""
+        # Parse date from the md's metadata table ("| Extracted at | ... |")
+        extracted_at = ""
+        for ln in lines:
+            m = re.match(r"^\|\s*Extracted at\s*\|\s*(.+?)\s*\|\s*$", ln)
+            if m:
+                extracted_at = m.group(1)
+                break
         out.append(name)
         out.append(f"  标题: {title}")
         if desc2:
             out.append(f"  简介: {desc2}")
+        if extracted_at:
+            out.append(f"  解析日期: {extracted_at}")
         out.append("")
     (author_dir / CATALOG_NAME).write_text("\n".join(out), encoding="utf-8")
     return len(entries)
+
+
+def save_transcript(author_dir: Path, aweme_id: str, title: str,
+                    author: str, text: str) -> Path:
+    """Save one transcript into a per-author directory (single-video flow).
+
+    One directory per UP: output/<author>/N-<aweme_id>.md. Legacy
+    '<aweme_id>.md' names are migrated first, an existing file for the same
+    video is updated in place (keeps its serial), and 0-目录.txt is
+    refreshed. Returns the written path.
+    """
+    author_dir = Path(author_dir)
+    author_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        rename_transcripts_numbered(author_dir)
+    except Exception:
+        pass
+    serial = _next_serial(author_dir, aweme_id)
+    path = author_dir / f"{serial}-{aweme_id}.md"
+    _write_transcript_md(path, title, aweme_id, author, text)
+    try:
+        update_catalog(author_dir, author)
+    except Exception:
+        pass
+    return path
 
 
 def is_profile_input(text: str) -> bool:
