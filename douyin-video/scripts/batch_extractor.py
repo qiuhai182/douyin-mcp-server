@@ -139,6 +139,97 @@ class ProfileCache:
         )
 
 
+AUTHORS_FILE = Path(__file__).resolve().parent.parent.parent / "authors.json"
+
+
+class AuthorRegistry:
+    """Persistent registry of batch-extracted authors (authors.json):
+    maps author display name -> {profile_url, sec_uid, last batch time,
+    video count}. Lets the WebUI list known UPs and re-run their batch
+    without pasting the profile link again."""
+
+    def __init__(self, path: Path = AUTHORS_FILE):
+        self.path = Path(path)
+        try:
+            self._data = json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception:
+            self._data = {}
+
+    def list(self) -> list:
+        items = []
+        for name, e in self._data.items():
+            # Live video count from the author's output dir (0 if missing)
+            n_videos = 0
+            d = self.path.parent / "output" / name
+            try:
+                n_videos = len([p for p in d.glob("*.md")
+                                if p.name != CATALOG_NAME])
+            except Exception:
+                pass
+            items.append({
+                "name": name,
+                "profile_url": e.get("profile_url", ""),
+                "sec_uid": e.get("sec_uid", ""),
+                "last_batch_at": e.get("last_batch_at", ""),
+                "video_count": n_videos,
+            })
+        items.sort(key=lambda x: x.get("last_batch_at", ""), reverse=True)
+        return items
+
+    def register(self, name: str, profile_url: str, sec_uid: str = ""):
+        name = (name or "").strip()
+        if not name:
+            return
+        self._data[name] = {
+            "profile_url": profile_url,
+            "sec_uid": sec_uid or self._data.get(name, {}).get("sec_uid", ""),
+            "last_batch_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        self.path.write_text(
+            json.dumps(self._data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def get(self, name: str) -> Optional[dict]:
+        return self._data.get(name)
+
+
+def _register_author_from_url(profile_link: str):
+    """Best-effort: resolve a profile link to nickname + canonical URL and
+    record it in the registry (used at batch start)."""
+    from profile_fetcher import fetch_profile_videos
+    canonical = profile_link
+    try:
+        canonical = normalize_profile_url(profile_link)
+    except Exception:
+        pass
+    # Cheap identity probe: reuse the profile cache if warm, else a
+    # minimal metadata fetch (no video list scrolling).
+    cached = ProfileCache().get(canonical)
+    nickname = (cached or {}).get("nickname", "")
+    sec_uid = (cached or {}).get("sec_uid", "")
+    if not nickname:
+        profile = fetch_profile_videos(canonical, max_videos=0,
+                                       headless=True,
+                                       progress_cb=lambda n: None)
+        nickname = profile.get("nickname", "")
+        sec_uid = profile.get("sec_uid", "")
+        if profile.get("videos"):
+            try:
+                ProfileCache().put(canonical, {
+                    "sec_uid": sec_uid, "nickname": nickname,
+                    "videos": profile.get("videos", []),
+                    "logged_in": bool(profile.get("logged_in")),
+                })
+            except Exception:
+                pass
+    if nickname:
+        author_registry.register(nickname, canonical, sec_uid)
+
+
+author_registry = AuthorRegistry()
+
+
 def _read_complete_transcript(path: Path) -> Optional[str]:
     """Return the transcript text if the md file is COMPLETE, else None.
 
@@ -669,5 +760,12 @@ def batch_extract(
         "resumed": counters["resumed"],
         "output_dir": str(author_dir),
     }
+    # Persist author -> profile URL so the WebUI can re-run this author
+    try:
+        if profile.get("nickname"):
+            author_registry.register(
+                profile["nickname"], canonical, profile.get("sec_uid", ""))
+    except Exception:
+        pass
     _report({"stage": "done", **summary})
     return summary

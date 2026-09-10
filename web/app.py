@@ -371,6 +371,46 @@ async def profile_history():
     return {"count": counts["ok"], "ok": counts["ok"], "fail": counts["fail"]}
 
 
+@app.get("/api/authors")
+async def authors_list():
+    """Known UPs (batch-extracted before): name, profile URL, counts."""
+    from batch_extractor import author_registry
+    return {"authors": author_registry.list()}
+
+
+@app.delete("/api/authors")
+async def authors_remove(name: str):
+    """Remove one author from the registry (does not delete output files)."""
+    from batch_extractor import author_registry
+    existed = author_registry.get(name) is not None
+    if existed:
+        author_registry._data.pop(name, None)
+        author_registry.path.write_text(
+            json.dumps(author_registry._data, ensure_ascii=False, indent=2),
+            encoding="utf-8")
+        log_operation("authors.remove", name=name)
+    return {"ok": True, "removed": existed}
+
+
+class AuthorNameRequest(BaseModel):
+    name: str
+
+
+@app.post("/api/authors/open-dir")
+async def authors_open_dir(req: AuthorNameRequest):
+    """Open the author's output folder in Explorer."""
+    import subprocess
+    from batch_extractor import author_registry
+    entry = author_registry.get(req.name)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Author not found")
+    d = Path(__file__).parent.parent / "output" / req.name
+    if not d.is_dir():
+        raise HTTPException(status_code=404, detail="Output folder not found")
+    subprocess.Popen(["explorer", str(d)])
+    return {"ok": True}
+
+
 @app.get("/api/douyin/login-status")
 async def douyin_login_status():
     """Whether a douyin session exists (backup file / imported session)."""
