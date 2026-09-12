@@ -272,52 +272,10 @@ async def profile_batch(req: BatchRequest):
     summary line, then closes.
     """
     if _batch_state["running"]:
-        raise HTTPException(status_code=409, detail="A batch job is already running")
-
-    async def _run_job(api_key: str):
-        q: "queue.Queue" = queue.Queue()
-        loop = asyncio.get_event_loop()
-
-        try:
-            _batch_state["running"] = True
-
-            log_operation("batch.start", url=req.url, provider=req.provider or "",
-                          max_videos=req.max_videos, force=req.force,
-                          save_video=req.save_video, use_cache=req.use_cache,
-                          workers=req.workers)
-            def _worker():
-                try:
-                    from batch_extractor import batch_extract
-                    batch_extract(
-                        req.url,
-                        output_dir=str(Path(__file__).parent.parent / "output"),
-                        api_key=api_key,
-                        provider=req.provider or None,
-                        max_videos=req.max_videos,
-                        force=req.force,
-                        headless=True,
-                        save_video=req.save_video,
-                        use_cache=req.use_cache,
-                        workers=req.workers,
-                        on_progress=lambda info: q.put(info),
-                    )
-                except Exception as e:
-                    log_operation("batch.job", status="error", error=str(e))
-                    q.put({"stage": "error", "error": str(e)[:400]})
-                finally:
-                    q.put(None)
-
-            thread = threading.Thread(target=_worker, daemon=True)
-            thread.start()
-
-            while True:
-                # Pull from the worker thread without blocking the event loop
-                item = await loop.run_in_executor(None, q.get)
-                if item is None:
-                    break
-                yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
-        finally:
-            _batch_state["running"] = False
+        raise HTTPException(
+            status_code=409,
+            detail="已有批量任务在运行（若界面看不到进度，可能是页面刷新后任务仍在后台继续，"
+                   "请等它结束后再试）")
 
     # Resolve key like the single-video endpoint does (config file / env)
     from asr_backends import load_config_file
@@ -329,8 +287,57 @@ async def profile_batch(req: BatchRequest):
     if not api_key:
         raise HTTPException(status_code=400, detail="Please configure API Key first")
 
+    # Claim the global single-job lock here, and let the WORKER thread release
+    # it in its own finally. Releasing it from the SSE generator would be wrong:
+    # a client disconnect (page reload) cancels the generator while the worker
+    # keeps running, so an early release lets a second batch start and open a
+    # second browser on the same persistent profile dir - two Chromium
+    # instances on one user-data-dir lock each other's cookie DB, which freezes
+    # the page renderer and hangs the run forever.
+    _batch_state["running"] = True
+    q: "queue.Queue" = queue.Queue()
+
+    def _worker():
+        try:
+            log_operation("batch.start", url=req.url, provider=req.provider or "",
+                          max_videos=req.max_videos, force=req.force,
+                          save_video=req.save_video, use_cache=req.use_cache,
+                          workers=req.workers)
+
+            from batch_extractor import batch_extract
+            batch_extract(
+                req.url,
+                output_dir=str(Path(__file__).parent.parent / "output"),
+                api_key=api_key,
+                provider=req.provider or None,
+                max_videos=req.max_videos,
+                force=req.force,
+                headless=True,
+                save_video=req.save_video,
+                use_cache=req.use_cache,
+                workers=req.workers,
+                on_progress=lambda info: q.put(info),
+            )
+        except Exception as e:
+            log_operation("batch.job", status="error", error=str(e))
+            q.put({"stage": "error", "error": str(e)[:400]})
+        finally:
+            _batch_state["running"] = False
+            q.put(None)
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+    async def _stream():
+        loop = asyncio.get_event_loop()
+        while True:
+            # Pull from the worker thread without blocking the event loop
+            item = await loop.run_in_executor(None, q.get)
+            if item is None:
+                break
+            yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+
     return StreamingResponse(
-        _run_job(api_key),
+        _stream(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

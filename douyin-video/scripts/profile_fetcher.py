@@ -22,6 +22,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 from typing import Optional
 from pathlib import Path
@@ -175,6 +176,49 @@ def is_profile_url(share_text: str) -> bool:
     return False
 
 
+# Only ONE Chromium may use the shared persistent profile at a time: two
+# instances on the same user-data-dir lock each other's cookie DB, which
+# freezes the page's renderer (page.evaluate / mouse.wheel then hang forever
+# while XHR responses are still captured - the classic "已发现 N 个视频" freeze).
+# All callers live in this process, so a thread lock is enough.
+_PROFILE_LOCK = threading.Lock()
+
+# A batch must never wait forever for the profile: if the lock is not released
+# within this window, something leaked it and we abort with a clear message.
+_PROFILE_LOCK_TIMEOUT = 180
+
+
+def _release_profile_lock():
+    """Release the shared-profile lock, ignoring an unbalanced release."""
+    try:
+        _PROFILE_LOCK.release()
+    except RuntimeError:
+        pass
+
+
+def _kill_profile_browsers(timeout: int = 20) -> int:
+    r"""Force-kill browser processes still holding our persistent profile.
+
+    Only processes whose command line references the profile directory are
+    touched, so the user's own Chrome/Edge windows are never affected.
+    """
+    marker = PROFILE_DIR.name  # ".douyin_profile"
+    script = (
+        "Get-CimInstance Win32_Process -Filter "
+        "\"Name='chrome.exe' or Name='msedge.exe'\" | "
+        f"Where-Object {{ $_.CommandLine -and $_.CommandLine -like '*{marker}*' }} | "
+        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+    )
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except Exception:
+        pass
+    return 0
+
+
 def _open_persistent(p, headless: bool):
     """Open a persistent browser context.
 
@@ -182,28 +226,44 @@ def _open_persistent(p, headless: bool):
     from the registry - no hardcoded names), then falls back to Edge/Chrome
     channels. After opening, cookies from the backup file are restored
     (if any), making the login state durable across runs.
+
+    Holds _PROFILE_LOCK until the context is torn down: callers must release
+    it via _release_profile_lock() right after _kill_profile_browsers().
     """
+    if not _PROFILE_LOCK.acquire(timeout=_PROFILE_LOCK_TIMEOUT):
+        raise RuntimeError(
+            "上一个批次仍占用抖音浏览器配置，"
+            f"已等待 {_PROFILE_LOCK_TIMEOUT}s 仍未释放；本次抓取已中止（避免卡死）"
+        )
+    # A browser left behind by a killed/crashed run still holds the profile
+    # dir; the new instance's page would then freeze (scroll/XHR hang forever).
+    # Clear any such leftover before launching.
+    _kill_profile_browsers()
     last_err = None
-    for extra in _browser_candidates():
-        try:
-            context = p.chromium.launch_persistent_context(
-                str(PROFILE_DIR),
-                headless=headless,
-                user_agent=DESKTOP_UA,
-                viewport={"width": 1380, "height": 900},
-                locale="zh-CN",
-                args=["--disable-blink-features=AutomationControlled"],
-                **extra,
-            )
-            _restore_cookies(context)
-            return context
-        except Exception as e:
-            last_err = e
-    raise RuntimeError(
-        "No Chromium-based browser available for automation "
-        "(system default browser is not Chromium-based or not found). "
-        f"Last error: {last_err}"
-    )
+    try:
+        for extra in _browser_candidates():
+            try:
+                context = p.chromium.launch_persistent_context(
+                    str(PROFILE_DIR),
+                    headless=headless,
+                    user_agent=DESKTOP_UA,
+                    viewport={"width": 1380, "height": 900},
+                    locale="zh-CN",
+                    args=["--disable-blink-features=AutomationControlled"],
+                    **extra,
+                )
+                _restore_cookies(context)
+                return context
+            except Exception as e:
+                last_err = e
+        raise RuntimeError(
+            "No Chromium-based browser available for automation "
+            "(system default browser is not Chromium-based or not found). "
+            f"Last error: {last_err}"
+        )
+    except Exception:
+        _release_profile_lock()
+        raise
 
 
 def _save_cookies(context):
@@ -574,6 +634,7 @@ def interactive_login(timeout: int = 240, on_notice=None) -> bool:
                 context.close()
             except Exception:
                 pass
+            _release_profile_lock()
 
 
 def fetch_profile_videos(
@@ -769,12 +830,26 @@ def fetch_profile_videos(
             if not logged_in:
                 _notice("未检测到抖音登录状态，可能只抓到第一页；点「登录抖音」一次即可抓全")
         finally:
-            # Persist any douyin cookies earned during this session
-            _save_cookies(context)
+            # Detach the XHR listener before shutting the browser down: sync
+            # Playwright runs "response" handlers on its dispatcher, and a
+            # response that lands while close() is in flight re-enters that
+            # dispatcher from inside the handler - which deadlocks close().
             try:
-                context.close()
+                page.remove_listener("response", _handle_response)
             except Exception:
                 pass
+            # Persist any douyin cookies earned during this session
+            _save_cookies(context)
+            # After driving a douyin page, Chromium's graceful shutdown never
+            # finishes: context.close() blocks forever (verified - it still
+            # hangs after force-killing the browser). So kill the browser and
+            # let the sync_playwright() block exit, which stops the driver
+            # instantly and releases the profile dir.
+            try:
+                _kill_profile_browsers()
+            finally:
+                # Must always run: a leaked lock freezes every later batch
+                _release_profile_lock()
 
     return {
         "sec_uid": sec_uid,

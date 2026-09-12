@@ -468,6 +468,9 @@
                                 <span x-show="batchTotal" class="text-douyin-gray-400 font-normal">
                                     (<span x-text="batchDone"></span>/<span x-text="batchTotal"></span>)
                                 </span>
+                                <span x-show="authorQueueCurrent && batchRunning" class="text-douyin-red font-normal">
+                                    · 正在刷新：<span x-text="authorQueueCurrent"></span>
+                                </span>
                             </p>
                             <div class="flex items-center gap-2">
                             <button x-show="batchRunning && !batchPaused" @click="batchPause()"
@@ -507,17 +510,43 @@
                                     (<span x-text="authors.length"></span>)
                                 </span>
                             </p>
-                            <button x-show="!batchRunning" @click="loadAuthors()"
-                                    class="text-xs text-douyin-gray-400 hover:text-douyin-gray-600">刷新</button>
+                            <div class="flex items-center gap-3">
+                                <span x-show="authorQueueRunning" class="text-xs text-amber-600">
+                                    逐个刷新中，剩余 <span x-text="authorQueue.length"></span> 位
+                                </span>
+                                <button x-show="authorQueueRunning" @click="stopAuthorQueue()"
+                                        class="text-xs px-2.5 py-1 rounded-lg bg-red-50 text-red-600 hover:bg-red-100 border border-red-200 transition-smooth">
+                                    停止队列
+                                </button>
+                                <button x-show="!authorQueueRunning && !batchRunning" @click="batchAllAuthors()"
+                                        class="text-xs px-2.5 py-1 rounded-lg bg-douyin-red/10 text-douyin-red hover:bg-douyin-red/20 border border-douyin-red/30 transition-smooth flex items-center gap-1">
+                                    <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
+                                        <path d="M8 5v14l11-7z"/>
+                                    </svg>
+                                    一键刷新全部
+                                </button>
+                                <button x-show="!authorQueueRunning && !batchRunning" @click="loadAuthors()"
+                                        class="text-xs text-douyin-gray-400 hover:text-douyin-gray-600">刷新</button>
+                            </div>
                         </div>
                         <div class="space-y-2 max-h-72 overflow-y-auto">
                             <template x-for="a in authors" :key="a.name">
-                                <div class="bg-white rounded-lg px-3 py-2.5 flex items-center gap-2 hover:shadow-sm transition-smooth">
+                                <div class="bg-white rounded-lg px-3 py-2.5 flex items-center gap-2 hover:shadow-sm transition-smooth"
+                                     :class="a.name === authorQueueCurrent && batchRunning ? 'ring-2 ring-douyin-red/40' : (authorQueueDone.includes(a.name) ? 'opacity-75' : '')">
                                     <div class="flex-1 min-w-0">
-                                        <p class="text-sm font-medium text-douyin-gray-800 truncate" x-text="a.name"></p>
-                                        <p class="text-xs text-douyin-gray-400 truncate">
-                                            <span x-text="a.video_count"></span> 个视频
-                                            <span x-show="a.last_batch_at"> · 最近批量 <span x-text="a.last_batch_at"></span></span>
+                                        <a :href="a.profile_url || '#'" target="_blank" rel="noopener noreferrer"
+                                           title="在新标签页打开作者主页"
+                                           class="block text-sm font-medium truncate transition-colors"
+                                           :class="a.name === authorQueueCurrent && batchRunning ? 'text-douyin-red' : 'text-douyin-gray-800 hover:text-douyin-red'"
+                                           x-text="a.name"></a>
+                                        <p class="text-xs truncate">
+                                            <span x-show="a.name === authorQueueCurrent && batchRunning"
+                                                  class="text-douyin-red font-medium">
+                                                刷新中 <span x-text="batchDone"></span>/<span x-text="batchTotal"></span> ·
+                                            </span>
+                                            <span x-show="authorQueueDone.includes(a.name)" class="text-green-600 font-medium">已刷新 · </span>
+                                            <span class="text-douyin-gray-400"><span x-text="a.video_count"></span> 个视频</span>
+                                            <span x-show="a.last_batch_at" class="text-douyin-gray-400"> · 最近批量 <span x-text="a.last_batch_at"></span></span>
                                         </p>
                                     </div>
                                     <button @click="batchAuthor(a)" :disabled="batchRunning"
@@ -831,6 +860,10 @@
                 batchDone: 0,
                 batchUseCache: false,
                 authors: [],
+                authorQueue: [],           // remaining UPs for "refresh all" mode
+                authorQueueRunning: false, // serial refresh-all mode in progress
+                authorQueueCurrent: '',    // UP currently being refreshed
+                authorQueueDone: [],       // UPs finished in this refresh-all run
                 douyinLoggedIn: false,
                 douyinLoginLabel: '登录抖音（可选，抓取不全时使用）',
                 polishInput: { enabled: false, api_key: '', api_base_url: '', model: '' },
@@ -924,10 +957,53 @@
                 },
 
                 batchAuthor(a) {
-                    // Fill the profile URL of a known UP and start batch
+                    // Manual single-author batch: cancel any pending queue
                     if (this.batchRunning) return;
+                    this.authorQueue = [];
+                    this.authorQueueRunning = false;
+                    this._startBatchAuthor(a);
+                },
+
+                _startBatchAuthor(a) {
+                    // Fill the profile URL of a known UP and start batch
+                    this.authorQueueCurrent = a.name;
                     this.url = a.profile_url;
                     this.batchExtract();
+                },
+
+                batchAllAuthors() {
+                    // Serially refresh every known UP (one batch at a time,
+                    // the global single-job lock enforces the rest).
+                    if (this.batchRunning || !this.authors.length) return;
+                    if (!this.apiKeyConfigured) {
+                        this.showSettings = true;
+                        return;
+                    }
+                    const total = this.authors.reduce((s, a) => s + (a.video_count || 0), 0);
+                    if (!confirm(`将依次批量刷新全部 ${this.authors.length} 位 UP（共约 ${total} 个视频，已提取的会自动跳过），开始？`)) return;
+                    this.batchLogs = [];
+                    this.batchTotal = 0;
+                    this.batchDone = 0;
+                    this.authorQueueDone = [];
+                    this.authorQueue = this.authors.slice();
+                    this.authorQueueRunning = true;
+                    this._startBatchAuthor(this.authorQueue.shift());
+                },
+
+                stopAuthorQueue() {
+                    // Stop after the current author's batch finishes
+                    this.authorQueue = [];
+                    this.authorQueueRunning = false;
+                },
+
+                continueAuthorQueue() {
+                    // Called from batchExtract() finally: chain to next UP
+                    if (this.authorQueueRunning && this.authorQueue.length) {
+                        this._startBatchAuthor(this.authorQueue.shift());
+                    } else {
+                        this.authorQueueRunning = false;
+                        this.authorQueueCurrent = '';
+                    }
                 },
 
                 async removeAuthor(a) {
@@ -1081,12 +1157,20 @@
 
                     this.batchRunning = true;
                     this.batchPaused = false;
-                    this.batchLogs = [];
-                    this.batchTotal = 0;
-                    this.batchDone = 0;
+                    if (this.authorQueueRunning) {
+                        // Refresh-all mode: keep earlier UPs' logs, mark a new section
+                        this.batchTotal = 0;
+                        this.batchDone = 0;
+                        const remaining = this.authorQueue.length;
+                        this.addBatchLog(`—— 开始刷新「${this.authorQueueCurrent}」（该 UP 完成后还剩 ${remaining} 位）——`, 'warn');
+                    } else {
+                        this.batchLogs = [];
+                        this.batchTotal = 0;
+                        this.batchDone = 0;
+                    }
                     this.resetState();
                     this.loading = true;
-                    this.loadingText = '批量提取中，正在读取作者视频列表...';
+                    this.loadingText = `批量提取中，正在读取 ${this.authorQueueCurrent || '作者'} 的视频列表...`;
 
                     try {
                         const res = await fetch('/api/profile/batch', {
@@ -1127,7 +1211,11 @@
                     } finally {
                         this.batchRunning = false;
                         this.loading = false;
+                        if (this.authorQueueRunning && this.authorQueueCurrent && !this.authorQueueDone.includes(this.authorQueueCurrent)) {
+                            this.authorQueueDone.push(this.authorQueueCurrent); // mark UP as refreshed
+                        }
                         this.loadAuthors(); // refresh author registry (new UP / new counts)
+                        this.continueAuthorQueue(); // chain to next UP in refresh-all mode
                     }
                 },
 
