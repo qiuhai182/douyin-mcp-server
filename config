@@ -6,12 +6,11 @@
 	symlinks = false
 	ignorecase = true
 [branch "main"]
-	remote = origin
-	vscode-merge-base = origin/main
+	remote = gitee
 	merge = refs/heads/main
-[remote "upstream"]
-	url = https://github.com/yzfly/douyin-mcp-server.git
-	fetch = +refs/heads/*:refs/remotes/upstream/*
+[remote "github"]
+	url = https://github.com/qiuhai182/douyin-mcp-server.git
+	fetch = +refs/heads/*:refs/remotes/github/*
 [remote "gitee"]
 	url = https://gitee.com/qiuhai182/douyin-mcp-server.git
 	fetch = +refs/heads/*:refs/remotes/gitee/*
