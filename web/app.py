@@ -549,6 +549,9 @@ class RefreshTaskRequest(BaseModel):
     current: str = ""    # UP that was being refreshed
     done: list = []      # UPs already finished in that run
     total: int = 0
+    run_new: int = 0     # transcripts added so far this run (completed UPs)
+    run_skipped: int = 0
+    run_fail: int = 0
 
 
 @app.get("/api/refresh-task")
