@@ -17,6 +17,7 @@ import json
 import time
 import queue
 import asyncio
+import subprocess
 import threading
 from pathlib import Path
 from urllib.parse import quote
@@ -25,11 +26,42 @@ from urllib.parse import quote
 sys.path.insert(0, str(Path(__file__).parent.parent / "douyin-video" / "scripts"))
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, PlainTextResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 import uvicorn
 import requests
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def _silence_child_consoles() -> None:
+    r"""Keep the service fully silent: no child console app (ffmpeg, ffprobe,
+    powershell...) may pop a console window while the server runs windowless
+    (pythonw / tray).
+
+    ffmpeg-python offers no way to pass creationflags, so the only hook that
+    covers every child process is the Popen constructor itself. Console
+    windows are only ever suppressed - GUI apps (e.g. explorer.exe) are
+    unaffected.
+    """
+    global _NO_WINDOW_PATCHED
+    if _NO_WINDOW_PATCHED or os.name != "nt":
+        return
+    _NO_WINDOW_PATCHED = True
+    original_init = subprocess.Popen.__init__
+
+    def init_without_window(self, *args, **kwargs):
+        kwargs["creationflags"] = (
+            kwargs.get("creationflags") or 0) | subprocess.CREATE_NO_WINDOW
+        original_init(self, *args, **kwargs)
+
+    subprocess.Popen.__init__ = init_without_window
+
+
+_NO_WINDOW_PATCHED = False
+_silence_child_consoles()
+
 
 # Import douyin processing module
 from douyin_downloader import get_video_info, HEADERS
@@ -253,6 +285,8 @@ class BatchRequest(BaseModel):
     """Author profile batch extraction request"""
     url: str
     provider: str = ""
+    author: str = ""  # display name of the UP, kept so a reloaded page can
+                      # tell which UP the background job belongs to
     max_videos: int = 0  # 0 = all
     force: bool = False
     save_video: bool = False
@@ -262,6 +296,150 @@ class BatchRequest(BaseModel):
 
 # Global batch job state (one job at a time keeps things simple)
 _batch_state = {"running": False}
+
+# Live view of the running batch job. A page reload (or a closed and reopened
+# tab) drops the SSE stream while the worker thread keeps going, so without
+# this the UI has no way back into a job it started:
+#   label   - which UP the job belongs to ("" for a one-off manual batch)
+#   history - every event published so far, replayed to a late subscriber
+#   subs    - queues of the progress streams currently attached
+#   seq     - increasing event id, used to skip replayed duplicates
+_batch_job = {"label": "", "history": [], "subs": [], "seq": 0}
+_BATCH_HISTORY_MAX = 2000
+
+
+def _sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _batch_publish(event: dict) -> None:
+    """Record a batch event and fan it out to every attached progress stream."""
+    _batch_job["seq"] += 1
+    event["seq"] = _batch_job["seq"]
+    history = _batch_job["history"]
+    history.append(event)
+    if len(history) > _BATCH_HISTORY_MAX:
+        del history[: len(history) - _BATCH_HISTORY_MAX]
+    for sub in list(_batch_job["subs"]):
+        sub.put(event)
+
+
+def _batch_finish() -> None:
+    """Tells every attached progress stream that the job is over."""
+    for sub in list(_batch_job["subs"]):
+        sub.put(None)
+
+
+async def _batch_stream():
+    """Replay the running job's events, then follow it live until it ends.
+
+    The replay is what lets a reloaded page restore the progress it lost; the
+    live tail then keeps it in sync. Events are deduped by seq, so an event
+    published between the replay snapshot and the subscription is not doubled.
+    """
+    sub: "queue.Queue" = queue.Queue()
+    _batch_job["subs"].append(sub)
+    loop = asyncio.get_event_loop()
+    last = 0
+    try:
+        for evt in list(_batch_job["history"]):
+            if evt.get("seq", 0) > last:
+                last = evt["seq"]
+                yield _sse(evt)
+        if not _batch_state["running"]:
+            yield _sse({"stage": "closed"})
+            return
+        while True:
+            item = await loop.run_in_executor(None, sub.get)
+            if item is None:
+                break
+            if item.get("seq", 0) <= last:
+                continue
+            last = item["seq"]
+            yield _sse(item)
+    finally:
+        if sub in _batch_job["subs"]:
+            _batch_job["subs"].remove(sub)
+
+# A restart requested while a batch job runs is deferred until that job
+# finishes, so an in-flight task is never interrupted.
+_restart_state = {"pending": False}
+
+
+def _restart_now(delay: float = 1.0) -> None:
+    """Reload this service with the latest code, silently and in place.
+
+    os.execv replaces the process image (same PID, same window mode), so no
+    console window is spawned and no launcher script is needed. The current
+    listening socket is released as the old image goes away, which is why
+    tray_server waits for the port when DOUYIN_RESTART is set.
+    """
+    def _run():
+        time.sleep(delay)
+        # Prefer the windowless interpreter: execv keeps the current session,
+        # so re-imaging with python.exe would attach a console (or fail when
+        # launched from an already windowless tray process).
+        pythonw = ROOT / ".venv" / "Scripts" / "pythonw.exe"
+        exe = str(pythonw) if pythonw.exists() else sys.executable
+        os.environ["DOUYIN_RESTART"] = "1"
+        try:
+            os.execv(exe, [exe, str(ROOT / "tray_server.py")])
+        except Exception as e:
+            log_operation("service.restart", status="error", error=str(e))
+            os._exit(1)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _restart_after_batch():
+    """Run a restart that was deferred because a batch job was running."""
+    if _restart_state["pending"]:
+        _restart_state["pending"] = False
+        log_operation("service.restart", status="run_deferred")
+        _restart_now(delay=3.0)
+
+
+@app.post("/api/service/restart")
+async def service_restart():
+    """Reload the service with the latest code.
+
+    Returns 200 when the restart starts immediately, or 202 when a batch job
+    is running and the restart has been queued for when it finishes.
+    """
+    if _batch_state["running"]:
+        _restart_state["pending"] = True
+        log_operation("service.restart", status="deferred")
+        return JSONResponse(
+            {"status": "deferred", "restart_pending": True},
+            status_code=202,
+        )
+    log_operation("service.restart", status="now")
+    _restart_now()
+    return {"status": "restarting"}
+
+
+@app.get("/api/service/status")
+async def service_status():
+    """Whether a batch job is running and whether a restart is queued.
+
+    A page that was reloaded mid-job asks this to learn that a job is still
+    running in the background (and which UP it belongs to), which is what
+    makes the "continue" button appear.
+    """
+    running = bool(_batch_state["running"])
+    paused = False
+    if running:
+        try:
+            from batch_extractor import run_gate
+            paused = not run_gate.is_set()
+        except Exception:
+            paused = False
+    return {
+        "batch_running": running,
+        "batch_paused": paused,
+        "batch_label": _batch_job["label"] if running else "",
+        "restart_pending": bool(_restart_state["pending"]),
+    }
 
 
 @app.post("/api/profile/batch")
@@ -295,7 +473,11 @@ async def profile_batch(req: BatchRequest):
     # instances on one user-data-dir lock each other's cookie DB, which freezes
     # the page renderer and hangs the run forever.
     _batch_state["running"] = True
-    q: "queue.Queue" = queue.Queue()
+    # Start a fresh job view: subscribing clients must never see the previous
+    # job's events replayed as if they belonged to this one.
+    _batch_job["label"] = req.author or ""
+    _batch_job["seq"] = 0
+    del _batch_job["history"][:]
 
     def _worker():
         try:
@@ -316,31 +498,90 @@ async def profile_batch(req: BatchRequest):
                 save_video=req.save_video,
                 use_cache=req.use_cache,
                 workers=req.workers,
-                on_progress=lambda info: q.put(info),
+                on_progress=_batch_publish,
             )
         except Exception as e:
             log_operation("batch.job", status="error", error=str(e))
-            q.put({"stage": "error", "error": str(e)[:400]})
+            _batch_publish({"stage": "error", "error": str(e)[:400]})
         finally:
+            # Order matters: a late subscriber treats "not running" as "the job
+            # is over", so the flag must be down before the streams are closed.
             _batch_state["running"] = False
-            q.put(None)
+            _batch_finish()
+            _restart_after_batch()
 
     threading.Thread(target=_worker, daemon=True).start()
 
-    async def _stream():
-        loop = asyncio.get_event_loop()
-        while True:
-            # Pull from the worker thread without blocking the event loop
-            item = await loop.run_in_executor(None, q.get)
-            if item is None:
-                break
-            yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+    return _batch_response()
 
+
+@app.get("/api/profile/batch/stream")
+async def profile_batch_stream():
+    """Reattach to the running batch job's progress stream.
+
+    A reloaded page (or a dropped connection) has lost its event stream while
+    the worker thread kept going. This replays what it missed and follows the
+    job live; when the job is already over it just replays the tail and says
+    so, which is how the client knows it can move on.
+    """
+    return _batch_response()
+
+
+def _batch_response() -> StreamingResponse:
     return StreamingResponse(
-        _stream(),
+        _batch_stream(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# Durable copy of the last "refresh all" queue. The WebUI drives that queue, so
+# it lives in the browser - and dies with the tab. Mirroring it here lets
+# 「继续上次刷新任务」 pick the run back up after a reload, a closed tab, a
+# restarted browser or a service restart. It only records where the queue
+# stopped: videos already extracted ok are skipped by history.json dedup, so
+# re-running the interrupted UP processes just what is still missing.
+REFRESH_TASK_FILE = ROOT / "refresh_task.json"
+
+
+class RefreshTaskRequest(BaseModel):
+    pending: list = []   # UPs not started yet
+    current: str = ""    # UP that was being refreshed
+    done: list = []      # UPs already finished in that run
+    total: int = 0
+
+
+@app.get("/api/refresh-task")
+async def refresh_task_get():
+    """The last refresh-all queue, for 「继续上次刷新任务」."""
+    try:
+        if REFRESH_TASK_FILE.exists():
+            return {"task": json.loads(REFRESH_TASK_FILE.read_text(encoding="utf-8"))}
+    except Exception:
+        pass
+    return {"task": None}
+
+
+@app.post("/api/refresh-task")
+async def refresh_task_put(req: RefreshTaskRequest):
+    """Save the refresh-all queue as it advances."""
+    data = req.model_dump()
+    data["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    REFRESH_TASK_FILE.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"ok": True}
+
+
+@app.delete("/api/refresh-task")
+async def refresh_task_delete():
+    """Drop the saved queue (the run finished, or there is nothing left)."""
+    try:
+        REFRESH_TASK_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+    return {"ok": True}
 
 
 @app.post("/api/profile/batch/pause")
@@ -473,6 +714,7 @@ async def douyin_login():
             yield f"data: {json.dumps({'stage': 'error', 'error': str(e)[:300]}, ensure_ascii=False)}\n\n"
         finally:
             _batch_state["running"] = False
+            _restart_after_batch()
 
     return StreamingResponse(_gen(), media_type="text/event-stream")
 

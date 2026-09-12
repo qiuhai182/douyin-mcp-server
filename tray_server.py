@@ -87,6 +87,22 @@ def _port_free() -> bool:
             return False
 
 
+def _wait_for_port(timeout: float = 30.0) -> bool:
+    """Wait until the listening port is released (used after a hot reload).
+
+    os.execv re-images this very process, so the old server socket is gone by
+    the time the new image runs - but Windows may need a moment to actually
+    free the port. Without this wait the fresh instance would fail to bind and
+    mistake the reload for a double launch.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _port_free():
+            return True
+        time.sleep(0.3)
+    return _port_free()
+
+
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE_NAME = "Douyin WebUI"
 
@@ -172,7 +188,17 @@ def _fatal(message: str):
 def main():
     _ensure_autostart()
 
-    if _already_running():
+    if os.getenv("DOUYIN_RESTART") == "1":
+        # Hot reload: web/app.py re-imaged this process (same PID, no console)
+        # to pick up new code. The old listening socket died with the previous
+        # image, so wait for the port instead of treating this as a double
+        # launch and quitting. The flag is cleared for future starts.
+        os.environ.pop("DOUYIN_RESTART", None)
+        print("[tray] hot reload: waiting for the port to be released")
+        if not _wait_for_port():
+            _fatal(f"热重载后端口 {PORT} 迟迟未释放。")
+            return
+    elif _already_running():
         # Double launch: just reveal the existing console.
         _open_console()
         return

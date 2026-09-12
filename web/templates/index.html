@@ -415,7 +415,7 @@
                     <div class="flex gap-3">
                         <button
                             @click="extractInfo"
-                            :disabled="!url || loading || batchRunning"
+                            :disabled="!url || loading || batchActive"
                             class="flex-1 h-11 bg-douyin-gray-100 hover:bg-douyin-gray-200 text-douyin-gray-700 font-medium text-sm rounded-xl transition-smooth disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
@@ -424,7 +424,7 @@
                         </button>
                         <button
                             @click="extractText"
-                            :disabled="!url || loading || !apiKeyConfigured || batchRunning"
+                            :disabled="!url || loading || !apiKeyConfigured || batchActive"
                             class="flex-1 h-11 bg-gradient-douyin hover:opacity-90 text-white font-medium text-sm rounded-xl transition-smooth disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 shadow-lg shadow-douyin-red/20">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
@@ -437,12 +437,12 @@
                     <div class="mt-3">
                         <button
                             @click="batchExtract"
-                            :disabled="!url || loading || batchRunning || !apiKeyConfigured"
+                            :disabled="!url || loading || batchActive || !apiKeyConfigured"
                             class="w-full h-11 border-2 border-douyin-red/30 hover:border-douyin-red hover:bg-red-50 text-douyin-red font-medium text-sm rounded-xl transition-smooth disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/>
                             </svg>
-                            <span x-text="batchRunning ? '批量提取中...' : '批量提取作者全部文案'"></span>
+                            <span x-text="batchActive ? '批量提取中...' : '批量提取作者全部文案'"></span>
                         </button>
                         <label class="mt-2 flex items-center gap-2 text-xs text-douyin-gray-500 cursor-pointer select-none">
                             <input type="checkbox" x-model="batchUseCache" class="accent-douyin-red w-3.5 h-3.5">
@@ -451,7 +451,7 @@
                         <p class="mt-2 text-xs text-douyin-gray-400">粘贴作者主页链接后使用；自动跳过已提取成功的视频，失败的会自动重试。若抓取不全，先点「登录抖音」一次（浏览器缓存会永久记住，不再弹窗）。</p>
                         <button
                             @click="douyinLogin"
-                            :disabled="batchRunning"
+                            :disabled="batchActive"
                             class="mt-2 w-full h-9 border border-douyin-gray-200 hover:border-douyin-gray-400 text-douyin-gray-600 text-xs rounded-lg transition-smooth disabled:opacity-50 flex items-center justify-center gap-2">
                             <span x-text="douyinLoginBtn.douyinLoginBtnLabel || douyinLoginLabel"></span>
                         </button>
@@ -460,7 +460,7 @@
                     </div>
 
                     <!-- Batch Progress Panel -->
-                    <div x-show="batchRunning || batchLogs.length" x-transition
+                    <div x-show="batchRunning || batchDetached || batchLogs.length" x-transition
                          class="mt-4 bg-douyin-gray-50 rounded-xl p-4">
                         <div class="flex items-center justify-between mb-2">
                             <p class="text-sm font-medium text-douyin-gray-700">
@@ -468,11 +468,19 @@
                                 <span x-show="batchTotal" class="text-douyin-gray-400 font-normal">
                                     (<span x-text="batchDone"></span>/<span x-text="batchTotal"></span>)
                                 </span>
-                                <span x-show="authorQueueCurrent && batchRunning" class="text-douyin-red font-normal">
-                                    · 正在刷新：<span x-text="authorQueueCurrent"></span>
+                                <span x-show="(authorQueueCurrent || backgroundLabel) && (batchRunning || batchDetached)" class="text-douyin-red font-normal">
+                                    · 正在刷新：<span x-text="authorQueueCurrent || backgroundLabel"></span>
                                 </span>
                             </p>
                             <div class="flex items-center gap-2">
+                            <button x-show="batchDetached" @click="resumeBatch()"
+                                    title="接上仍在后台运行的批量任务"
+                                    class="text-xs px-2.5 py-1 rounded-lg bg-green-50 text-green-700 hover:bg-green-100 border border-green-200 transition-smooth flex items-center gap-1 animate-pulse-soft">
+                                <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
+                                    <path d="M8 5v14l11-7z"/>
+                                </svg>
+                                继续
+                            </button>
                             <button x-show="batchRunning && !batchPaused" @click="batchPause()"
                                     class="text-xs px-2.5 py-1 rounded-lg bg-amber-50 text-amber-700 hover:bg-amber-100 border border-amber-200 transition-smooth flex items-center gap-1">
                                 <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
@@ -487,8 +495,9 @@
                                 </svg>
                                 继续
                             </button>
-                            <span x-show="batchPaused" class="text-xs text-amber-600">已暂停（当前视频完成后生效）</span>
-                            <button x-show="!batchRunning && batchLogs.length" @click="batchLogs = []; batchTotal = 0; batchDone = 0"
+                            <span x-show="batchDetached" class="text-xs text-amber-600">任务仍在后台运行，点「继续」接上</span>
+                            <span x-show="batchRunning && batchPaused" class="text-xs text-amber-600">已暂停（当前视频完成后生效）</span>
+                            <button x-show="!batchRunning && !batchDetached && batchLogs.length" @click="batchLogs = []; batchTotal = 0; batchDone = 0"
                                     class="text-xs text-douyin-gray-400 hover:text-douyin-gray-600">清空</button>
                         </div>
                         </div>
@@ -518,29 +527,39 @@
                                         class="text-xs px-2.5 py-1 rounded-lg bg-red-50 text-red-600 hover:bg-red-100 border border-red-200 transition-smooth">
                                     停止队列
                                 </button>
-                                <button x-show="!authorQueueRunning && !batchRunning" @click="batchAllAuthors()"
+                                <button x-show="!authorQueueRunning && !batchRunning && !batchDetached" @click="resumeLastTask()"
+                                        :disabled="!hasLastTask"
+                                        :title="hasLastTask && lastTaskInfo ? ('上次任务：已完成 ' + (lastTaskInfo.done || []).length + ' 位，剩余 ' + ((lastTaskInfo.pending || []).length + (lastTaskInfo.current ? 1 : 0)) + ' 位（已成功的视频会自动跳过）') : '暂无可继续的任务；运行一次「一键刷新全部」后，若中途被打断可从这里接着刷新'"
+                                        :class="hasLastTask ? 'bg-amber-50 text-amber-700 hover:bg-amber-100 border-amber-200' : 'bg-douyin-gray-100 text-douyin-gray-300 border-douyin-gray-200 cursor-not-allowed'"
+                                        class="text-xs px-2.5 py-1 rounded-lg border transition-smooth flex items-center gap-1">
+                                    <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
+                                        <path d="M8 5v14l11-7z"/>
+                                    </svg>
+                                    继续上次刷新任务
+                                </button>
+                                <button x-show="!authorQueueRunning && !batchRunning && !batchDetached" @click="batchAllAuthors()"
                                         class="text-xs px-2.5 py-1 rounded-lg bg-douyin-red/10 text-douyin-red hover:bg-douyin-red/20 border border-douyin-red/30 transition-smooth flex items-center gap-1">
                                     <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
                                         <path d="M8 5v14l11-7z"/>
                                     </svg>
                                     一键刷新全部
                                 </button>
-                                <button x-show="!authorQueueRunning && !batchRunning" @click="loadAuthors()"
+                                <button x-show="!authorQueueRunning && !batchRunning && !batchDetached" @click="loadAuthors()"
                                         class="text-xs text-douyin-gray-400 hover:text-douyin-gray-600">刷新</button>
                             </div>
                         </div>
                         <div class="space-y-2 max-h-72 overflow-y-auto">
                             <template x-for="a in authors" :key="a.name">
                                 <div class="bg-white rounded-lg px-3 py-2.5 flex items-center gap-2 hover:shadow-sm transition-smooth"
-                                     :class="a.name === authorQueueCurrent && batchRunning ? 'ring-2 ring-douyin-red/40' : (authorQueueDone.includes(a.name) ? 'opacity-75' : '')">
+                                     :class="a.name === activeUp && batchActive ? 'ring-2 ring-douyin-red/40' : (authorQueueDone.includes(a.name) ? 'opacity-75' : '')">
                                     <div class="flex-1 min-w-0">
                                         <a :href="a.profile_url || '#'" target="_blank" rel="noopener noreferrer"
                                            title="在新标签页打开作者主页"
                                            class="block text-sm font-medium truncate transition-colors"
-                                           :class="a.name === authorQueueCurrent && batchRunning ? 'text-douyin-red' : 'text-douyin-gray-800 hover:text-douyin-red'"
+                                           :class="a.name === activeUp && batchActive ? 'text-douyin-red' : 'text-douyin-gray-800 hover:text-douyin-red'"
                                            x-text="a.name"></a>
                                         <p class="text-xs truncate">
-                                            <span x-show="a.name === authorQueueCurrent && batchRunning"
+                                            <span x-show="a.name === activeUp && batchActive"
                                                   class="text-douyin-red font-medium">
                                                 刷新中 <span x-text="batchDone"></span>/<span x-text="batchTotal"></span> ·
                                             </span>
@@ -549,7 +568,7 @@
                                             <span x-show="a.last_batch_at" class="text-douyin-gray-400"> · 最近批量 <span x-text="a.last_batch_at"></span></span>
                                         </p>
                                     </div>
-                                    <button @click="batchAuthor(a)" :disabled="batchRunning"
+                                    <button @click="batchAuthor(a)" :disabled="batchActive"
                                             title="再次批量解析该作者的最新视频"
                                             class="flex-shrink-0 text-xs px-2.5 py-1.5 rounded-lg bg-douyin-pink bg-opacity-10 text-douyin-pink hover:bg-opacity-20 disabled:opacity-40 transition-smooth flex items-center gap-1">
                                         <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
@@ -855,6 +874,10 @@
                 providerConfig: { providers: {} },
                 serverApiKeyConfigured: false,
                 batchRunning: false,
+                batchPaused: false,
+                batchDetached: false,      // a background job this page is not attached to
+                backgroundLabel: '',       // UP name of that background job
+                batchLastSeq: 0,           // last stream event applied (per job)
                 batchLogs: [],
                 batchTotal: 0,
                 batchDone: 0,
@@ -864,6 +887,8 @@
                 authorQueueRunning: false, // serial refresh-all mode in progress
                 authorQueueCurrent: '',    // UP currently being refreshed
                 authorQueueDone: [],       // UPs finished in this refresh-all run
+                hasLastTask: false,        // a saved refresh-all queue exists on disk
+                lastTaskInfo: null,        // its contents (tooltip / confirm text)
                 douyinLoggedIn: false,
                 douyinLoginLabel: '登录抖音（可选，抓取不全时使用）',
                 polishInput: { enabled: false, api_key: '', api_base_url: '', model: '' },
@@ -882,6 +907,16 @@
                     return {};
                 },
 
+                get batchActive() {
+                    // True while a batch is progressing, whether this page is
+                    // attached to it or only watching it from the outside.
+                    return this.batchRunning || this.batchDetached;
+                },
+
+                get activeUp() {
+                    return this.authorQueueCurrent || this.backgroundLabel;
+                },
+
                 async checkDouyinLogin() {
                     try {
                         const res = await fetch('/api/douyin/login-status');
@@ -891,7 +926,7 @@
                 },
 
                 async douyinLogin() {
-                    if (this.batchRunning) return;
+                    if (this.batchActive) return;
                     const prevLabel = this.douyinLoginLabel;
                     this.douyinLoginLabel = '浏览器窗口已打开，请在窗口中登录...';
                     this.addBatchLog('正在打开浏览器窗口，请在其中登录抖音（扫码/短信/密码均可）...', 'warn');
@@ -945,7 +980,159 @@
                     }
                     await this.loadConfig();
                     await this.checkDouyinLogin();
-                    this.loadAuthors();
+                    await this.loadAuthors();
+                    await this.checkBackgroundBatch();
+                    await this.loadLastTask();
+                },
+
+                async _fetchServiceStatus() {
+                    try {
+                        const res = await fetch('/api/service/status');
+                        return await res.json();
+                    } catch (e) { return null; }
+                },
+
+                async checkBackgroundBatch() {
+                    // A reload (or a dropped stream) leaves the batch running in
+                    // the background with no UI attached to it. Detect that and
+                    // offer the "继续" button instead of pretending nothing runs.
+                    const st = await this._fetchServiceStatus();
+                    if (!st) return;
+                    if (!st.batch_running) {
+                        sessionStorage.removeItem('douyin_author_queue');
+                        return;
+                    }
+                    this.batchDetached = true;
+                    this.batchPaused = !!st.batch_paused;
+                    this.backgroundLabel = st.batch_label || '';
+                    let saved = this._restoreQueueState();
+                    if (!saved || !saved.running) {
+                        // A fresh tab (or a restarted browser) has no
+                        // sessionStorage, but the durable task file still knows
+                        // which UPs are left.
+                        const task = await this._fetchLastTask();
+                        if (task) {
+                            saved = {
+                                running: true,
+                                remaining: (task.pending || [])
+                                    .map(n => this.authors.find(a => a.name === n))
+                                    .filter(Boolean),
+                                current: task.current || '',
+                                done: task.done || []
+                            };
+                        }
+                    }
+                    if (saved && saved.running) {
+                        // Same tab as the interrupted run: pick its refresh-all
+                        // queue back up where it stopped.
+                        this.authorQueue = saved.remaining || [];
+                        this.authorQueueDone = saved.done || [];
+                        this.authorQueueRunning = true;
+                        this.authorQueueCurrent = st.batch_label || saved.current || '';
+                    }
+                },
+
+                _saveQueueState() {
+                    // sessionStorage, not localStorage: the refresh-all queue
+                    // must not be picked up by a second tab and driven twice.
+                    try {
+                        sessionStorage.setItem('douyin_author_queue', JSON.stringify({
+                            running: this.authorQueueRunning,
+                            remaining: this.authorQueue,
+                            current: this.authorQueueCurrent,
+                            done: this.authorQueueDone
+                        }));
+                    } catch (e) { /* private mode: queue just won't survive a reload */ }
+                },
+
+                _restoreQueueState() {
+                    try {
+                        const raw = sessionStorage.getItem('douyin_author_queue');
+                        return raw ? JSON.parse(raw) : null;
+                    } catch (e) { return null; }
+                },
+
+                _persistTask() {
+                    // Durable mirror of the refresh-all queue: sessionStorage
+                    // dies with the tab, this file does not. Only refresh-all
+                    // runs are recorded, so a manual "再次批量" never overwrites
+                    // the task the button offers to continue.
+                    if (!this.authorQueueRunning) return;
+                    const task = {
+                        pending: this.authorQueue.map(a => a.name),
+                        current: this.authorQueueCurrent,
+                        done: this.authorQueueDone,
+                        total: this.authorQueue.length + this.authorQueueDone.length
+                               + (this.authorQueueCurrent ? 1 : 0)
+                    };
+                    this.lastTaskInfo = task;
+                    this.hasLastTask = true;
+                    fetch('/api/refresh-task', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(task)
+                    }).catch(() => {});
+                },
+
+                async _fetchLastTask() {
+                    try {
+                        const res = await fetch('/api/refresh-task');
+                        const data = await res.json();
+                        return data.task || null;
+                    } catch (e) { return null; }
+                },
+
+                async loadLastTask() {
+                    const task = await this._fetchLastTask();
+                    this.lastTaskInfo = task;
+                    this.hasLastTask = !!(task && (task.current || (task.pending || []).length));
+                },
+
+                _clearTask() {
+                    // The refresh-all run finished: nothing left to continue.
+                    this.hasLastTask = false;
+                    this.lastTaskInfo = null;
+                    fetch('/api/refresh-task', { method: 'DELETE' }).catch(() => {});
+                },
+
+                async resumeLastTask() {
+                    // Continue the last refresh-all run. The UP that was in
+                    // flight is re-run first - its already-extracted videos are
+                    // skipped by history dedup, so only what is missing is
+                    // processed - then the remaining queue follows.
+                    if (this.batchActive) return;
+                    const task = await this._fetchLastTask();
+                    const pending = (task && task.pending) || [];
+                    if (!task || (!task.current && !pending.length)) {
+                        this.hasLastTask = false;
+                        this.showToast('没有可继续的刷新任务');
+                        return;
+                    }
+                    if (!this.apiKeyConfigured) { this.showSettings = true; return; }
+                    const todo = (task.current ? 1 : 0) + pending.length;
+                    if (!confirm(`继续上次刷新任务：从「${task.current || pending[0]}」接着刷新，还剩 ${todo} 位 UP（上次已成功提取的视频会自动跳过），开始？`)) return;
+
+                    this.batchLogs = [];
+                    this.batchTotal = 0;
+                    this.batchDone = 0;
+                    this.authorQueueDone = (task.done || []).slice();
+                    this.authorQueue = pending
+                        .map(n => this.authors.find(a => a.name === n))
+                        .filter(Boolean);
+                    this.authorQueueRunning = true;
+
+                    const first = task.current
+                        ? this.authors.find(a => a.name === task.current) : null;
+                    if (first) {
+                        this.addBatchLog(`—— 继续上次刷新任务：从「${first.name}」开始（还剩 ${todo} 位）——`, 'warn');
+                        this._startBatchAuthor(first);
+                    } else if (this.authorQueue.length) {
+                        this._startBatchAuthor(this.authorQueue.shift());
+                    } else {
+                        this.authorQueueRunning = false;
+                        this._clearTask();
+                        this.addBatchLog('上次刷新任务已无剩余内容', 'warn');
+                    }
                 },
 
                 async loadAuthors() {
@@ -958,7 +1145,7 @@
 
                 batchAuthor(a) {
                     // Manual single-author batch: cancel any pending queue
-                    if (this.batchRunning) return;
+                    if (this.batchActive) return;
                     this.authorQueue = [];
                     this.authorQueueRunning = false;
                     this._startBatchAuthor(a);
@@ -974,7 +1161,7 @@
                 batchAllAuthors() {
                     // Serially refresh every known UP (one batch at a time,
                     // the global single-job lock enforces the rest).
-                    if (this.batchRunning || !this.authors.length) return;
+                    if (this.batchActive || !this.authors.length) return;
                     if (!this.apiKeyConfigured) {
                         this.showSettings = true;
                         return;
@@ -991,9 +1178,14 @@
                 },
 
                 stopAuthorQueue() {
-                    // Stop after the current author's batch finishes
+                    // Stop after the current author's batch finishes. The
+                    // remaining UP list stays on disk so 「继续上次刷新任务」 can
+                    // pick the run back up later.
+                    this._persistTask();
                     this.authorQueue = [];
                     this.authorQueueRunning = false;
+                    try { sessionStorage.removeItem('douyin_author_queue'); } catch (e) {}
+                    this.addBatchLog('已停止逐个刷新；剩余 UP 可用「继续上次刷新任务」恢复', 'warn');
                 },
 
                 continueAuthorQueue() {
@@ -1001,9 +1193,14 @@
                     if (this.authorQueueRunning && this.authorQueue.length) {
                         this._startBatchAuthor(this.authorQueue.shift());
                     } else {
+                        if (this.authorQueueRunning) {
+                            // Refresh-all finished: nothing left to continue.
+                            this._clearTask();
+                        }
                         this.authorQueueRunning = false;
                         this.authorQueueCurrent = '';
                     }
+                    this._saveQueueState();
                 },
 
                 async removeAuthor(a) {
@@ -1149,7 +1346,7 @@
                 },
 
                 async batchExtract() {
-                    if (!this.url || this.batchRunning) return;
+                    if (!this.url || this.batchActive) return;
                     if (!this.apiKeyConfigured) {
                         this.showSettings = true;
                         return;
@@ -1157,6 +1354,7 @@
 
                     this.batchRunning = true;
                     this.batchPaused = false;
+                    this.batchLastSeq = 0;
                     if (this.authorQueueRunning) {
                         // Refresh-all mode: keep earlier UPs' logs, mark a new section
                         this.batchTotal = 0;
@@ -1168,10 +1366,13 @@
                         this.batchTotal = 0;
                         this.batchDone = 0;
                     }
+                    this._saveQueueState();
+                    this._persistTask();
                     this.resetState();
                     this.loading = true;
                     this.loadingText = `批量提取中，正在读取 ${this.authorQueueCurrent || '作者'} 的视频列表...`;
 
+                    let ended = false;
                     try {
                         const res = await fetch('/api/profile/batch', {
                             method: 'POST',
@@ -1179,6 +1380,7 @@
                             body: JSON.stringify({
                                 url: this.url,
                                 provider: this.activeProvider,
+                                author: this.authorQueueCurrent || '',
                                 use_cache: this.batchUseCache
                             })
                         });
@@ -1188,35 +1390,96 @@
                             throw new Error(err.detail || '批量任务启动失败');
                         }
 
-                        // Read SSE-style stream
-                        const reader = res.body.getReader();
-                        const decoder = new TextDecoder();
-                        let buf = '';
-                        while (true) {
-                            const { done, value } = await reader.read();
-                            if (done) break;
-                            buf += decoder.decode(value, { stream: true });
-                            const lines = buf.split('\n');
-                            buf = lines.pop() || '';
-                            for (const line of lines) {
-                                if (!line.startsWith('data: ')) continue;
-                                let evt;
-                                try { evt = JSON.parse(line.slice(6)); } catch (e) { continue; }
-                                this.handleBatchEvent(evt);
-                            }
-                        }
+                        ended = await this._consumeBatchStream(res);
                     } catch (e) {
                         this.addBatchLog('批量任务失败: ' + (e.message || e), 'error');
                         this.error = e.message || '批量任务失败';
                     } finally {
                         this.batchRunning = false;
                         this.loading = false;
-                        if (this.authorQueueRunning && this.authorQueueCurrent && !this.authorQueueDone.includes(this.authorQueueCurrent)) {
-                            this.authorQueueDone.push(this.authorQueueCurrent); // mark UP as refreshed
-                        }
-                        this.loadAuthors(); // refresh author registry (new UP / new counts)
-                        this.continueAuthorQueue(); // chain to next UP in refresh-all mode
+                        await this._finishBatchStep(ended);
                     }
+                },
+
+                async resumeBatch() {
+                    // Reattach to the job that kept running while this page was
+                    // reloaded (or its stream was dropped).
+                    if (this.batchRunning || !this.batchDetached) return;
+                    this.batchDetached = false;
+                    this.batchRunning = true;
+                    this.batchPaused = false;
+                    this.loading = true;
+                    this.loadingText = '正在接上后台任务...';
+                    this.addBatchLog(`正在接上后台任务${this.backgroundLabel ? '（' + this.backgroundLabel + '）' : ''}，回放已错过的进度...`, 'warn');
+
+                    let ended = false;
+                    try {
+                        const res = await fetch('/api/profile/batch/stream');
+                        if (!res.ok) throw new Error('接上后台任务失败');
+                        ended = await this._consumeBatchStream(res);
+                    } catch (e) {
+                        this.addBatchLog('接上后台任务失败: ' + (e.message || e), 'error');
+                        this.error = e.message || '接上后台任务失败';
+                    } finally {
+                        this.batchRunning = false;
+                        this.loading = false;
+                        await this._finishBatchStep(ended);
+                    }
+                },
+
+                async _consumeBatchStream(res) {
+                    // Shared by a fresh run and a reattach. Returns true when the
+                    // stream ended on a final event, false when it just dropped.
+                    const reader = res.body.getReader();
+                    const decoder = new TextDecoder();
+                    let buf = '';
+                    let ended = false;
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        buf += decoder.decode(value, { stream: true });
+                        const lines = buf.split('\n');
+                        buf = lines.pop() || '';
+                        for (const line of lines) {
+                            if (!line.startsWith('data: ')) continue;
+                            let evt;
+                            try { evt = JSON.parse(line.slice(6)); } catch (e) { continue; }
+                            if (evt.stage === 'done' || evt.stage === 'error' || evt.stage === 'closed') ended = true;
+                            // A reattach replays events this page already applied;
+                            // seq restarts per job, so skipping by seq is safe.
+                            if (typeof evt.seq === 'number') {
+                                if (evt.seq <= this.batchLastSeq) continue;
+                                this.batchLastSeq = evt.seq;
+                            }
+                            this.handleBatchEvent(evt);
+                        }
+                    }
+                    return ended;
+                },
+
+                async _finishBatchStep(ended) {
+                    if (!ended) {
+                        // The stream dropped without a final event: the job may
+                        // still be running in the background. Chaining the queue
+                        // here would collide with it on the single-job lock, so
+                        // offer to reattach instead.
+                        const st = await this._fetchServiceStatus();
+                        if (st && st.batch_running) {
+                            this.batchDetached = true;
+                            this.batchPaused = !!st.batch_paused;
+                            this.backgroundLabel = st.batch_label || this.authorQueueCurrent || '';
+                            this.addBatchLog('进度连接中断，但后台任务仍在运行，点「继续」可接上', 'warn');
+                            return;
+                        }
+                    }
+                    this.backgroundLabel = '';
+                    this.batchDetached = false;
+                    if (this.authorQueueRunning && this.authorQueueCurrent && !this.authorQueueDone.includes(this.authorQueueCurrent)) {
+                        this.authorQueueDone.push(this.authorQueueCurrent); // mark UP as refreshed
+                    }
+                    this._saveQueueState();
+                    this.loadAuthors(); // refresh author registry (new UP / new counts)
+                    this.continueAuthorQueue(); // chain to next UP in refresh-all mode
                 },
 
                 handleBatchEvent(evt) {

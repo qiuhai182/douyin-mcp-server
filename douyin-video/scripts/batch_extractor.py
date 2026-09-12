@@ -173,7 +173,9 @@ class AuthorRegistry:
                 "last_batch_at": e.get("last_batch_at", ""),
                 "video_count": n_videos,
             })
-        items.sort(key=lambda x: x.get("last_batch_at", ""), reverse=True)
+        # Ascending by video count: the UP with the fewest videos is
+        # refreshed first (name breaks ties, so the order stays stable).
+        items.sort(key=lambda x: (x.get("video_count") or 0, x.get("name", "")))
         return items
 
     def register(self, name: str, profile_url: str, sec_uid: str = ""):
