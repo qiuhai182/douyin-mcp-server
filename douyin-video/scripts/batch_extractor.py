@@ -518,6 +518,7 @@ def batch_extract(
         if cached and cached.get("videos") and cached.get("logged_in", False):
             profile = cached
             _report({"stage": "list", "found": len(profile["videos"]),
+                     "nickname": profile.get("nickname", ""),
                      "notice": f"使用缓存视频列表（{len(profile['videos'])} 个，{cached.get('cached_at', '')}）"})
         elif cached and cached.get("videos"):
             # The cached list came from an anonymous session and is likely
@@ -542,7 +543,8 @@ def batch_extract(
             except Exception:
                 pass
     videos = profile.get("videos", [])
-    _report({"stage": "list", "found": len(videos)})
+    _report({"stage": "list", "found": len(videos),
+             "nickname": profile.get("nickname", "")})
 
     history = TranscriptHistory()
     backend_cfg = resolve_backend(api_key, provider, model, api_base_url)

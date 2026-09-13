@@ -111,7 +111,7 @@
         }
     </style>
 </head>
-<body class="bg-douyin-gray-50 min-h-screen lg:h-screen lg:overflow-hidden bg-gradient-mesh flex flex-col" x-data="douyinExtractor()" x-init="checkHealth()">
+<body class="bg-douyin-gray-50 min-h-screen lg:h-screen lg:overflow-hidden bg-gradient-mesh flex flex-col" x-data="douyinExtractor()" x-init="checkHealth(); loadPendingLinks(); startQueueWatchers()">
 
     <!-- Top Navigation Bar -->
     <nav class="sticky top-0 z-50 flex-shrink-0 bg-white/80 backdrop-blur-xl border-b border-douyin-gray-100">
@@ -378,6 +378,151 @@
         </div>
     </div>
 
+    <!-- Remove Author Confirm Modal -->
+    <div x-show="authorToRemove" x-transition.opacity class="fixed inset-0 z-50 bg-black/50 backdrop-blur-sm flex items-center justify-center p-4"
+         @click.self="authorToRemove = null"
+         @keydown.escape.window="authorToRemove = null">
+        <div x-show="authorToRemove" x-transition:enter="transition ease-out duration-200"
+             x-transition:enter-start="opacity-0 scale-95" x-transition:enter-end="opacity-100 scale-100"
+             class="bg-white rounded-2xl shadow-2xl max-w-sm w-full p-6 animate-fadeIn">
+            <div class="flex items-start gap-3 mb-4">
+                <div class="w-10 h-10 rounded-xl bg-red-50 flex items-center justify-center flex-shrink-0">
+                    <svg class="w-5 h-5 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
+                    </svg>
+                </div>
+                <div class="min-w-0">
+                    <h3 class="text-base font-semibold text-douyin-gray-900">从列表移除该 UP？</h3>
+                    <p class="mt-1 text-sm text-douyin-gray-600 break-all" x-text="authorToRemove ? authorToRemove.name : ''"></p>
+                </div>
+            </div>
+            <p class="text-xs text-douyin-gray-400 leading-relaxed mb-5">
+                仅从列表移除，本地已提取的文案文件全部保留；之后对同一 UP
+                再次批量解析时，会自动重新加入列表。
+            </p>
+            <div class="flex gap-2">
+                <button @click="authorToRemove = null"
+                        class="flex-1 h-10 border border-douyin-gray-200 hover:bg-douyin-gray-50 text-douyin-gray-600 text-sm rounded-xl transition-smooth">
+                    取消
+                </button>
+                <button @click="confirmRemoveAuthor()"
+                        :disabled="removingAuthor"
+                        class="flex-1 h-10 bg-red-500 hover:bg-red-600 text-white text-sm rounded-xl transition-smooth disabled:opacity-50">
+                    <span x-text="removingAuthor ? '移除中...' : '移除'"></span>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Pending Links Manager Modal -->
+    <div x-show="showPendingModal" x-transition.opacity
+         class="fixed inset-0 z-50 bg-black/50 backdrop-blur-sm flex items-center justify-center p-4"
+         @click.self="showPendingModal = false"
+         @keydown.escape.window="showPendingModal = false">
+        <div x-show="showPendingModal" x-transition:enter="transition ease-out duration-200"
+             x-transition:enter-start="opacity-0 scale-95" x-transition:enter-end="opacity-100 scale-100"
+             class="bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[85vh] flex flex-col">
+            <!-- Header -->
+            <div class="flex items-center justify-between px-6 py-4 border-b border-douyin-gray-100 flex-shrink-0">
+                <div class="min-w-0">
+                    <h3 class="text-base font-semibold text-douyin-gray-900">待解析列表</h3>
+                    <p class="text-xs text-douyin-gray-400 mt-0.5">当前任务结束后按顺序自动执行 · 拖动条目排序 · 点铅笔编辑链接（仅待处理项）</p>
+                </div>
+                <button @click="showPendingModal = false"
+                        class="flex-shrink-0 w-8 h-8 rounded-lg bg-douyin-gray-100 hover:bg-douyin-gray-200 flex items-center justify-center transition-smooth">
+                    <svg class="w-4 h-4 text-douyin-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                    </svg>
+                </button>
+            </div>
+            <!-- Add row -->
+            <div class="px-6 py-3 border-b border-douyin-gray-100 flex gap-2 flex-shrink-0">
+                <input x-model="pendingLinkInput" @keydown.enter="addPendingLinks()"
+                       placeholder="https://www.douyin.com/video/... 或 https://www.douyin.com/user/...（可一次粘贴多条）"
+                       class="flex-1 min-w-0 h-9 px-3 text-xs rounded-lg border border-douyin-gray-200 focus:border-douyin-red focus:outline-none bg-white">
+                <button @click="addPendingLinks()" :disabled="pendingLinkBusy || !pendingLinkInput.trim()"
+                        class="flex-shrink-0 h-9 px-4 text-xs rounded-lg bg-douyin-gray-800 hover:bg-douyin-dark text-white transition-smooth disabled:opacity-40">
+                    添加
+                </button>
+            </div>
+            <p x-show="pendingLinkMsg" x-transition class="px-6 pt-2 text-xs text-green-600 flex-shrink-0" x-text="pendingLinkMsg"></p>
+            <!-- List -->
+            <div class="flex-1 overflow-y-auto px-6 py-3 space-y-2">
+                <template x-for="it in pendingLinks" :key="it.id">
+                    <div class="bg-douyin-gray-50 rounded-xl px-3 py-2.5 flex items-center gap-2.5"
+                         :draggable="editingLinkId !== it.id"
+                         @dragstart="onLinkDragStart(it, $event)"
+                         @dragover.prevent="onLinkDragOver(it, $event)"
+                         @drop.prevent="onLinkDrop(it, $event)"
+                         @dragend="onLinkDragEnd()"
+                         :class="dragLinkId === it.id ? 'opacity-40'
+                                : (dragLinkId !== null && linkDropTargetId === it.id ? 'ring-2 ring-douyin-red/40' : '')">
+                        <svg class="w-4 h-4 text-douyin-gray-300 flex-shrink-0 cursor-grab active:cursor-grabbing" fill="currentColor" viewBox="0 0 20 20">
+                            <path d="M7 4a1 1 0 110 2H5a1 1 0 110-2h2zm8 0a1 1 0 110 2h-2a1 1 0 110-2h2zM7 9a1 1 0 110 2H5a1 1 0 110-2h2zm8 0a1 1 0 110 2h-2a1 1 0 110-2h2zm-8 5a1 1 0 110 2H5a1 1 0 110-2h2zm8 0a1 1 0 110 2h-2a1 1 0 110-2h2z"/>
+                        </svg>
+                        <span class="flex-shrink-0 text-[10px] px-1.5 py-0.5 rounded font-medium"
+                              :class="it.kind === 'up' ? 'bg-douyin-pink/10 text-douyin-pink' : 'bg-blue-50 text-blue-500'"
+                              x-text="pendingKindLabel(it)"></span>
+                        <template x-if="editingLinkId !== it.id">
+                            <a :href="it.url" target="_blank" rel="noopener noreferrer"
+                               class="flex-1 min-w-0 text-xs text-douyin-gray-600 hover:text-douyin-red truncate"
+                               :title="it.result ? it.url + '｜' + it.result : it.url" x-text="it.title || it.url"></a>
+                        </template>
+                        <template x-if="editingLinkId === it.id">
+                            <div class="flex-1 min-w-0 flex gap-1.5">
+                                <input id="edit-link-input" x-model="editingLinkUrl"
+                                       @keydown.enter="saveEditLink()" @keydown.escape="cancelEditLink()"
+                                       class="flex-1 min-w-0 h-7 px-2 text-xs rounded-md border border-douyin-red/50 focus:outline-none bg-white">
+                                <button @click="saveEditLink()" title="保存"
+                                        class="flex-shrink-0 w-7 h-7 rounded-md bg-green-500 hover:bg-green-600 flex items-center justify-center">
+                                    <svg class="w-3.5 h-3.5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                                    </svg>
+                                </button>
+                                <button @click="cancelEditLink()" title="取消"
+                                        class="flex-shrink-0 w-7 h-7 rounded-md bg-douyin-gray-200 hover:bg-douyin-gray-300 flex items-center justify-center">
+                                    <svg class="w-3.5 h-3.5 text-douyin-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                                    </svg>
+                                </button>
+                            </div>
+                        </template>
+                        <span class="flex-shrink-0 text-[10px] px-1.5 py-0.5 rounded"
+                              :class="pendingStatusClass(it.status)" x-text="pendingStatusLabel(it.status)"></span>
+                        <template x-if="editingLinkId !== it.id">
+                            <div class="flex-shrink-0 flex items-center gap-1">
+                                <button @click="startEditLink(it)" :disabled="it.status !== 'pending'" title="编辑链接"
+                                        class="w-6 h-6 rounded-lg bg-douyin-gray-100 hover:bg-blue-50 flex items-center justify-center disabled:opacity-40 disabled:cursor-not-allowed transition-smooth">
+                                    <svg class="w-3 h-3 text-douyin-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/>
+                                    </svg>
+                                </button>
+                                <button @click="removePendingLink(it)" :disabled="it.status === 'running'" title="删除"
+                                        class="w-6 h-6 rounded-lg bg-douyin-gray-100 hover:bg-red-50 flex items-center justify-center disabled:opacity-40 transition-smooth">
+                                    <svg class="w-3 h-3 text-douyin-gray-400 hover:text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                                    </svg>
+                                </button>
+                            </div>
+                        </template>
+                    </div>
+                </template>
+                <p x-show="!pendingLinks.length" class="text-center text-xs text-douyin-gray-300 py-10">队列为空，在上方粘贴链接开始排队</p>
+            </div>
+            <!-- Footer -->
+            <div class="px-6 py-3 border-t border-douyin-gray-100 flex items-center justify-between flex-shrink-0">
+                <span class="text-xs text-douyin-gray-400">
+                    待执行 <span class="font-medium text-douyin-gray-600" x-text="pendingLinks.filter(i => i.status === 'pending').length"></span>
+                    · 处理中 <span class="font-medium text-douyin-gray-600" x-text="pendingLinks.filter(i => i.status === 'running').length"></span>
+                    · 已完成/失败 <span class="font-medium text-douyin-gray-600" x-text="pendingLinks.filter(i => i.status === 'done' || i.status === 'fail').length"></span>
+                </span>
+                <button x-show="pendingLinks.some(i => i.status === 'done' || i.status === 'fail')"
+                        @click="clearFinishedLinks()"
+                        class="text-xs text-douyin-gray-400 hover:text-douyin-gray-600">清除已完成</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Main Content -->
     <main class="w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 lg:flex-1 lg:min-h-0">
         <div class="grid grid-cols-1 lg:grid-cols-12 gap-6 lg:h-full lg:min-h-0">
@@ -397,7 +542,6 @@
                                 placeholder="粘贴分享链接或文本，例如：&#10;7.89 02/February/2025 xxx https://v.douyin.com/xxxxx/"
                                 rows="4"
                                 class="w-full px-4 py-3 text-sm border border-douyin-gray-200 rounded-xl resize-none focus-ring transition-smooth placeholder:text-douyin-gray-400"
-                                :disabled="loading"
                             ></textarea>
                             <button
                                 x-show="url"
@@ -424,25 +568,26 @@
                         </button>
                         <button
                             @click="extractText"
-                            :disabled="!url || loading || !apiKeyConfigured || batchActive"
+                            :disabled="!url || !apiKeyConfigured"
                             class="flex-1 h-11 bg-gradient-douyin hover:opacity-90 text-white font-medium text-sm rounded-xl transition-smooth disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 shadow-lg shadow-douyin-red/20">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
                             </svg>
-                            提取文案
+                            <span x-text="queuedVideoPending() ? '提前解析' : (canJumpQueue() ? '插队解析' : ((batchActive || loading) ? '排队解析' : '提取文案'))"></span>
                         </button>
                     </div>
+                    <p x-show="queuedNotice" x-transition class="mt-2 text-xs text-green-600" x-text="queuedNotice"></p>
 
                     <!-- Batch Extract Button (author profile links) -->
                     <div class="mt-3">
                         <button
                             @click="batchExtract"
-                            :disabled="!url || loading || batchActive || !apiKeyConfigured"
+                            :disabled="!url || !apiKeyConfigured"
                             class="w-full h-11 border-2 border-douyin-red/30 hover:border-douyin-red hover:bg-red-50 text-douyin-red font-medium text-sm rounded-xl transition-smooth disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/>
                             </svg>
-                            <span x-text="batchActive ? '批量提取中...' : '批量提取作者全部文案'"></span>
+                            <span x-text="(batchActive || loading) ? '排队解析' : '批量提取作者全部文案'"></span>
                         </button>
                         <label class="mt-2 flex items-center gap-2 text-xs text-douyin-gray-500 cursor-pointer select-none">
                             <input type="checkbox" x-model="batchUseCache" class="accent-douyin-red w-3.5 h-3.5">
@@ -469,7 +614,7 @@
                                     (<span x-text="batchDone"></span>/<span x-text="batchTotal"></span>)
                                 </span>
                                 <span x-show="(authorQueueCurrent || backgroundLabel) && (batchRunning || batchDetached)" class="text-douyin-red font-normal">
-                                    · 正在刷新：<span x-text="authorQueueCurrent || backgroundLabel"></span>
+                                    · 正在解析「<span x-text="authorQueueCurrent || backgroundLabel"></span>」
                                 </span>
                                 <span x-show="runNew || runSkipped" class="text-green-600 font-normal"
                                       :title="'本轮任务新增 ' + runNew + ' 条，跳过 ' + runSkipped + ' 条，失败 ' + runFail + ' 条'">
@@ -515,6 +660,60 @@
                                    x-text="log.text"></p>
                             </template>
                         </div>
+                    </div>
+
+                    <!-- Pending Links Queue -->
+                    <div class="mt-4 bg-douyin-gray-50 rounded-xl p-4">
+                        <div class="flex items-center justify-between mb-2">
+                            <p class="text-sm font-medium text-douyin-gray-700">
+                                待解析列表
+                                <span x-show="pendingLinks.length" class="text-douyin-gray-400 font-normal">
+                                    (<span x-text="pendingLinks.filter(i => i.status === 'pending').length"></span> 待执行)
+                                </span>
+                            </p>
+                            <div class="flex items-center gap-3">
+                                <button @click="openPendingModal()"
+                                        class="text-xs font-medium text-douyin-red hover:opacity-80">管理</button>
+                                <button x-show="pendingLinks.some(i => i.status === 'done' || i.status === 'fail')"
+                                        @click="clearFinishedLinks()"
+                                        class="text-xs text-douyin-gray-400 hover:text-douyin-gray-600">清除已完成</button>
+                            </div>
+                        </div>
+                        <p class="text-xs text-douyin-gray-400 mb-2">粘贴链接（单个视频 / UP 主页自动识别），当前批量任务结束后自动依次执行，不打断正在运行的任务。支持一次粘贴多条（换行/逗号分隔）。</p>
+                        <div class="flex gap-2">
+                            <input x-model="pendingLinkInput" @keydown.enter="addPendingLinks()"
+                                   placeholder="https://www.douyin.com/video/... 或 https://www.douyin.com/user/..."
+                                   class="flex-1 min-w-0 h-9 px-3 text-xs rounded-lg border border-douyin-gray-200 focus:border-douyin-red focus:outline-none bg-white">
+                            <button @click="addPendingLinks()" :disabled="pendingLinkBusy || !pendingLinkInput.trim()"
+                                    class="flex-shrink-0 h-9 px-3.5 text-xs rounded-lg bg-douyin-gray-800 hover:bg-douyin-dark text-white transition-smooth disabled:opacity-40">
+                                添加
+                            </button>
+                        </div>
+                        <p x-show="pendingLinkMsg" x-transition class="mt-1.5 text-xs text-green-600" x-text="pendingLinkMsg"></p>
+                        <div x-show="pendingLinks.length" class="mt-2 space-y-1.5 max-h-56 overflow-y-auto">
+                            <template x-for="it in pendingLinks" :key="it.id">
+                                <div class="bg-white rounded-lg px-3 py-2 flex items-center gap-2">
+                                    <span class="flex-shrink-0 text-[10px] px-1.5 py-0.5 rounded font-medium"
+                                          :class="it.kind === 'up' ? 'bg-douyin-pink/10 text-douyin-pink' : 'bg-blue-50 text-blue-500'"
+                                          x-text="pendingKindLabel(it)"></span>
+                                    <a :href="it.url" target="_blank" rel="noopener noreferrer"
+                                       class="flex-1 min-w-0 text-xs text-douyin-gray-600 hover:text-douyin-red truncate"
+                                       :title="it.result ? it.url + '｜' + it.result : it.url" x-text="it.title || it.url"></a>
+                                    <span class="flex-shrink-0 text-[10px] px-1.5 py-0.5 rounded"
+                                          :class="pendingStatusClass(it.status)" x-text="pendingStatusLabel(it.status)"></span>
+                                    <button @click="removePendingLink(it)" :disabled="it.status === 'running'"
+                                            title="从队列移除"
+                                            class="flex-shrink-0 w-6 h-6 rounded-lg bg-douyin-gray-100 hover:bg-red-50 flex items-center justify-center disabled:opacity-40 transition-smooth">
+                                        <svg class="w-3 h-3 text-douyin-gray-400 hover:text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                                        </svg>
+                                    </button>
+                                </div>
+                            </template>
+                        </div>
+                        <p x-show="pendingLinks.some(i => i.status === 'pending')" class="mt-2 text-[11px] text-douyin-gray-400">
+                            <span x-text="pendingLinks.filter(i => i.status === 'pending').length"></span> 条排队中，将在当前任务结束后自动开始
+                        </p>
                     </div>
 
                     <!-- Known Authors Panel -->
@@ -583,6 +782,14 @@
                                             <path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/>
                                         </svg>
                                         再次批量
+                                    </button>
+                                    <button @click="queueAuthor(a)"
+                                            title="加入待解析队列（当前任务完成后自动批量，可排队多个 UP）"
+                                            class="flex-shrink-0 text-xs px-2.5 py-1.5 rounded-lg bg-blue-50 text-blue-500 hover:bg-blue-100 transition-smooth flex items-center gap-1">
+                                        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"/>
+                                        </svg>
+                                        加入队列
                                     </button>
                                     <button @click="openAuthorDir(a)" title="打开输出文件夹"
                                             class="flex-shrink-0 w-7 h-7 rounded-lg bg-douyin-gray-100 hover:bg-douyin-gray-200 flex items-center justify-center transition-smooth">
@@ -895,6 +1102,18 @@
                 runFinished: false,        // 本轮任务已结束（用于展示汇总条）
                 batchUseCache: false,
                 authors: [],
+                authorToRemove: null,      // 待确认移除的作者（弹窗确认用）
+                removingAuthor: false,
+                pendingLinks: [],          // 待解析链接队列（后端持久化，批量结束后自动执行）
+                pendingLinkInput: '',
+                pendingLinkBusy: false,
+                pendingLinkMsg: '',
+                queuedNotice: '',          // 主输入框「排队解析」的反馈提示
+                showPendingModal: false,   // 待解析列表独立管理弹窗
+                editingLinkId: null,       // 正在编辑链接的条目 id
+                editingLinkUrl: '',
+                dragLinkId: null,          // 拖拽排序：被拖动条目 id
+                linkDropTargetId: null,    // 拖拽排序：当前落点条目 id
                 authorQueue: [],           // remaining UPs for "refresh all" mode
                 authorQueueRunning: false, // serial refresh-all mode in progress
                 authorQueueCurrent: '',    // UP currently being refreshed
@@ -1123,7 +1342,20 @@
                     // flight is re-run first - its already-extracted videos are
                     // skipped by history dedup, so only what is missing is
                     // processed - then the remaining queue follows.
+                    // 插队解析永远优先：它运行期间不发起新批量、不动任何状态
+                    if (this.loading) {
+                        this.showToast('插队解析进行中，完成后再继续刷新任务');
+                        return;
+                    }
                     if (this.batchActive) return;
+                    // 后台批量仍在运行（含已暂停）时不能发起新批量：会重复抢锁、清乱进度
+                    const st = await this._fetchServiceStatus();
+                    if (st && st.batch_running) {
+                        this.showToast(st.batch_paused
+                            ? '后台批量已暂停：请在批量进度区点「继续」恢复，或等插队解析完成'
+                            : '后台批量仍在运行，无法继续刷新任务');
+                        return;
+                    }
                     const task = await this._fetchLastTask();
                     const pending = (task && task.pending) || [];
                     if (!task || (!task.current && !pending.length)) {
@@ -1184,6 +1416,28 @@
                     this.authorQueueCurrent = a.name;
                     this.url = a.profile_url;
                     this.batchExtract();
+                },
+
+                async queueAuthor(a) {
+                    // 把已知 UP 加入待解析队列（当前任务完成后自动批量），不打断正在运行的任务
+                    if (!a.profile_url) {
+                        this.showToast('该作者缺少主页链接，无法加入队列');
+                        return;
+                    }
+                    try {
+                        const res = await fetch('/api/pending-links', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ urls: [a.profile_url], titles: [a.name] })
+                        });
+                        const data = await res.json();
+                        this.pendingLinks = data.items || [];
+                        this.showToast(data.added
+                            ? `「${a.name}」已加入待解析队列`
+                            : '该作者已在待解析队列中');
+                    } catch (e) {
+                        this.showToast('加入队列失败，请重试');
+                    }
                 },
 
                 batchAllAuthors() {
@@ -1251,12 +1505,205 @@
                     this.addBatchLog(`—— 本轮任务完成：${parts.join('，')} ——`, 'ok');
                 },
 
-                async removeAuthor(a) {
-                    if (!confirm(`从列表移除「${a.name}」？（不删除已提取的文案文件）`)) return;
+                removeAuthor(a) {
+                    // 弹窗确认后才移除（只删注册表记录，不动本地文件）
+                    this.authorToRemove = a;
+                },
+
+                async confirmRemoveAuthor() {
+                    if (!this.authorToRemove || this.removingAuthor) return;
+                    this.removingAuthor = true;
                     try {
-                        await fetch('/api/authors?name=' + encodeURIComponent(a.name), { method: 'DELETE' });
+                        await fetch('/api/authors?name=' + encodeURIComponent(this.authorToRemove.name), { method: 'DELETE' });
                         await this.loadAuthors();
+                    } catch (e) { /* ignore */ } finally {
+                        this.authorToRemove = null;
+                        this.removingAuthor = false;
+                    }
+                },
+
+                // ---------- 待解析链接队列 ----------
+                async loadPendingLinks() {
+                    try {
+                        const res = await fetch('/api/pending-links');
+                        const data = await res.json();
+                        this.pendingLinks = data.items || [];
                     } catch (e) { /* ignore */ }
+                },
+
+                async addPendingLinks() {
+                    const urls = (this.pendingLinkInput || '')
+                        .split(/\s+|[,，;；]+/).map(s => s.trim()).filter(Boolean);
+                    if (!urls.length || this.pendingLinkBusy) return;
+                    this.pendingLinkBusy = true;
+                    try {
+                        const res = await fetch('/api/pending-links', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ urls })
+                        });
+                        const data = await res.json();
+                        this.pendingLinkInput = '';
+                        this.pendingLinks = data.items || [];
+                        this.pendingLinkMsg = `已加入 ${data.added} 条` +
+                            (data.duplicates ? `，${data.duplicates} 条重复已忽略` : '');
+                        setTimeout(() => this.pendingLinkMsg = '', 4000);
+                    } catch (e) {
+                        this.pendingLinkMsg = '加入失败，请重试';
+                    } finally { this.pendingLinkBusy = false; }
+                },
+
+                async removePendingLink(it) {
+                    try {
+                        const res = await fetch('/api/pending-links/' + it.id, { method: 'DELETE' });
+                        if (res.ok) {
+                            const data = await res.json();
+                            this.pendingLinks = data.items || [];
+                        }
+                    } catch (e) { /* ignore */ }
+                },
+
+                async clearFinishedLinks() {
+                    try {
+                        const res = await fetch('/api/pending-links/clear-finished', { method: 'POST' });
+                        const data = await res.json();
+                        this.pendingLinks = data.items || [];
+                    } catch (e) { /* ignore */ }
+                },
+
+                pendingKindLabel(it) { return it.kind === 'up' ? 'UP主页' : '单个视频'; },
+                pendingStatusLabel(st) {
+                    return st === 'running' ? '处理中' : st === 'done' ? '已完成'
+                         : st === 'fail' ? '失败' : '待处理';
+                },
+                pendingStatusClass(st) {
+                    return st === 'running' ? 'bg-red-50 text-douyin-red'
+                         : st === 'done' ? 'bg-green-50 text-green-600'
+                         : st === 'fail' ? 'bg-red-100 text-red-600'
+                         : 'bg-douyin-gray-100 text-douyin-gray-500';
+                },
+
+                // ---------- 待解析列表管理弹窗：编辑 / 删除 / 拖拽排序 ----------
+                async openPendingModal() {
+                    await this.loadPendingLinks();
+                    this.showPendingModal = true;
+                },
+                startEditLink(it) {
+                    if (it.status !== 'pending') return; // 仅待处理条目可编辑
+                    this.editingLinkId = it.id;
+                    this.editingLinkUrl = it.url;
+                    this.$nextTick(() => {
+                        const el = document.getElementById('edit-link-input');
+                        if (el) { el.focus(); el.select(); }
+                    });
+                },
+                cancelEditLink() { this.editingLinkId = null; this.editingLinkUrl = ''; },
+                async saveEditLink() {
+                    if (this.editingLinkId == null) return;
+                    const url = (this.editingLinkUrl || '').trim();
+                    if (!/^https?:\/\//i.test(url)) {
+                        this.pendingLinkMsg = '链接格式无效（需以 http(s):// 开头）';
+                        return;
+                    }
+                    try {
+                        const res = await fetch('/api/pending-links/' + this.editingLinkId, {
+                            method: 'PUT',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ url })
+                        });
+                        if (res.ok) {
+                            const data = await res.json();
+                            this.pendingLinks = data.items || [];
+                            this.cancelEditLink();
+                            this.pendingLinkMsg = '已保存';
+                            setTimeout(() => this.pendingLinkMsg = '', 3000);
+                        } else {
+                            this.pendingLinkMsg = '保存失败：条目可能已在处理中';
+                        }
+                    } catch (e) { this.pendingLinkMsg = '保存失败，请重试'; }
+                },
+                onLinkDragStart(it, e) {
+                    this.dragLinkId = it.id;
+                    e.dataTransfer.effectAllowed = 'move';
+                    try { e.dataTransfer.setData('text/plain', String(it.id)); } catch (err) {}
+                },
+                onLinkDragOver(it, e) {
+                    if (this.dragLinkId == null || this.dragLinkId === it.id) return;
+                    this.linkDropTargetId = it.id;
+                },
+                async onLinkDrop(it, e) {
+                    if (this.dragLinkId == null || this.dragLinkId === it.id) return;
+                    const from = this.pendingLinks.findIndex(i => i.id === this.dragLinkId);
+                    const to = this.pendingLinks.findIndex(i => i.id === it.id);
+                    if (from < 0 || to < 0) return;
+                    const [moved] = this.pendingLinks.splice(from, 1);
+                    this.pendingLinks.splice(to, 0, moved);
+                    this.dragLinkId = null;
+                    this.linkDropTargetId = null;
+                    await this.persistLinkOrder();
+                },
+                onLinkDragEnd() { this.dragLinkId = null; this.linkDropTargetId = null; },
+                async persistLinkOrder() {
+                    try {
+                        const res = await fetch('/api/pending-links/reorder', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ ids: this.pendingLinks.map(i => i.id) })
+                        });
+                        if (res.ok) {
+                            const data = await res.json();
+                            this.pendingLinks = data.items || [];
+                        }
+                    } catch (e) { /* ignore */ }
+                },
+
+                // ---------- 主输入框「排队解析」：忙时点击 = 加入待解析队列 ----------
+                async queueFromMainInput() {
+                    const text = (this.url || '').trim();
+                    if (!text) return;
+                    // 分享文本里可能夹杂文字，抽出所有 http(s) 链接
+                    const urls = text.match(/https?:\/\/[^\s,,;，；"']+/g) || [];
+                    if (!urls.length) {
+                        this.queuedNotice = '未在输入中找到有效链接（需以 http(s):// 开头）';
+                        clearTimeout(this._queueNoticeTimer);
+                        this._queueNoticeTimer = setTimeout(() => this.queuedNotice = '', 4000);
+                        return;
+                    }
+                    try {
+                        const res = await fetch('/api/pending-links', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ urls })
+                        });
+                        const data = await res.json();
+                        this.pendingLinks = data.items || [];
+                        this.queuedNotice = data.added
+                            ? `已加入待解析队列 ${data.added} 条${data.duplicates ? `（重复 ${data.duplicates} 条已忽略）` : ''}，当前解析完成后自动开始`
+                            : '该链接已在待解析队列中，无需重复添加';
+                        this.url = '';
+                    } catch (e) {
+                        this.queuedNotice = '加入队列失败，请重试';
+                    }
+                    clearTimeout(this._queueNoticeTimer);
+                    this._queueNoticeTimer = setTimeout(() => this.queuedNotice = '', 5000);
+                },
+
+                startQueueWatchers() {
+                    // 8s: refresh queue item statuses; 6s: if the backend queue
+                    // runner auto-started the next item, silently reattach the
+                    // progress stream so the UI follows queued work seamlessly.
+                    if (this._queueWatchers) return;
+                    this._queueWatchers = true;
+                    setInterval(() => this.loadPendingLinks(), 8000);
+                    setInterval(async () => {
+                        try {
+                            const st = await this._fetchServiceStatus();
+                            if (st && st.batch_running && !this.batchActive && !this.authorQueueRunning) {
+                                this.batchDetached = true;
+                                this.resumeBatch();
+                            }
+                        } catch (e) { /* ignore */ }
+                    }, 6000);
                 },
 
                 openAuthorDir(a) {
@@ -1386,15 +1833,27 @@
                             const err = await res.json().catch(() => ({}));
                             throw new Error(err.detail || '继续失败');
                         }
-                        this.batchPaused = false;
-                        this.addBatchLog('已继续，开始处理剩余视频...', 'ok');
+                        const data = await res.json().catch(() => ({}));
+                        if (data.status === 'deferred') {
+                            // 插队解析优先：继续指令已挂起，插队完成后自动生效
+                            this.addBatchLog(data.notice || '插队解析进行中，完成后批量将自动继续', 'warn');
+                        } else {
+                            this.batchPaused = false;
+                            this.addBatchLog('已继续，开始处理剩余视频...', 'ok');
+                        }
                     } catch (e) {
                         this.showToast(e.message || '继续失败');
                     }
                 },
 
                 async batchExtract() {
-                    if (!this.url || this.batchActive) return;
+                    if (!this.url || !this.url.trim()) return;
+
+                    // 忙时不打断：把链接加入待解析队列（UP/视频自动识别）
+                    if (this.batchActive || this.loading) {
+                        await this.queueFromMainInput();
+                        return;
+                    }
                     if (!this.apiKeyConfigured) {
                         this.showSettings = true;
                         return;
@@ -1461,14 +1920,39 @@
                     this.loadingText = '正在接上后台任务...';
                     this.addBatchLog(`正在接上后台任务${this.backgroundLabel ? '（' + this.backgroundLabel + '）' : ''}，回放已错过的进度...`, 'warn');
 
+                    // 服务重启/任务中断后已无可接上的任务：优雅降级，不报网络错误
+                    try {
+                        const st = await (await fetch('/api/service/status')).json();
+                        if (!st.batch_running) {
+                            this.batchRunning = false;
+                            this.loading = false;
+                            this.addBatchLog('后台批量任务已不存在（服务重启或任务被中断）', 'warn');
+                            this.addBatchLog('用「继续上次刷新任务」或对该作者「再次批量」续跑剩余视频，已提取的部分会自动跳过', 'warn');
+                            this.batchDetached = false;
+                            await this._finishBatchStep(false);
+                            return;
+                        }
+                    } catch (e) { /* 状态查询失败：仍尝试连接流 */ }
+
                     let ended = false;
                     try {
                         const res = await fetch('/api/profile/batch/stream');
                         if (!res.ok) throw new Error('接上后台任务失败');
                         ended = await this._consumeBatchStream(res);
                     } catch (e) {
-                        this.addBatchLog('接上后台任务失败: ' + (e.message || e), 'error');
-                        this.error = e.message || '接上后台任务失败';
+                        // 流中断后先确认任务是否还在：任务已消失时同样优雅降级
+                        let gone = false;
+                        try {
+                            const st = await (await fetch('/api/service/status')).json();
+                            gone = !st.batch_running;
+                        } catch (_) {}
+                        if (gone) {
+                            this.addBatchLog('后台批量任务已结束（服务重启或任务被中断）', 'warn');
+                            this.addBatchLog('用「继续上次刷新任务」或对该作者「再次批量」续跑剩余视频，已提取的部分会自动跳过', 'warn');
+                        } else {
+                            this.addBatchLog('接上后台任务失败: ' + (e.message || e), 'error');
+                            this.error = e.message || '接上后台任务失败';
+                        }
                     } finally {
                         this.batchRunning = false;
                         this.loading = false;
@@ -1534,6 +2018,7 @@
                 handleBatchEvent(evt) {
                     const stage = evt.stage;
                     if (stage === 'list') {
+                        if (evt.nickname) this.backgroundLabel = evt.nickname; // URL 粘贴批量：后端解析出昵称后补显到标题
                         if (evt.notice) {
                             this.addBatchLog(evt.notice, 'warn');
                             return;
@@ -1558,6 +2043,12 @@
                             this.runFail++;
                             this.addBatchLog(`[失败] ${evt.aweme_id} ${evt.title || ''} - ${evt.error || ''}`, 'error');
                         }
+                    } else if (stage === 'notice') {
+                        this.addBatchLog(evt.message || '', 'warn');
+                    } else if (stage === 'queue') {
+                        this.addBatchLog(evt.kind === 'up'
+                            ? '—— 队列任务：开始解析 UP 主页 ——'
+                            : '—— 队列任务：开始解析单个视频 ——', 'warn');
                     } else if (stage === 'done') {
                         this.addBatchLog(`完成：成功 ${evt.ok}，跳过 ${evt.skip}，失败 ${evt.fail}。输出目录: ${evt.output_dir}`, 'ok');
                         this.showToast(`批量完成：成功 ${evt.ok}，跳过 ${evt.skip}，失败 ${evt.fail}`);
@@ -1617,8 +2108,125 @@
                     }
                 },
 
+                // ---------- 提前解析：主输入的链接已在待解析队列中时，点击 = 立即插队解析 ----------
+                queuedExtractItem() {
+                    const text = (this.url || '').trim();
+                    if (!text || !this.pendingLinks.length) return null;
+                    const urls = text.match(/https?:\/\/[^\s,,;，；"']+/g) || [];
+                    if (!urls.length) return null;
+                    return this.pendingLinks.find(it => it.status === 'pending' && urls.includes(it.url)) || null;
+                },
+                queuedVideoPending() {
+                    const qi = this.queuedExtractItem();
+                    // 空闲 或 批量已暂停（worker 空闲）时才可插队；批量运行中仍走排队
+                    return (qi && qi.kind === 'video' && (!this.batchActive || this.batchPaused)) ? qi : null;
+                },
+                // 批量已暂停时，主输入的新链接（单个视频、不在队列中）可插队立即解析
+                canJumpQueue() {
+                    if (!this.batchPaused || this.loading || this.batchRunning) return false;
+                    const text = (this.url || '').trim();
+                    if (!text) return false;
+                    const urls = text.match(/https?:\/\/[^\s,,;，；"']+/g) || [];
+                    if (urls.length !== 1) return false; // 仅单条链接可插队
+                    const u0 = urls[0];
+                    if (/MS4wLjAB/.test(u0)) return false; // sec_uid 主页链接
+                    // /user/ 且不带 modal_id 才是 UP 主页；带 modal_id 的是视频弹窗页，可插队
+                    if (/douyin\.com\/user\//.test(u0) && !/modal_id=\d+/.test(u0)) return false;
+                    if (this.queuedVideoPending()) return false; // 已由「提前解析」覆盖
+                    return true;
+                },
+                async jumpQueueExtract() {
+                    // 先入队留痕（防队列重复执行），随即对该条目 extract-now 插队
+                    const text = (this.url || '').trim();
+                    const urls = text.match(/https?:\/\/[^\s,,;，；"']+/g) || [];
+                    if (!urls.length) return;
+                    if (!this.apiKeyConfigured) {
+                        this.showSettings = true;
+                        return;
+                    }
+                    try {
+                        const res = await fetch('/api/pending-links', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ urls })
+                        });
+                        const data = await res.json();
+                        this.pendingLinks = data.items || [];
+                        const item = (data.items || []).find(i => urls.includes(i.url) && i.status === 'pending');
+                        if (item) {
+                            await this.extractQueuedNow(item);
+                            return;
+                        }
+                        this.queuedNotice = '该链接已在待解析队列中，无需重复添加';
+                        clearTimeout(this._queueNoticeTimer);
+                        this._queueNoticeTimer = setTimeout(() => this.queuedNotice = '', 4000);
+                    } catch (e) {
+                        this.queuedNotice = '加入队列失败，请重试';
+                        clearTimeout(this._queueNoticeTimer);
+                        this._queueNoticeTimer = setTimeout(() => this.queuedNotice = '', 4000);
+                    }
+                },
+                async extractQueuedNow(item) {
+                    if (this.loading) return;
+                    if (!this.apiKeyConfigured) {
+                        this.showSettings = true;
+                        return;
+                    }
+                    this.resetState();
+                    this.loading = true;
+                    this.extractingText = true;
+                    this.loadingText = '正在提前解析队列中的视频...';
+                    this.step = 1;
+                    const stepInterval = setInterval(() => {
+                        if (this.step < 4) this.step++;
+                    }, 2500);
+                    try {
+                        const res = await fetch('/api/pending-links/' + item.id + '/extract-now', {
+                            method: 'POST'
+                        });
+                        const data = await res.json();
+                        clearInterval(stepInterval);
+                        this.step = 5;
+                        if (data.success) {
+                            this.videoInfo = {
+                                video_id: data.video_id,
+                                title: data.title,
+                                download_url: data.download_url
+                            };
+                            this.transcript = data.text;
+                            this.showToast('解析完成');
+                        } else {
+                            this.error = data.detail || data.error || '提前解析失败';
+                        }
+                        await this.loadPendingLinks();
+                    } catch (e) {
+                        clearInterval(stepInterval);
+                        this.error = '网络错误，请检查网络连接后重试';
+                    } finally {
+                        this.loading = false;
+                    }
+                },
+
                 async extractText() {
-                    if (!this.url || this.loading) return;
+                    if (!this.url || !this.url.trim()) return;
+
+                    // 链接已在队列中且当前可安全插队（空闲/已暂停）→ 立即解析，不再重复排队
+                    const qi = this.queuedVideoPending();
+                    if (qi) {
+                        await this.extractQueuedNow(qi);
+                        return;
+                    }
+
+                    // 忙时主输入也可以点：把链接加入待解析队列，当前任务结束后自动执行
+                    if (this.batchActive || this.loading) {
+                        // 批量已暂停时，单个视频链接还可以选择插队立即解析
+                        if (this.canJumpQueue()) {
+                            await this.jumpQueueExtract();
+                            return;
+                        }
+                        await this.queueFromMainInput();
+                        return;
+                    }
 
                     // Check if API key is configured
                     if (!this.apiKeyConfigured) {

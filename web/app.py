@@ -264,10 +264,17 @@ async def get_info(req: VideoRequest):
         # Profile links are handled by the batch flow instead
         sys.path.insert(0, str(Path(__file__).parent.parent / "douyin-video" / "scripts"))
         from profile_fetcher import is_profile_url
-        if is_profile_url(req.url):
+        if is_profile_url(req.url) and "modal_id=" not in req.url:
             return VideoInfoResponse(success=False,
                                      error="This is an author profile link. Use the Batch Extract button.")
-        info = await asyncio.to_thread(get_video_info, req.url)
+        if not _claim_extract_slot():
+            raise HTTPException(
+                status_code=409,
+                detail="已有解析任务在运行；请等它结束后再试，或使用「排队解析」")
+        try:
+            info = await asyncio.to_thread(get_video_info, req.url)
+        finally:
+            _release_extract_slot()
         log_operation("video.info", url=req.url, video_id=info["video_id"],
                       title=info["title"], download_url=info["url"])
         return VideoInfoResponse(
@@ -276,6 +283,8 @@ async def get_info(req: VideoRequest):
             title=info["title"],
             download_url=info["url"]
         )
+    except HTTPException:
+        raise
     except Exception as e:
         log_operation("video.info", status="error", url=req.url, error=str(e))
         return VideoInfoResponse(success=False, error=str(e))
@@ -362,8 +371,10 @@ async def _batch_stream():
             _batch_job["subs"].remove(sub)
 
 # A restart requested while a batch job runs is deferred until that job
-# finishes, so an in-flight task is never interrupted.
-_restart_state = {"pending": False}
+# finishes, so an in-flight task is never interrupted. "restarting" latches
+# once the deferred restart is actually on its way, so the pending-links
+# queue runner knows not to start new work in those final seconds.
+_restart_state = {"pending": False, "restarting": False}
 
 
 def _restart_now(delay: float = 1.0) -> None:
@@ -395,8 +406,495 @@ def _restart_after_batch():
     """Run a restart that was deferred because a batch job was running."""
     if _restart_state["pending"]:
         _restart_state["pending"] = False
+        _restart_state["restarting"] = True
         log_operation("service.restart", status="run_deferred")
         _restart_now(delay=3.0)
+
+
+# ------------------------------------------------------------------
+# 待解析链接队列 (pending links): users can queue single-video and UP-profile
+# links while a batch job is running; each queued link runs automatically,
+# one at a time, as soon as the global batch lock frees up. The queue is
+# persisted to pending_links.json so it survives page reloads and service
+# restarts (a startup hook re-arms the runner when items are waiting).
+# ------------------------------------------------------------------
+PENDING_LINKS_FILE = ROOT / "pending_links.json"
+_pending_lock = threading.Lock()      # guards the JSON file + worker/timer state
+_pending_worker_alive = False
+_pending_timer = None
+
+# The original check-then-set of _batch_state["running"] inside the async
+# endpoint was race-free only because no await sat between them. The queue
+# runner claims the lock from a plain thread, so claiming is now atomic.
+_batch_claim_mutex = threading.Lock()
+
+# Single-video extractions (info/extract endpoints) can fall back to the
+# Playwright browser when the share page is risk-controlled, so they must be
+# serialized against batch jobs and the pending queue just like a batch.
+_extract_busy = False
+
+
+def _claim_batch_lock() -> bool:
+    """Atomically claim the global single-job lock."""
+    global _extract_busy
+    with _batch_claim_mutex:
+        if _batch_state["running"] or _extract_busy:
+            return False
+        _batch_state["running"] = True
+        return True
+
+
+def _claim_extract_slot() -> bool:
+    """Claim the single-extraction slot (mutually exclusive with batch jobs)."""
+    global _extract_busy
+    with _batch_claim_mutex:
+        if _batch_state["running"] or _extract_busy:
+            return False
+        _extract_busy = True
+        return True
+
+
+def _release_extract_slot() -> None:
+    global _extract_busy
+    with _batch_claim_mutex:
+        _extract_busy = False
+
+
+def classify_link(url: str) -> str:
+    """'up' for author profile links, 'video' for everything else.
+
+    /user/ links carrying modal_id are video-permalink pages (e.g. a video
+    opened in a modal from one's own profile / favorites), not author
+    profiles — parse_share_url already extracts the modal_id video."""
+    u = (url or "").strip().lower()
+    if "/user/" in u and "modal_id=" not in u:
+        return "up"
+    return "video"
+
+
+def _load_pending() -> dict:
+    try:
+        if PENDING_LINKS_FILE.exists():
+            data = json.loads(PENDING_LINKS_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("items"), list):
+                data.setdefault("next_id", 1)
+                return data
+    except Exception:
+        pass
+    return {"next_id": 1, "items": []}
+
+
+def _save_pending(data: dict) -> None:
+    PENDING_LINKS_FILE.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _batch_pause_flag() -> bool:
+    with _pending_lock:
+        return bool(_load_pending().get("batch_paused"))
+
+
+def _set_batch_pause_flag(value: bool) -> None:
+    """Persist the user's pause intent so a service restart (which rebuilds
+    the batch from the queue) can restore it instead of silently resuming."""
+    with _pending_lock:
+        data = _load_pending()
+        if bool(data.get("batch_paused")) != value:
+            data["batch_paused"] = value
+            _save_pending(data)
+
+
+def _pending_items() -> list:
+    with _pending_lock:
+        return _load_pending()["items"]
+
+
+def _pending_add(urls: list, titles: list = None) -> tuple:
+    """Append links, deduped against still-queued ones. Returns (added, duplicates).
+    Optional parallel `titles` list labels items (e.g. a known UP's name)."""
+    from datetime import datetime
+    added = dup = 0
+    titles = titles or []
+    with _pending_lock:
+        data = _load_pending()
+        queued = {it["url"] for it in data["items"] if it["status"] in ("pending", "running")}
+        for idx, raw in enumerate(urls):
+            url = (raw or "").strip()
+            if not url or not re.match(r"^https?://", url, re.I):
+                continue
+            if url in queued:
+                dup += 1
+                continue
+            data["items"].append({
+                "id": data["next_id"], "url": url,
+                "kind": classify_link(url), "status": "pending",
+                "title": (titles[idx].strip() if idx < len(titles) and titles[idx] else ""),
+                "added_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "started_at": "", "finished_at": "", "result": "",
+            })
+            data["next_id"] += 1
+            queued.add(url)
+            added += 1
+        if added:
+            _save_pending(data)
+    return added, dup
+
+
+def _pending_remove(item_id: int) -> bool:
+    with _pending_lock:
+        data = _load_pending()
+        before = len(data["items"])
+        data["items"] = [it for it in data["items"]
+                         if not (it["id"] == item_id and it["status"] != "running")]
+        if len(data["items"]) != before:
+            _save_pending(data)
+            return True
+        return False
+
+
+def _pending_clear_finished() -> int:
+    with _pending_lock:
+        data = _load_pending()
+        before = len(data["items"])
+        data["items"] = [it for it in data["items"] if it["status"] not in ("done", "fail")]
+        removed = before - len(data["items"])
+        if removed:
+            _save_pending(data)
+        return removed
+
+
+def _pending_update(item_id: int, url: str) -> bool:
+    """Edit a queued link's URL (pending items only; kind is re-detected)."""
+    url = (url or "").strip()
+    if not re.match(r"^https?://", url, re.I):
+        return False
+    with _pending_lock:
+        data = _load_pending()
+        for it in data["items"]:
+            if it["id"] == item_id and it["status"] == "pending":
+                it["url"] = url
+                it["kind"] = classify_link(url)
+                it["title"] = ""  # old label may no longer match the new URL
+                _save_pending(data)
+                return True
+        return False
+
+
+def _pending_reorder(ids: list) -> bool:
+    """Apply a full item order (the id sequence the UI shows). id order only
+    decides execution priority among pending items; done/fail items just keep
+    their displayed position."""
+    with _pending_lock:
+        data = _load_pending()
+        if sorted(ids) != sorted(it["id"] for it in data["items"]):
+            return False  # must be a permutation of current ids
+        by_id = {it["id"]: it for it in data["items"]}
+        data["items"] = [by_id[i] for i in ids]
+        _save_pending(data)
+        return True
+
+
+def _pending_mark(item_id: int, status: str, result: str = "") -> None:
+    from datetime import datetime
+    with _pending_lock:
+        data = _load_pending()
+        for it in data["items"]:
+            if it["id"] == item_id:
+                it["status"] = status
+                it["result"] = (result or "")[:300]
+                if status in ("done", "fail"):
+                    it["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                break
+        _save_pending(data)
+
+
+def _pending_pop_next() -> dict:
+    """Mark and return the next pending item (caller must hold the batch lock)."""
+    from datetime import datetime
+    with _pending_lock:
+        data = _load_pending()
+        for it in data["items"]:
+            if it["status"] == "pending":
+                it["status"] = "running"
+                it["started_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                _save_pending(data)
+                return it
+    return None
+
+
+def _maybe_start_pending(delay: float = 2.0) -> None:
+    """Arm the delayed queue runner unless one is already alive or armed."""
+    global _pending_timer
+    with _pending_lock:
+        if _pending_worker_alive or _pending_timer is not None:
+            return
+        if not any(it["status"] == "pending" for it in _load_pending()["items"]):
+            return
+        _pending_timer = threading.Timer(delay, _pending_worker_loop)
+        _pending_timer.daemon = True
+        _pending_timer.start()
+
+
+def _pending_worker_loop() -> None:
+    """Run queued links serially. Every item executes under the global batch
+    lock, so a queue item and a manual/refresh-all batch can never overlap on
+    the browser profile. A manual batch always gets the lock first: this loop
+    simply retries until the lock stays free."""
+    global _pending_timer, _pending_worker_alive
+    _pending_timer = None
+    _pending_worker_alive = True
+    log_operation("queue.runner", status="start")
+    try:
+        while not (_restart_state["pending"] or _restart_state["restarting"]):
+            if not any(it["status"] == "pending" for it in _pending_items()):
+                break
+            if not _claim_batch_lock():
+                time.sleep(5)  # another job holds the lock; wait for it
+                continue
+            item = _pending_pop_next()
+            if item is None:
+                _batch_state["running"] = False  # claim released, nothing to do
+                break
+            try:
+                _pending_run_item(item)
+            except Exception as e:
+                log_operation("queue.item", status="error",
+                              url=item.get("url", ""), error=str(e)[:300])
+            finally:
+                _batch_state["running"] = False
+                _set_batch_pause_flag(False)  # item ended; don't pause the next one
+                _batch_finish()
+                _restart_after_batch()
+    finally:
+        with _pending_lock:
+            _pending_worker_alive = False
+            _pending_timer = None
+    log_operation("queue.runner", status="stop")
+
+
+def _pending_api_key() -> str:
+    from asr_backends import load_config_file
+    file_cfg = load_config_file()
+    provider_id = (file_cfg.get("active_provider") or "siliconflow").lower()
+    entry = (file_cfg.get("providers") or {}).get(provider_id) or {}
+    return entry.get("api_key") or os.getenv("API_KEY", "") \
+        or os.getenv("DASHSCOPE_API_KEY", "") or os.getenv("ARK_API_KEY", "")
+
+
+def _pending_run_item(item: dict) -> None:
+    """Run one queued link (batch lock already held). Publishes progress on
+    the same SSE channel as manual batches, so the WebUI shows it the same way."""
+    _batch_job["label"] = "待解析队列"
+    _batch_job["seq"] = 0
+    del _batch_job["history"][:]
+    _batch_publish({"stage": "queue", "kind": item["kind"], "url": item["url"]})
+    try:
+        if item["kind"] == "up":
+            _pending_run_up(item)
+        else:
+            _pending_run_video(item)
+    except Exception as e:
+        _pending_mark(item["id"], "fail", result=str(e))
+        _batch_publish({"stage": "error", "error": str(e)[:400]})
+
+
+def _pending_run_up(item: dict) -> None:
+    api_key = _pending_api_key()
+    if not api_key:
+        raise RuntimeError("未配置 API Key")
+    from batch_extractor import batch_extract, run_gate
+    # Restore a pause that was active when the service stopped (e.g. the
+    # deferred hot-reload restart): start the batch paused instead of
+    # silently resuming. batch_extract re-sets run_gate on entry, so the
+    # clear is applied shortly after it starts (workers check the gate
+    # before every video, well past this point).
+    if _batch_pause_flag():
+        def _apply_restored_pause():
+            try:
+                if _batch_state["running"] and _batch_pause_flag():
+                    run_gate.clear()
+            except Exception:
+                pass
+        threading.Timer(2.0, _apply_restored_pause).start()
+    summary = batch_extract(
+        item["url"],
+        output_dir=str(Path(__file__).parent.parent / "output"),
+        api_key=api_key,
+        provider=None,
+        max_videos=0,
+        force=False,
+        headless=True,
+        save_video=False,
+        use_cache=False,
+        workers=3,
+        on_progress=_batch_publish,
+    )
+    _pending_mark(item["id"], "done",
+                  result=f"新增 {summary.get('ok', 0)}，跳过 {summary.get('skip', 0)}，失败 {summary.get('fail', 0)}")
+
+
+def _pending_run_video(item: dict) -> None:
+    api_key = _pending_api_key()
+    if not api_key:
+        raise RuntimeError("未配置 API Key")
+    video_info, _text = _extract_single_video(item["url"], api_key)
+    _batch_publish({"stage": "extract", "index": 1, "total": 1,
+                    "aweme_id": video_info["video_id"], "title": video_info["title"],
+                    "status": "ok"})
+    _pending_mark(item["id"], "done", result=video_info.get("title", ""))
+    _batch_publish({"stage": "done", "ok": 1, "skip": 0, "fail": 0,
+                    "resumed": 0, "output_dir": ""})
+
+
+class PendingLinksRequest(BaseModel):
+    urls: list = []
+    titles: list = []  # optional display labels, parallel to urls
+
+
+@app.get("/api/pending-links")
+async def pending_links_list():
+    """The 待解析 queue: links waiting to run after the current job."""
+    return {"items": _pending_items()}
+
+
+@app.post("/api/pending-links")
+async def pending_links_add(req: PendingLinksRequest):
+    """Queue links (single video / UP profile, auto-detected). Kicks the
+    runner if nothing is running; otherwise it starts when the lock frees."""
+    added, dup = _pending_add(req.urls, req.titles)
+    if added:
+        log_operation("queue.add", count=added, duplicates=dup)
+        _maybe_start_pending(delay=2.0)
+    return {"added": added, "duplicates": dup, "items": _pending_items()}
+
+
+@app.post("/api/pending-links/clear-finished")
+async def pending_links_clear_finished():
+    removed = _pending_clear_finished()
+    return {"removed": removed, "items": _pending_items()}
+
+
+@app.post("/api/pending-links/{item_id}/extract-now", response_model=ExtractResponse)
+async def pending_links_extract_now(item_id: int):
+    """Manually run a queued single-video link ahead of the queue (提前解析).
+
+    Allowed while idle OR while a batch is PAUSED (workers idle, browser
+    untouched); refused while a batch is actively running. The item is marked
+    running so the queue runner skips it, then done/fail with the outcome.
+    """
+    from datetime import datetime
+    from batch_extractor import run_gate
+
+    with _pending_lock:
+        data = _load_pending()
+        item = next((it for it in data["items"] if it["id"] == item_id), None)
+        if item is None:
+            raise HTTPException(status_code=404, detail="任务列表中不存在该条目")
+        if item["status"] != "pending":
+            raise HTTPException(status_code=409, detail="该条目已在处理中或已完成")
+        if item["kind"] != "video":
+            raise HTTPException(status_code=409, detail="UP 主页链接请在队列中等待自动批量")
+
+    if _batch_state["running"]:
+        try:
+            paused = not run_gate.is_set()
+        except Exception:
+            paused = False
+        if not paused:
+            raise HTTPException(
+                status_code=409,
+                detail="批量任务正在运行：请先暂停批量，或等待其完成（该链接已在队列中排队）")
+
+    global _extract_busy
+    with _batch_claim_mutex:
+        if _extract_busy:
+            raise HTTPException(status_code=409, detail="已有解析任务在运行")
+        _extract_busy = True
+
+    try:
+        with _pending_lock:
+            data = _load_pending()
+            for it in data["items"]:
+                if it["id"] == item_id and it["status"] == "pending":
+                    it["status"] = "running"
+                    it["started_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    _save_pending(data)
+                    break
+
+        api_key = _pending_api_key()
+        if not api_key:
+            _pending_mark(item_id, "fail", result="未配置 API Key")
+            return ExtractResponse(success=False, error="请先配置 API Key")
+
+        try:
+            video_info, text = await asyncio.to_thread(
+                _extract_single_video, item["url"], api_key)
+            _pending_mark(item_id, "done", result=video_info.get("title", ""))
+            log_operation("queue.extract_now", video_id=video_info["video_id"],
+                          title=video_info["title"], ok=True)
+            return ExtractResponse(
+                success=True,
+                video_id=video_info["video_id"],
+                title=video_info["title"],
+                text=text,
+                download_url=video_info["url"]
+            )
+        except Exception as e:
+            _pending_mark(item_id, "fail", result=str(e))
+            log_operation("queue.extract_now", url=item["url"], ok=False, error=str(e))
+            return ExtractResponse(success=False, error=str(e))
+    finally:
+        with _batch_claim_mutex:
+            _extract_busy = False
+
+
+class PendingLinkUpdateRequest(BaseModel):
+    url: str = ""
+
+
+class PendingReorderRequest(BaseModel):
+    ids: list = []
+
+
+@app.put("/api/pending-links/{item_id}")
+async def pending_links_update(item_id: int, req: PendingLinkUpdateRequest):
+    """Edit a pending link's URL (re-detects UP-profile vs single video)."""
+    if not _pending_update(item_id, req.url):
+        raise HTTPException(
+            status_code=409,
+            detail="条目不存在、已在处理中，或链接格式无效")
+    return {"ok": True, "items": _pending_items()}
+
+
+@app.post("/api/pending-links/reorder")
+async def pending_links_reorder(req: PendingReorderRequest):
+    """Apply the UI's item order (drag & drop)."""
+    if not _pending_reorder(req.ids):
+        raise HTTPException(status_code=409, detail="排序数据与当前列表不一致")
+    return {"ok": True, "items": _pending_items()}
+
+
+@app.delete("/api/pending-links/{item_id}")
+async def pending_links_remove(item_id: int):
+    if not _pending_remove(item_id):
+        raise HTTPException(status_code=409, detail="条目不存在或正在运行")
+    return {"ok": True, "items": _pending_items()}
+
+
+@app.on_event("startup")
+async def _resume_pending_queue():
+    """After a crash/restart, requeue an item that died mid-run and resume
+    the queue - links the user queued must not be lost to a service restart."""
+    with _pending_lock:
+        data = _load_pending()
+        changed = False
+        for it in data["items"]:
+            if it["status"] == "running":
+                it["status"] = "pending"
+                changed = True
+        if changed:
+            _save_pending(data)
+    _maybe_start_pending(delay=8.0)
 
 
 @app.post("/api/service/restart")
@@ -449,11 +947,16 @@ async def profile_batch(req: BatchRequest):
     Returns a text/event-stream with JSON progress lines, then a final
     summary line, then closes.
     """
-    if _batch_state["running"]:
+    if not _claim_batch_lock():
+        if _extract_busy:
+            raise HTTPException(
+                status_code=409,
+                detail="插队解析进行中：请等它完成后再发起批量（插队任务优先）")
         raise HTTPException(
             status_code=409,
             detail="已有批量任务在运行（若界面看不到进度，可能是页面刷新后任务仍在后台继续，"
                    "请等它结束后再试）")
+    _set_batch_pause_flag(False)  # a manual batch always starts unpaused
 
     # Resolve key like the single-video endpoint does (config file / env)
     from asr_backends import load_config_file
@@ -472,7 +975,6 @@ async def profile_batch(req: BatchRequest):
     # second browser on the same persistent profile dir - two Chromium
     # instances on one user-data-dir lock each other's cookie DB, which freezes
     # the page renderer and hangs the run forever.
-    _batch_state["running"] = True
     # Start a fresh job view: subscribing clients must never see the previous
     # job's events replayed as if they belonged to this one.
     _batch_job["label"] = req.author or ""
@@ -508,6 +1010,7 @@ async def profile_batch(req: BatchRequest):
             # is over", so the flag must be down before the streams are closed.
             _batch_state["running"] = False
             _batch_finish()
+            _maybe_start_pending(delay=2.0)  # queued links take over next
             _restart_after_batch()
 
     threading.Thread(target=_worker, daemon=True).start()
@@ -598,19 +1101,70 @@ async def profile_batch_pause():
         raise HTTPException(status_code=409, detail="No batch job is running")
     from batch_extractor import run_gate
     run_gate.clear()
+    _set_batch_pause_flag(True)
     log_operation("batch.pause", status="ok")
     return {"status": "paused", "notice": "当前视频完成后暂停"}
 
 
 @app.post("/api/profile/batch/resume")
 async def profile_batch_resume():
-    """Resume a paused batch job."""
+    """Resume a paused batch job.
+
+    A running jump-queue extraction (插队解析) always has priority: instead of
+    refusing, the resume is deferred until the extraction slot frees up, then
+    applied automatically - the user's 继续 click is remembered, never lost,
+    and never interrupts the extraction.
+    """
+    global _resume_waiting
     from batch_extractor import run_gate
     if run_gate.is_set():
         raise HTTPException(status_code=409, detail="Batch job is not paused")
+    if _extract_busy:
+        with _batch_claim_mutex:
+            if not _resume_waiting:
+                _resume_waiting = True
+                threading.Thread(
+                    target=_deferred_resume_when_extract_done,
+                    daemon=True).start()
+        return {"status": "deferred",
+                "notice": "插队解析进行中：完成后批量将自动继续（插队任务优先）"}
     run_gate.set()
+    _set_batch_pause_flag(False)
     log_operation("batch.resume", status="ok")
     return {"status": "resumed"}
+
+
+# One deferred-resume watcher at a time (guarded by _batch_claim_mutex).
+_resume_waiting = False
+
+
+def _deferred_resume_when_extract_done():
+    """Wait for the jump-queue extraction to finish, then resume the batch.
+
+    The paused batch keeps waiting on run_gate the whole time, so resuming is
+    just set() - the extraction is never disturbed. If the service is about to
+    restart, bail out: the persisted pause flag makes the next process restore
+    the pause instead.
+    """
+    global _resume_waiting
+    from batch_extractor import run_gate
+    try:
+        while True:
+            if _restart_state["pending"] or _restart_state["restarting"]:
+                return  # keep paused; next process restores it via the flag
+            with _batch_claim_mutex:
+                busy = _extract_busy
+            if not busy:
+                run_gate.set()
+                _set_batch_pause_flag(False)
+                log_operation("batch.resume", status="ok", deferred=True)
+                _batch_publish({"stage": "notice",
+                                "message": "插队解析完成，批量已自动继续"})
+                return
+            time.sleep(1.0)
+    finally:
+        with _batch_claim_mutex:
+            _resume_waiting = False
 
 
 @app.get("/api/profile/history")
@@ -722,6 +1276,64 @@ async def douyin_login():
     return StreamingResponse(_gen(), media_type="text/event-stream")
 
 
+def _extract_single_video(url: str, api_key: str, provider: str = None,
+                          model: str = None) -> tuple:
+    """Single-video pipeline: share-url -> download -> audio -> ASR (+polish)
+    -> record to the global library -> save md into the per-author output dir.
+
+    Raises on failure. Shared by the /api/video/extract endpoint and the
+    pending-links queue runner so both behave identically.
+    """
+    from douyin_downloader import DouyinProcessor
+    from transcript_library import append_record
+    backend = resolve_backend(api_key, provider=provider, model=model)
+    processor = DouyinProcessor(
+        backend['api_key'],
+        provider=backend['provider'],
+        model=backend['model'],
+        api_base_url=backend['api_base_url'] or "",
+    )
+    video_info = processor.parse_share_url(url)
+    video_path = processor.download_video(video_info, show_progress=False)
+    audio_path = processor.extract_audio(video_path, show_progress=False)
+    try:
+        text = processor.extract_text_from_audio(audio_path, show_progress=False)
+    finally:
+        processor.cleanup_files(video_path, audio_path)
+    # Optional LLM polish (fixes homophones/punctuation)
+    polish_cfg = (load_config_file().get("polish") or {})
+    if polish_cfg.get("enabled"):
+        try:
+            from transcript_polish import polish_transcript
+            text = polish_transcript(text)
+        except Exception:
+            pass  # never break extraction due to polish failure
+    # Record to the global library file
+    append_record(
+        video_id=video_info["video_id"],
+        title=video_info["title"],
+        text=text,
+        source="single",
+        provider=backend['provider'],
+        model=backend['model'],
+    )
+    # Save into the per-author directory (one dir per UP) and
+    # refresh that author's catalog; never fail the request on it.
+    try:
+        from batch_extractor import save_transcript
+        author = (video_info.get("author") or "").strip() or "未知作者"
+        safe_author = re.sub(r'[\\/:*?"<>|]', '_', author).strip() or "未知作者"
+        author_dir = (Path(__file__).resolve().parent.parent
+                      / "output" / safe_author)
+        save_transcript(author_dir, video_info["video_id"],
+                        video_info["title"], author, text)
+    except Exception as e:
+        log_operation("video.extract.save_md_failed",
+                      video_id=video_info["video_id"],
+                      error=str(e)[:200])
+    return video_info, text
+
+
 @app.post("/api/video/extract", response_model=ExtractResponse)
 async def extract_transcript(req: VideoRequest):
     """Extract video transcript (API_KEY required)"""
@@ -737,64 +1349,17 @@ async def extract_transcript(req: VideoRequest):
             error="Please configure API Key first"
         )
 
+    if not _claim_extract_slot():
+        raise HTTPException(
+            status_code=409,
+            detail="已有解析任务在运行；请等它结束后再试，或使用「排队解析」加入待解析队列")
+
     try:
         # Resolve backend (provider/model from request or config/env), then
         # run download -> extract audio -> transcribe in a worker thread.
-        def _run():
-            from douyin_downloader import DouyinProcessor
-            from transcript_library import append_record
-            backend = resolve_backend(
-                api_key,
-                provider=req.provider or None,
-                model=req.model or None,
-            )
-            processor = DouyinProcessor(
-                backend['api_key'],
-                provider=backend['provider'],
-                model=backend['model'],
-                api_base_url=backend['api_base_url'] or "",
-            )
-            video_info = processor.parse_share_url(req.url)
-            video_path = processor.download_video(video_info, show_progress=False)
-            audio_path = processor.extract_audio(video_path, show_progress=False)
-            try:
-                text = processor.extract_text_from_audio(audio_path, show_progress=False)
-            finally:
-                processor.cleanup_files(video_path, audio_path)
-            # Optional LLM polish (fixes homophones/punctuation)
-            polish_cfg = (load_config_file().get("polish") or {})
-            if polish_cfg.get("enabled"):
-                try:
-                    from transcript_polish import polish_transcript
-                    text = polish_transcript(text)
-                except Exception:
-                    pass  # never break extraction due to polish failure
-            # Record to the global library file
-            append_record(
-                video_id=video_info["video_id"],
-                title=video_info["title"],
-                text=text,
-                source="single",
-                provider=backend['provider'],
-                model=backend['model'],
-            )
-            # Save into the per-author directory (one dir per UP) and
-            # refresh that author's catalog; never fail the request on it.
-            try:
-                from batch_extractor import save_transcript
-                author = (video_info.get("author") or "").strip() or "未知作者"
-                safe_author = re.sub(r'[\\/:*?"<>|]', '_', author).strip() or "未知作者"
-                author_dir = (Path(__file__).resolve().parent.parent
-                              / "output" / safe_author)
-                save_transcript(author_dir, video_info["video_id"],
-                                video_info["title"], author, text)
-            except Exception as e:
-                log_operation("video.extract.save_md_failed",
-                              video_id=video_info["video_id"],
-                              error=str(e)[:200])
-            return video_info, text
-
-        video_info, text = await asyncio.to_thread(_run)
+        video_info, text = await asyncio.to_thread(
+            _extract_single_video, req.url, api_key,
+            req.provider or None, req.model or None)
         log_operation("video.extract", video_id=video_info["video_id"],
                       title=video_info["title"], text_length=len(text),
                       download_url=video_info["url"])
@@ -808,6 +1373,8 @@ async def extract_transcript(req: VideoRequest):
     except Exception as e:
         log_operation("video.extract", status="error", url=req.url, error=str(e))
         return ExtractResponse(success=False, error=str(e))
+    finally:
+        _release_extract_slot()
 
 
 @app.get("/api/logs")
