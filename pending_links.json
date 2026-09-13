@@ -1,27 +1,16 @@
 {
-  "next_id": 6,
+  "next_id": 8,
   "items": [
     {
-      "id": 1,
-      "url": "https://www.douyin.com/user/MS4wLjABAAAAB3Qx5iT-XPUp54-wBHTac06qDEKdyWUmKhcIwTIyS5Q25jt7CBoRK-OS-N1ha4Yk",
+      "id": 7,
+      "url": "https://www.douyin.com/user/MS4wLjABAAAAqLHhOHE1pcj_KDYH-ahWfnSuCm_rGvFuO8idUdvw-NQ?from_tab_name=main&vid=7684585102689511153",
       "kind": "up",
-      "status": "running",
-      "title": "学院派Academia",
-      "added_at": "2026-09-13 13:26:09",
-      "started_at": "2026-09-13 13:48:18",
-      "finished_at": "",
-      "result": ""
-    },
-    {
-      "id": 5,
-      "url": "https://www.douyin.com/user/self?from_tab_name=main&modal_id=7674579776841026843&showSubTab=video&showTab=favorite_collection",
-      "kind": "video",
       "status": "done",
       "title": "",
-      "added_at": "2026-09-13 13:51:55",
-      "started_at": "2026-09-13 13:51:55",
-      "finished_at": "2026-09-13 13:53:16",
-      "result": "【火影社会学】抖音热梗“霸之意志”背后，是日本社会百年霸凌史 在Ask Me a Hard Question栏目里，有观众问我怎么看待抖音最近的火影热梗“霸之意志”。这是一个很有意思的问题，因为如果霸凌只是强者欺负弱者，那火影里最无法解释的一件事，就是一群普通村民为什么敢长期排斥随时可能暴走灭村的鸣人和我爱罗。\n事实上，我认为“霸之意志”无意间揭露了日本社会的霸凌与其他国家的最大不同。美式和韩式霸凌有明显的“恃强凌弱”逻辑，但日式霸凌针对的却不是弱者，而是“不合群者”。\n从日本学校的固定班级与“读空气”，到战后企业的成员型雇用和更古老的“村八分”，透过社会学研究我们会发现，过去百年日本社会都是"
+      "added_at": "2026-09-13 15:59:01",
+      "started_at": "2026-09-13 15:59:43",
+      "finished_at": "2026-09-13 16:56:22",
+      "result": "新增 98，跳过 0，失败 0"
     }
   ],
   "batch_paused": false

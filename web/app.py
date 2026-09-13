@@ -316,6 +316,24 @@ _batch_state = {"running": False}
 _batch_job = {"label": "", "history": [], "subs": [], "seq": 0}
 _BATCH_HISTORY_MAX = 2000
 
+# Increments on every new job (manual batch or next queue item). The seq
+# counter restarts from 0 per job, so clients need the epoch to tell
+# "replayed event of the same job" apart from "event of a NEW job whose
+# seq started over" - without it a reattached page filters away every
+# event of the follow-up job and freezes on the previous job's state.
+# Seeded from the clock so it stays monotonic across service restarts
+# (a page holding a pre-restart epoch must never see it reused).
+_batch_epoch = int(time.time())
+
+
+def _batch_new_job(label: str) -> None:
+    """Start a new progress job on the shared SSE channel."""
+    global _batch_epoch
+    _batch_epoch += 1
+    _batch_job["label"] = label
+    _batch_job["seq"] = 0
+    del _batch_job["history"][:]
+
 
 def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
@@ -325,6 +343,7 @@ def _batch_publish(event: dict) -> None:
     """Record a batch event and fan it out to every attached progress stream."""
     _batch_job["seq"] += 1
     event["seq"] = _batch_job["seq"]
+    event["epoch"] = _batch_epoch
     history = _batch_job["history"]
     history.append(event)
     if len(history) > _BATCH_HISTORY_MAX:
@@ -684,9 +703,7 @@ def _pending_api_key() -> str:
 def _pending_run_item(item: dict) -> None:
     """Run one queued link (batch lock already held). Publishes progress on
     the same SSE channel as manual batches, so the WebUI shows it the same way."""
-    _batch_job["label"] = "待解析队列"
-    _batch_job["seq"] = 0
-    del _batch_job["history"][:]
+    _batch_new_job("待解析队列")
     _batch_publish({"stage": "queue", "kind": item["kind"], "url": item["url"]})
     try:
         if item["kind"] == "up":
@@ -977,9 +994,7 @@ async def profile_batch(req: BatchRequest):
     # the page renderer and hangs the run forever.
     # Start a fresh job view: subscribing clients must never see the previous
     # job's events replayed as if they belonged to this one.
-    _batch_job["label"] = req.author or ""
-    _batch_job["seq"] = 0
-    del _batch_job["history"][:]
+    _batch_new_job(req.author or "")
 
     def _worker():
         try:

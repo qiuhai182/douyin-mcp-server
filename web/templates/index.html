@@ -1093,6 +1093,7 @@
                 batchDetached: false,      // a background job this page is not attached to
                 backgroundLabel: '',       // UP name of that background job
                 batchLastSeq: 0,           // last stream event applied (per job)
+                batchEpoch: 0,             // server-side job generation (queue items / new batches bump it)
                 batchLogs: [],
                 batchTotal: 0,
                 batchDone: 0,
@@ -1100,7 +1101,7 @@
                 runSkipped: 0,             // 本轮跳过的条数（之前已提取过）
                 runFail: 0,                // 本轮失败的条数
                 runFinished: false,        // 本轮任务已结束（用于展示汇总条）
-                batchUseCache: false,
+                batchUseCache: true,
                 authors: [],
                 authorToRemove: null,      // 待确认移除的作者（弹窗确认用）
                 removingAuthor: false,
@@ -1238,11 +1239,17 @@
                     this.backgroundLabel = st.batch_label || '';
                     let saved = this._restoreQueueState();
                     const task = await this._fetchLastTask();
+                    // 服务端批量若是待解析队列任务，则由队列 runner 全权驱动：
+                    // 此时复活客户端刷新队列会让两条队列抢锁（409 风暴）
+                    const serverQueueOwns = st.batch_label === '待解析队列';
+                    if (saved && saved.running && serverQueueOwns) {
+                        saved = null; // 改为纯旁观，仅展示后台任务进度
+                    }
                     if (!saved || !saved.running) {
                         // A fresh tab (or a restarted browser) has no
                         // sessionStorage, but the durable task file still knows
                         // which UPs are left.
-                        if (task) {
+                        if (task && !serverQueueOwns) {
                             saved = {
                                 running: true,
                                 remaining: (task.pending || [])
@@ -1978,6 +1985,19 @@
                             let evt;
                             try { evt = JSON.parse(line.slice(6)); } catch (e) { continue; }
                             if (evt.stage === 'done' || evt.stage === 'error' || evt.stage === 'closed') ended = true;
+                            // A NEW job (next queue item / fresh batch) restarts
+                            // seq from 0. Without this reset every event of the
+                            // new job would be filtered as "already applied" and
+                            // the panel would freeze on the previous job's state.
+                            if (typeof evt.epoch === 'number' && evt.epoch !== this.batchEpoch) {
+                                this.batchEpoch = evt.epoch;
+                                this.batchLastSeq = 0;
+                                this.batchDone = 0;
+                                this.batchTotal = 0;
+                                this.runFinished = false;
+                                this.backgroundLabel = '';
+                                this.addBatchLog('—— 下一个任务开始 ——', 'warn');
+                            }
                             // A reattach replays events this page already applied;
                             // seq restarts per job, so skipping by seq is safe.
                             if (typeof evt.seq === 'number') {
