@@ -87,3 +87,13 @@ ffmpeg/
 .probe*.py
 _dbg*.py
 _migrate*.py
+
+*.vsix
+
+# WebUI runtime state (task queues & registries)
+pending_links.json
+refresh_task.json
+authors.json
+
+# Node (VS Code extension dev)
+node_modules/

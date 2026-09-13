@@ -1,0 +1,118 @@
+{
+  "name": "douyin-transcript-server",
+  "displayName": "抖音文案提取器 服务控制",
+  "description": "侧边栏控制抖音文案提取服务：启动 / 停止 / 重启 / 打开控制台。默认不自动启动，可配置为随 VS Code 启动。",
+  "version": "1.3.0",
+  "publisher": "GuGuDong",
+  "author": {
+    "name": "咕咕咚"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/qiuhail82/douyin-mcp-server"
+  },
+  "icon": "media/icon.png",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "douyin-server",
+          "title": "抖音文案服务",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "douyin-server": [
+        {
+          "id": "douyinServerControls",
+          "name": "服务控制"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "douyinServer.start",
+        "title": "启动服务",
+        "icon": "$(play)"
+      },
+      {
+        "command": "douyinServer.stop",
+        "title": "停止服务",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "douyinServer.restart",
+        "title": "重启服务（热重载，不打断批量任务）",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "douyinServer.open",
+        "title": "打开控制台界面",
+        "icon": "$(link-external)"
+      },
+      {
+        "command": "douyinServer.openLog",
+        "title": "查看运行日志",
+        "icon": "$(output)"
+      },
+      {
+        "command": "douyinServer.toggleAutoStart",
+        "title": "切换：随 VS Code 自动启动",
+        "icon": "$(eye-closed)"
+      },
+      {
+        "command": "douyinServer.pause",
+        "title": "暂停批量（当前视频完成后生效）",
+        "icon": "$(debug-pause)"
+      },
+      {
+        "command": "douyinServer.resume",
+        "title": "恢复批量（继续暂停的任务）",
+        "icon": "$(debug-continue)"
+      },
+      {
+        "command": "douyinServer.refresh",
+        "title": "刷新状态",
+        "icon": "$(refresh)"
+      }
+    ],
+    "configuration": {
+      "title": "抖音文案提取服务",
+      "properties": {
+        "douyinServer.serverRoot": {
+          "type": "string",
+          "default": "c:\\fitions-novels-stories\\douyin-mcp-server",
+          "description": "douyin-mcp-server 项目根目录（含 web/app.py）"
+        },
+        "douyinServer.pythonPath": {
+          "type": "string",
+          "default": "",
+          "description": "Python 解释器路径；留空则自动使用 <项目根>/.venv/Scripts/pythonw.exe，找不到时回退到 PATH 中的 python"
+        },
+        "douyinServer.port": {
+          "type": "number",
+          "default": 8080,
+          "description": "WebUI 服务端口"
+        },
+        "douyinServer.autoStartWithVscode": {
+          "type": "boolean",
+          "default": false,
+          "description": "VS Code 启动时自动启动服务（默认关闭，需手动开启或在侧边栏点击切换）"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "package": "vsce package"
+  },
+  "license": "MIT"
+}

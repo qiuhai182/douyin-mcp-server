@@ -30,6 +30,8 @@
 | 方式 | 适用场景 | 特点 |
 |------|----------|------|
 | [**WebUI**](#-webui-推荐) | 普通用户 | 浏览器操作，最简单 |
+| [**VS Code / Trae 插件**](#-vs-code--trae-插件) | 编辑器用户 | 侧边栏一键启停服务 |
+| [**exe 托盘程序**](#-exe-打包免-python-环境运行) | 免环境部署 | 双击运行，无需 Python |
 | [**MCP Server**](#-mcp-server) | Claude Desktop 用户 | AI 对话中直接调用 |
 | [**命令行**](#️-命令行工具) | 开发者 | 批量处理，脚本集成 |
 
@@ -112,6 +114,12 @@ uv run python web/app.py
 - ⏸️ **暂停** - 当前视频完成后停止拉取新视频（进行中的视频不会中断）
 - ▶️ **继续** - 从暂停处继续处理剩余视频
 
+**任务队列与插队解析**：
+
+- 📥 **待解析队列** - 批量进行中也能粘贴新链接（单个视频 / UP 主页自动识别）加入队列，不打断当前任务；队列项支持编辑、删除、排序
+- ⚡ **插队解析** - 队列中的链接可随时「提前解析」，插队任务拥有最高优先级，当前视频完成后立即执行，不会被队列阻塞
+- 📊 **本轮统计** - 每轮批量实时显示本次新增 / 跳过 / 失败的文案数量
+
 **容错机制**：
 
 - 已提取的视频自动跳过（按 `history.json` 记录去重）
@@ -136,6 +144,40 @@ output/
 1-7595175846302715163.md
   标题: 血继限界 生而为神？ #火影忍者 #血继限界 #佐助 #二次元 #动漫
 ```
+
+---
+
+## 🧩 VS Code / Trae 插件
+
+侧边栏控制服务，无需离开编辑器。安装方式：VS Code 扩展面板 → `⋯` → 「从 VSIX 安装」，选择 `vscode-extension` 目录打包出的 `*.vsix`。
+
+- 启动 / 停止 / 重启服务（重启为热重载，**不打断正在运行的批量任务**）
+- 暂停 / 恢复批量、打开控制台、查看运行日志
+- 「随 VS Code 自动启动」默认关闭，可在侧边栏点击开启
+
+从源码打包插件：
+
+```bash
+cd vscode-extension
+npx @vscode/vsce package --no-dependencies
+```
+
+---
+
+## 📦 exe 打包（免 Python 环境运行）
+
+Windows 上一键构建服务 exe 与插件 vsix：
+
+```bash
+build.bat
+```
+
+产物：
+
+- `dist\douyin-server\douyin-server.exe` —— 托盘服务，双击即用，目标机器无需 Python（需自行安装 [FFmpeg](https://ffmpeg.org/download.html) 并加入 PATH）
+- `vscode-extension\*.vsix` —— 编辑器插件安装包
+
+运行时通过托盘图标打开控制台 / 查看日志 / 优雅退出；如需关闭开机自启，删除「任务管理器 → 启动应用」中的 **Douyin WebUI** 条目即可。
 
 ---
 
@@ -259,7 +301,7 @@ output/
 |------|------|----------|
 | uv | Python 包管理 | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
 | Python | 3.10+ | `uv python install 3.12` |
-| FFmpeg | 音视频处理 | `brew install ffmpeg` (macOS) <br> `apt install ffmpeg` (Ubuntu) |
+| FFmpeg | 音视频处理 | `winget install ffmpeg` (Windows) <br> `brew install ffmpeg` (macOS) <br> `apt install ffmpeg` (Ubuntu) |
 
 ---
 
@@ -286,7 +328,16 @@ output/
 
 ## 📝 更新日志
 
-### v1.5.0 (最新)
+### v1.6.0 (最新)
+
+- 🧩 **VS Code / Trae 插件** - 侧边栏启停服务、暂停恢复批量、热重载重启（不打断批量）
+- 📦 **一键打包** - `build.bat` 同时产出服务 exe（PyInstaller）与插件 vsix
+- 📥 **待解析队列** - 批量中粘贴新链接排队，支持编辑 / 删除 / 排序
+- ⚡ **插队解析** - 插队任务最高优先级，当前视频完成后立即处理
+- 📊 **本轮统计** - 实时显示本轮新增 / 跳过 / 失败文案数
+- 🔁 **进度更可靠** - 任务代数（epoch）机制防止进度串台，页面刷新可恢复
+
+### v1.5.0
 
 - 🖥️ **系统托盘运行** - `start.bat` 以托盘方式后台启动（无终端窗口），双击托盘图标打开控制台，右键可看日志/退出
 - 📚 **批量提取** - 粘贴作者主页链接，一键抓取作者全部视频文案
