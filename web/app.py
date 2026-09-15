@@ -326,13 +326,19 @@ _BATCH_HISTORY_MAX = 2000
 _batch_epoch = int(time.time())
 
 
-def _batch_new_job(label: str) -> None:
+def _batch_new_job(label: str, run_ctx: dict = None) -> None:
     """Start a new progress job on the shared SSE channel."""
-    global _batch_epoch
+    global _batch_epoch, _run_ctx
     _batch_epoch += 1
     _batch_job["label"] = label
     _batch_job["seq"] = 0
     del _batch_job["history"][:]
+    # Per-run refresh-log context (written to output/刷新日志/ on finish)
+    _run_ctx = run_ctx if run_ctx is not None else {
+        "trigger": "", "url": "", "params": "", "note": "",
+        "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "t0": time.time(), "logged": False,
+    }
 
 
 def _sse(payload: dict) -> str:
@@ -356,6 +362,111 @@ def _batch_finish() -> None:
     """Tells every attached progress stream that the job is over."""
     for sub in list(_batch_job["subs"]):
         sub.put(None)
+
+
+# ---------------------------------------------------------------------------
+# 刷新日志: every finished run (manual batch, queued UP refresh, queued single
+# video) writes its OWN standalone log file under output/刷新日志/, so each
+# incremental refresh leaves a permanent self-contained record: trigger,
+# timing, stats and a per-video detail table. output/ is git-ignored.
+# ---------------------------------------------------------------------------
+REFRESH_LOG_DIR = ROOT / "output" / "刷新日志"
+_run_ctx: dict = {}
+
+
+def _refresh_log_ctx(trigger: str, url: str = "", params: str = "",
+                     note: str = "") -> dict:
+    return {"trigger": trigger, "url": url, "params": params, "note": note,
+            "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "t0": time.time(), "logged": False}
+
+
+def _sanitize_log_name(name: str) -> str:
+    name = re.sub(r'[\\/:*?"<>|\r\n]+', "_", (name or "").strip())
+    return name[:60] or "未命名"
+
+
+def _write_refresh_log() -> None:
+    """Dump the current job's event history into its own log file.
+
+    Runs in the worker thread right before the job is declared over, while
+    _batch_job["history"] still holds this run's events (the next
+    _batch_new_job clears them). Never raises: logging must not break the
+    batch pipeline.
+    """
+    ctx = _run_ctx
+    if not ctx or ctx.get("logged"):
+        return
+    ctx["logged"] = True
+    try:
+        events = [e for e in _batch_job["history"] if isinstance(e, dict)]
+        if not events:
+            return
+        done = next((e for e in reversed(events) if e.get("stage") == "done"), {})
+        extracts = [e for e in events if e.get("stage") == "extract"]
+        errors = [e for e in events if e.get("stage") == "error"]
+
+        secs = max(0, int(time.time() - float(ctx.get("t0") or 0)))
+        dur = f"{secs // 60}分{secs % 60:02d}秒" if secs >= 60 else f"{secs}秒"
+        author = (done.get("author") or _batch_job["label"] or "").strip()
+
+        lines = [
+            f"# 刷新日志：{_sanitize_log_name(author)}",
+            "",
+            f"- 开始时间：{ctx.get('started', '')}",
+            f"- 结束时间：{time.strftime('%Y-%m-%d %H:%M:%S')}（耗时 {dur}）",
+            f"- 触发方式：{ctx.get('trigger') or '手动批量'}",
+        ]
+        if ctx.get("url"):
+            lines.append(f"- 链接：{ctx['url']}")
+        if ctx.get("params"):
+            lines.append(f"- 参数：{ctx['params']}")
+        if ctx.get("note"):
+            lines.append(f"- 备注：{ctx['note']}")
+        lines += [
+            "",
+            "## 结果统计",
+            "",
+            f"- 新增：{done.get('ok', sum(1 for e in extracts if e.get('status') == 'ok'))}"
+            f"（其中断点续传 {done.get('resumed', 0)}）",
+            f"- 跳过（已有文案）：{done.get('skip', sum(1 for e in extracts if e.get('status') == 'skip'))}",
+            f"- 失败：{done.get('fail', sum(1 for e in extracts if e.get('status') == 'fail'))}",
+        ]
+        if done.get("output_dir"):
+            lines.append(f"- 输出目录：{done['output_dir']}")
+        if errors:
+            lines += ["", "## 运行错误", ""]
+            for e in errors:
+                lines.append(f"- {str(e.get('error', '')).replace('|', chr(92) + '|')}")
+        if extracts:
+            lines += [
+                "",
+                "## 视频明细",
+                "",
+                "| # | 标题 | 视频ID | 状态 | 备注 |",
+                "|---|------|--------|------|------|",
+            ]
+            for e in extracts:
+                status = {"ok": "新增", "skip": "跳过",
+                          "fail": "失败"}.get(e.get("status"), str(e.get("status", "")))
+                if e.get("resumed"):
+                    status += "（续传）"
+                remark = e.get("error") or e.get("output") or ""
+                title = str(e.get("title", "")).replace("|", "\\|").replace("\n", " ")
+                lines.append(
+                    f"| {e.get('index', '')} | {title} | {e.get('aweme_id', '')} "
+                    f"| {status} | {str(remark).replace('|', chr(92) + '|')} |")
+
+        REFRESH_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        base = f"{time.strftime('%Y%m%d_%H%M%S')}_{_sanitize_log_name(author)}"
+        path = REFRESH_LOG_DIR / f"{base}.md"
+        n = 2
+        while path.exists():
+            path = REFRESH_LOG_DIR / f"{base}-{n}.md"
+            n += 1
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except Exception:
+        pass
 
 
 async def _batch_stream():
@@ -680,6 +791,7 @@ def _pending_worker_loop() -> None:
                 log_operation("queue.item", status="error",
                               url=item.get("url", ""), error=str(e)[:300])
             finally:
+                _write_refresh_log()  # one standalone log per queued run
                 _batch_state["running"] = False
                 _set_batch_pause_flag(False)  # item ended; don't pause the next one
                 _batch_finish()
@@ -703,7 +815,9 @@ def _pending_api_key() -> str:
 def _pending_run_item(item: dict) -> None:
     """Run one queued link (batch lock already held). Publishes progress on
     the same SSE channel as manual batches, so the WebUI shows it the same way."""
-    _batch_new_job("待解析队列")
+    _batch_new_job("待解析队列", _refresh_log_ctx(
+        trigger="待解析队列", url=item.get("url", ""),
+        note="类型：UP 主页" if item["kind"] == "up" else "类型：单个视频"))
     _batch_publish({"stage": "queue", "kind": item["kind"], "url": item["url"]})
     try:
         if item["kind"] == "up":
@@ -994,7 +1108,11 @@ async def profile_batch(req: BatchRequest):
     # the page renderer and hangs the run forever.
     # Start a fresh job view: subscribing clients must never see the previous
     # job's events replayed as if they belonged to this one.
-    _batch_new_job(req.author or "")
+    _batch_new_job(req.author or "", _refresh_log_ctx(
+        trigger="手动批量", url=req.url,
+        params=f"max_videos={req.max_videos}, force={req.force}, "
+               f"save_video={req.save_video}, use_cache={req.use_cache}, "
+               f"workers={req.workers}"))
 
     def _worker():
         try:
@@ -1023,6 +1141,7 @@ async def profile_batch(req: BatchRequest):
         finally:
             # Order matters: a late subscriber treats "not running" as "the job
             # is over", so the flag must be down before the streams are closed.
+            _write_refresh_log()  # needs history before any next job clears it
             _batch_state["running"] = False
             _batch_finish()
             _maybe_start_pending(delay=2.0)  # queued links take over next
