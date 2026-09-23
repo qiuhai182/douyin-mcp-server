@@ -57,6 +57,25 @@ if sys.platform == "win32":
 HISTORY_FILE = Path(__file__).resolve().parent.parent.parent / "history.json"
 PROFILE_CACHE_FILE = Path(__file__).resolve().parent.parent.parent / "profile_cache.json"
 
+# Ledger of newly materialized transcripts (one line per new md file, across
+# all authors), so the user can see at a glance what each run added.
+NEW_RECORDS_FILE = HISTORY_FILE.parent / "output" / "_新增记录.md"
+_new_records_lock = threading.Lock()
+
+
+def _log_new_record(author: str, md_path, title: str):
+    """Append one line per newly written transcript to the output-root
+    ledger. Best-effort: never let bookkeeping break extraction."""
+    try:
+        line = (f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {author} | "
+                f"{Path(md_path).name} | {(title or '').strip()[:80]}\n")
+        with _new_records_lock:
+            NEW_RECORDS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(NEW_RECORDS_FILE, "a", encoding="utf-8") as f:
+                f.write(line)
+    except Exception:
+        pass
+
 # Pause control for the batch pipeline (run gate): set = running,
 # cleared = paused. Checked BEFORE each video starts, so an in-flight
 # video always finishes (pause takes effect at the next video boundary).
@@ -672,6 +691,7 @@ def batch_extract(
                     history.add(aweme_id, title, str(md_path))
                     counters["ok"] += 1
                     counters["resumed"] += 1
+                _log_new_record(author_dir_name, md_path, title)
                 _report({"stage": "extract", "index": i + 1, "total": total,
                          "aweme_id": aweme_id, "title": title,
                          "status": "ok", "resumed": True,
@@ -765,6 +785,7 @@ def batch_extract(
                 history.add(aweme_id, title, str(transcript_path))
                 counters["ok"] += 1
 
+            _log_new_record(author_dir_name, transcript_path, title)
             _report({"stage": "extract", "index": index + 1, "total": total,
                      "aweme_id": aweme_id, "title": title,
                      "status": "ok", "output": str(transcript_path)})
