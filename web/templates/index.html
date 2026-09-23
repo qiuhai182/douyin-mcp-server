@@ -559,7 +559,7 @@
                     <div class="flex gap-3">
                         <button
                             @click="extractInfo"
-                            :disabled="!url || loading || batchActive"
+                            :disabled="!url || loading || backendBusy"
                             class="flex-1 h-11 bg-douyin-gray-100 hover:bg-douyin-gray-200 text-douyin-gray-700 font-medium text-sm rounded-xl transition-smooth disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
@@ -587,7 +587,7 @@
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/>
                             </svg>
-                            <span x-text="(batchActive || loading) ? '排队解析' : '批量提取作者全部文案'"></span>
+                            <span x-text="(backendBusy || loading) ? '排队解析' : '提取文案'"></span>
                         </button>
                         <label class="mt-2 flex items-center gap-2 text-xs text-douyin-gray-500 cursor-pointer select-none">
                             <input type="checkbox" x-model="batchUseCache" class="accent-douyin-red w-3.5 h-3.5">
@@ -596,7 +596,7 @@
                         <p class="mt-2 text-xs text-douyin-gray-400">粘贴作者主页链接后使用；自动跳过已提取成功的视频，失败的会自动重试。若抓取不全，先点「登录抖音」一次（浏览器缓存会永久记住，不再弹窗）。</p>
                         <button
                             @click="douyinLogin"
-                            :disabled="batchActive"
+                            :disabled="backendBusy"
                             class="mt-2 w-full h-9 border border-douyin-gray-200 hover:border-douyin-gray-400 text-douyin-gray-600 text-xs rounded-lg transition-smooth disabled:opacity-50 flex items-center justify-center gap-2">
                             <span x-text="douyinLoginBtn.douyinLoginBtnLabel || douyinLoginLabel"></span>
                         </button>
@@ -605,8 +605,24 @@
                     </div>
 
                     <!-- Batch Progress Panel -->
-                    <div x-show="batchRunning || batchDetached || batchLogs.length" x-transition
+                    <div x-show="batchRunning || batchDetached || driverTask || batchLogs.length" x-transition
                          class="mt-4 bg-douyin-gray-50 rounded-xl p-4">
+                        <!-- Backend script task banner (全UP刷新 driver)：页面刷新/换浏览器都不丢 -->
+                        <div x-show="driverTask" x-transition
+                             class="mb-3 rounded-lg bg-red-50 border border-red-200 px-3 py-2.5">
+                            <div class="flex items-center justify-between gap-2">
+                                <p class="text-xs font-medium text-red-700">
+                                    <span class="inline-block w-2 h-2 rounded-full bg-red-500 mr-1 animate-pulse-soft"></span>
+                                    后端刷新任务运行中（<span x-text="driverProgressText"></span>）
+                                    <span class="block mt-0.5 text-red-500/80 font-normal">关闭浏览器不影响任务；新任务已暂停受理</span>
+                                </p>
+                                <button @click="batchAbort()"
+                                        :disabled="driverTerminating"
+                                        class="flex-shrink-0 text-xs px-2.5 py-1 rounded-lg bg-red-50 text-red-600 hover:bg-red-100 border border-red-200 transition-smooth disabled:opacity-50">
+                                    <span x-text="driverTerminating ? '终止中...' : '终止'"></span>
+                                </button>
+                            </div>
+                        </div>
                         <div class="flex items-center justify-between mb-2">
                             <p class="text-sm font-medium text-douyin-gray-700">
                                 批量进度
@@ -643,6 +659,15 @@
                                     <path d="M8 5v14l11-7z"/>
                                 </svg>
                                 继续
+                            </button>
+                            <button x-show="batchRunning || batchDetached" @click="batchAbort()"
+                                    :disabled="driverTerminating"
+                                    title="终止任务：当前视频完成后停止，已完成的文案保留"
+                                    class="text-xs px-2.5 py-1 rounded-lg bg-red-50 text-red-600 hover:bg-red-100 border border-red-200 transition-smooth flex items-center gap-1 disabled:opacity-50">
+                                <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
+                                    <path d="M6 6l12 12M18 6L6 18"/>
+                                </svg>
+                                <span x-text="driverTerminating ? '终止中...' : '终止'"></span>
                             </button>
                             <span x-show="batchDetached" class="text-xs text-amber-600">任务仍在后台运行，点「继续」接上</span>
                             <span x-show="batchRunning && batchPaused" class="text-xs text-amber-600">已暂停（当前视频完成后生效）</span>
@@ -734,7 +759,7 @@
                                         class="text-xs px-2.5 py-1 rounded-lg bg-red-50 text-red-600 hover:bg-red-100 border border-red-200 transition-smooth">
                                     停止队列
                                 </button>
-                                <button x-show="!authorQueueRunning && !batchRunning && !batchDetached" @click="resumeLastTask()"
+                                <button x-show="!authorQueueRunning && !batchRunning && !batchDetached && !driverTask" @click="resumeLastTask()"
                                         :disabled="!hasLastTask"
                                         :title="hasLastTask && lastTaskInfo ? ('上次任务：已完成 ' + (lastTaskInfo.done || []).length + ' 位，剩余 ' + ((lastTaskInfo.pending || []).length + (lastTaskInfo.current ? 1 : 0)) + ' 位（已成功的视频会自动跳过）') : '暂无可继续的任务；运行一次「一键刷新全部」后，若中途被打断可从这里接着刷新'"
                                         :class="hasLastTask ? 'bg-amber-50 text-amber-700 hover:bg-amber-100 border-amber-200' : 'bg-douyin-gray-100 text-douyin-gray-300 border-douyin-gray-200 cursor-not-allowed'"
@@ -744,7 +769,8 @@
                                     </svg>
                                     继续上次刷新任务
                                 </button>
-                                <button x-show="!authorQueueRunning && !batchRunning && !batchDetached" @click="batchAllAuthors()"
+                                <button x-show="!authorQueueRunning && !batchRunning && !batchDetached && !driverTask" @click="startBackendRefreshAll()"
+                                        title="以后台脚本方式静默刷新全部 UP：关闭浏览器不中断，页面实时显示进度，可随时终止"
                                         class="text-xs px-2.5 py-1 rounded-lg bg-douyin-red/10 text-douyin-red hover:bg-douyin-red/20 border border-douyin-red/30 transition-smooth flex items-center gap-1">
                                     <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
                                         <path d="M8 5v14l11-7z"/>
@@ -775,7 +801,7 @@
                                             <span x-show="a.last_batch_at" class="text-douyin-gray-400"> · 最近批量 <span x-text="a.last_batch_at"></span></span>
                                         </p>
                                     </div>
-                                    <button @click="batchAuthor(a)" :disabled="batchActive"
+                                    <button @click="batchAuthor(a)" :disabled="backendBusy"
                                             title="再次批量解析该作者的最新视频"
                                             class="flex-shrink-0 text-xs px-2.5 py-1.5 rounded-lg bg-douyin-pink bg-opacity-10 text-douyin-pink hover:bg-opacity-20 disabled:opacity-40 transition-smooth flex items-center gap-1">
                                         <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
@@ -1094,6 +1120,8 @@
                 backgroundLabel: '',       // UP name of that background job
                 batchLastSeq: 0,           // last stream event applied (per job)
                 batchEpoch: 0,             // server-side job generation (queue items / new batches bump it)
+                driverTask: null,          // backend script task (全UP刷新 driver) heartbeat info
+                driverTerminating: false,  // 终止按钮已点击，防止重复请求
                 batchLogs: [],
                 batchTotal: 0,
                 batchDone: 0,
@@ -1143,6 +1171,33 @@
                     // True while a batch is progressing, whether this page is
                     // attached to it or only watching it from the outside.
                     return this.batchRunning || this.batchDetached;
+                },
+
+                get backendBusy() {
+                    // Any task occupying the Chrome profile: a WebUI batch OR
+                    // the backend script task (全UP刷新 driver). While busy,
+                    // new tasks are blocked (the backend enforces it too).
+                    return this.batchActive || !!this.driverTask;
+                },
+
+                get driverProgressText() {
+                    const d = this.driverTask;
+                    if (!d) return '';
+                    const pos = d.author_total
+                        ? `第 ${d.author_index || '?'}/${d.author_total} 位 UP`
+                        : '';
+                    const who = d.current_author ? `「${d.current_author}」` : '';
+                    const le = d.last_event || {};
+                    let live = '';
+                    if (le.stage === 'extract' && le.total) {
+                        live = ` · ${le.index || '?'}/${le.total}`;
+                        if (le.status === 'ok') live += ' 最新已提取';
+                        else if (le.status === 'skip') live += ' 跳过中';
+                        else if (le.status === 'fail') live += ' 出现失败';
+                    } else if (le.stage === 'list') {
+                        live = ` · 已发现 ${le.found || 0} 个视频`;
+                    }
+                    return [pos, who].filter(Boolean).join('：') + live;
                 },
 
                 get activeUp() {
@@ -1230,6 +1285,7 @@
                     // offer the "继续" button instead of pretending nothing runs.
                     const st = await this._fetchServiceStatus();
                     if (!st) return;
+                    this.driverTask = st.driver_running ? (st.driver || {}) : null;
                     if (!st.batch_running) {
                         sessionStorage.removeItem('douyin_author_queue');
                         return;
@@ -1447,26 +1503,6 @@
                     }
                 },
 
-                batchAllAuthors() {
-                    // Serially refresh every known UP (one batch at a time,
-                    // the global single-job lock enforces the rest).
-                    if (this.batchActive || !this.authors.length) return;
-                    if (!this.apiKeyConfigured) {
-                        this.showSettings = true;
-                        return;
-                    }
-                    const total = this.authors.reduce((s, a) => s + (a.video_count || 0), 0);
-                    if (!confirm(`将依次批量刷新全部 ${this.authors.length} 位 UP（共约 ${total} 个视频，已提取的会自动跳过），开始？`)) return;
-                    this.batchLogs = [];
-                    this.batchTotal = 0;
-                    this.batchDone = 0;
-                    this._resetRunStats();
-                    this.authorQueueDone = [];
-                    this.authorQueue = this.authors.slice();
-                    this.authorQueueRunning = true;
-                    this._startBatchAuthor(this.authorQueue.shift());
-                },
-
                 stopAuthorQueue() {
                     // Stop after the current author's batch finishes. The
                     // remaining UP list stays on disk so 「继续上次刷新任务」 can
@@ -1542,6 +1578,10 @@
                     const urls = (this.pendingLinkInput || '')
                         .split(/\s+|[,，;；]+/).map(s => s.trim()).filter(Boolean);
                     if (!urls.length || this.pendingLinkBusy) return;
+                    if (this.driverTask) {
+                        this.showToast('后端刷新任务运行中，暂不接受排队');
+                        return;
+                    }
                     this.pendingLinkBusy = true;
                     try {
                         const res = await fetch('/api/pending-links', {
@@ -1682,6 +1722,13 @@
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({ urls })
                         });
+                        if (!res.ok) {
+                            const err = await res.json().catch(() => ({}));
+                            this.queuedNotice = err.detail || '加入队列失败，请重试';
+                            clearTimeout(this._queueNoticeTimer);
+                            this._queueNoticeTimer = setTimeout(() => this.queuedNotice = '', 5000);
+                            return;
+                        }
                         const data = await res.json();
                         this.pendingLinks = data.items || [];
                         this.queuedNotice = data.added
@@ -1698,14 +1745,18 @@
                 startQueueWatchers() {
                     // 8s: refresh queue item statuses; 6s: if the backend queue
                     // runner auto-started the next item, silently reattach the
-                    // progress stream so the UI follows queued work seamlessly.
+                    // progress stream so the UI follows queued work seamlessly;
+                    // 6s also keeps the backend-driver banner fresh (page
+                    // reloads never lose it: the state lives in the service).
                     if (this._queueWatchers) return;
                     this._queueWatchers = true;
                     setInterval(() => this.loadPendingLinks(), 8000);
                     setInterval(async () => {
                         try {
                             const st = await this._fetchServiceStatus();
-                            if (st && st.batch_running && !this.batchActive && !this.authorQueueRunning) {
+                            if (!st) return;
+                            this.driverTask = st.driver_running ? (st.driver || {}) : null;
+                            if (st.batch_running && !this.batchActive && !this.authorQueueRunning) {
                                 this.batchDetached = true;
                                 this.resumeBatch();
                             }
@@ -1853,8 +1904,62 @@
                     }
                 },
 
+                async batchAbort() {
+                    // 终止当前任务：WebUI 批量在下一个视频边界停止；
+                    // 后端脚本任务（driver）直接终止进程树。
+                    if (this.driverTerminating) return;
+                    if (!confirm('确定终止当前任务？正在处理的视频完成后停止，已完成的文案会保留。')) return;
+                    this.driverTerminating = true;
+                    try {
+                        const res = await fetch('/api/profile/batch/abort', { method: 'POST' });
+                        if (!res.ok) {
+                            const err = await res.json().catch(() => ({}));
+                            throw new Error(err.detail || '终止失败');
+                        }
+                        const data = await res.json().catch(() => ({}));
+                        this.addBatchLog(data.notice || '已请求终止...', 'warn');
+                        this.showToast('已请求终止');
+                    } catch (e) {
+                        this.showToast(e.message || '终止失败');
+                    } finally {
+                        setTimeout(() => this.driverTerminating = false, 4000);
+                    }
+                },
+
+                async startBackendRefreshAll() {
+                    // 一键刷新全部 → 后端脚本任务（driver）：静默、关闭浏览器
+                    // 不丢任务，前端实时显示进度并可终止。
+                    if (this.backendBusy || !this.authors.length) return;
+                    if (!this.apiKeyConfigured) {
+                        this.showSettings = true;
+                        return;
+                    }
+                    const total = this.authors.reduce((s, a) => s + (a.video_count || 0), 0);
+                    if (!confirm(`将以后台脚本方式刷新全部 ${this.authors.length} 位 UP（共约 ${total} 个视频，已提取的会自动跳过）。\n\n任务在服务端运行：关闭浏览器/页面都不会中断，进度会一直显示在这里，可随时终止。开始？`)) return;
+                    try {
+                        const res = await fetch('/api/refresh-all/start', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ workers: 3, force: false })
+                        });
+                        if (!res.ok) {
+                            const err = await res.json().catch(() => ({}));
+                            throw new Error(err.detail || '启动失败');
+                        }
+                        const data = await res.json().catch(() => ({}));
+                        this.showToast(data.notice || '后台刷新已启动');
+                    } catch (e) {
+                        this.showToast(e.message || '启动失败');
+                    }
+                },
+
                 async batchExtract() {
                     if (!this.url || !this.url.trim()) return;
+                    // 后端脚本任务独占 Chrome profile：不受理新任务（后端同样拦截）
+                    if (this.driverTask) {
+                        this.showToast('后端刷新任务运行中，不能开始新任务');
+                        return;
+                    }
 
                     // 忙时不打断：把链接加入待解析队列（UP/视频自动识别）
                     if (this.batchActive || this.loading) {
@@ -1984,7 +2089,7 @@
                             if (!line.startsWith('data: ')) continue;
                             let evt;
                             try { evt = JSON.parse(line.slice(6)); } catch (e) { continue; }
-                            if (evt.stage === 'done' || evt.stage === 'error' || evt.stage === 'closed') ended = true;
+                            if (evt.stage === 'done' || evt.stage === 'error' || evt.stage === 'aborted' || evt.stage === 'closed') ended = true;
                             // A NEW job (next queue item / fresh batch) restarts
                             // seq from 0. Without this reset every event of the
                             // new job would be filtered as "already applied" and
@@ -2072,6 +2177,9 @@
                     } else if (stage === 'done') {
                         this.addBatchLog(`完成：成功 ${evt.ok}，跳过 ${evt.skip}，失败 ${evt.fail}。输出目录: ${evt.output_dir}`, 'ok');
                         this.showToast(`批量完成：成功 ${evt.ok}，跳过 ${evt.skip}，失败 ${evt.fail}`);
+                    } else if (stage === 'aborted') {
+                        this.addBatchLog(`已终止：成功 ${evt.ok ?? 0}，跳过 ${evt.skip ?? 0}，失败 ${evt.fail ?? 0}（已完成的文案保留）`, 'warn');
+                        this.showToast('任务已终止');
                     } else if (stage === 'error') {
                         this.addBatchLog('错误: ' + (evt.error || '未知'), 'error');
                         this.error = evt.error || '批量任务出错';

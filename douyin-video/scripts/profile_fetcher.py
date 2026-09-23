@@ -22,6 +22,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 from typing import Optional
@@ -210,9 +211,12 @@ def _kill_profile_browsers(timeout: int = 20) -> int:
         "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
     )
     try:
+        kwargs = dict(capture_output=True, text=True, timeout=timeout)
+        if sys.platform == "win32":
+            kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
         subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-            capture_output=True, text=True, timeout=timeout,
+            **kwargs,
         )
     except Exception:
         pass
@@ -683,6 +687,7 @@ def fetch_profile_videos(
     videos = {}      # aweme_id -> {"desc":, "url":}
     nickname = ""
     sec_uid = ""
+    declared_total = 0
     has_more = {"value": True}  # XHR flag: does the server have more pages?
 
     with sync_playwright() as p:
@@ -766,6 +771,22 @@ def fetch_profile_videos(
             except Exception:
                 pass
 
+            # Declared video count from the profile tab ("作品 382"). The
+            # public aweme/post API may lag or hide a video (e.g. under
+            # review), so this is a patience target, never a hard promise:
+            # we keep scrolling while short of it, but only videos that
+            # actually show up in the list enter `videos`.
+            declared_total = 0
+            try:
+                declared_total = page.evaluate(
+                    "() => { const m = document.body.innerText.match(/作品\\s*(\\d+)/);"
+                    " return m ? parseInt(m[1], 10) : 0; }"
+                ) or 0
+            except Exception:
+                pass
+            if declared_total and declared_total < len(videos):
+                declared_total = 0  # nonsense reading; ignore
+
             # Robust scroll loop:
             # - keeps scrolling while the server says has_more=True (even if
             #   a scroll round fetched nothing, e.g. slow network)
@@ -776,6 +797,8 @@ def fetch_profile_videos(
             for i in range(max_rounds):
                 if max_videos and len(videos) >= max_videos:
                     break
+                if declared_total and len(videos) >= declared_total:
+                    break  # everything the profile declares is already here
                 # Douyin's list lives in an inner scroll container; scrolling
                 # window alone is often not enough, so scroll every candidate.
                 try:
@@ -796,7 +819,11 @@ def fetch_profile_videos(
                 cur = len(videos)
                 if cur == prev_count:
                     stable += 1
-                    if has_more["value"]:
+                    # Still short of the declared count? Then the missing
+                    # video is likely one page request away - stay as
+                    # patient as the has_more=True path (20 rounds ~= 24s).
+                    short_of_declared = bool(declared_total) and cur < declared_total
+                    if has_more["value"] or short_of_declared:
                         # Server still reports more pages -> be very patient
                         # (rate-limited/slow responses can lag several rounds).
                         if stable >= 20:
@@ -810,8 +837,14 @@ def fetch_profile_videos(
                     prev_count = cur
 
             # Final settle pass: flush late XHR responses that were still in
-            # flight when the main loop decided to stop.
-            for _ in range(5):
+            # flight when the main loop decided to stop. Dynamic: keep
+            # scrolling while the count is still growing; stop after 3
+            # consecutive rounds added nothing (or the declared count is met).
+            settle_prev = len(videos)
+            settle_stable = 0
+            for _ in range(15):
+                if declared_total and len(videos) >= declared_total:
+                    break
                 try:
                     page.evaluate(
                         "() => {"
@@ -826,6 +859,13 @@ def fetch_profile_videos(
                 except Exception:
                     pass
                 page.wait_for_timeout(1500)
+                if len(videos) > settle_prev:
+                    settle_prev = len(videos)
+                    settle_stable = 0
+                else:
+                    settle_stable += 1
+                    if settle_stable >= 3:
+                        break
 
             if not logged_in:
                 _notice("未检测到抖音登录状态，可能只抓到第一页；点「登录抖音」一次即可抓全")
@@ -858,4 +898,5 @@ def fetch_profile_videos(
             {"aweme_id": vid, **meta} for vid, meta in videos.items()
         ],
         "logged_in": logged_in,
+        "declared_total": declared_total,  # profile-tab count, 0 = unknown
     }

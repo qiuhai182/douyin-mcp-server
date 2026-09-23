@@ -18,9 +18,11 @@ History file layout (history.json):
 """
 
 import re
+import sys
 import time
 import json
 import shutil
+import subprocess
 import threading
 from pathlib import Path
 from datetime import datetime
@@ -32,6 +34,26 @@ from profile_fetcher import (
     normalize_profile_url, HEADERS,
 )
 
+# Windows: console tools spawned here (ffmpeg / ffprobe via ffmpeg-python,
+# curl etc.) would each flash a new console window when the parent is
+# windowless (pythonw). Force CREATE_NO_WINDOW on every Popen.
+# NOTE: patch Popen.__init__, NOT the Popen class itself — asyncio's
+# windows_utils subclasses subprocess.Popen at import time, and a swapped-in
+# plain function breaks `class Popen(subprocess.Popen)` (TypeError: function()
+# argument 'code' must be code, not str) when asyncio is imported after us.
+if sys.platform == "win32":
+    _CREATE_NO_WINDOW = 0x08000000
+    if not getattr(subprocess.Popen.__init__, "_no_window_patched", False):
+        _orig_popen_init = subprocess.Popen.__init__
+
+        def _quiet_popen_init(self, *args, **kwargs):
+            kwargs["creationflags"] = (
+                kwargs.get("creationflags") or 0) | _CREATE_NO_WINDOW
+            _orig_popen_init(self, *args, **kwargs)
+
+        _quiet_popen_init._no_window_patched = True
+        subprocess.Popen.__init__ = _quiet_popen_init
+
 HISTORY_FILE = Path(__file__).resolve().parent.parent.parent / "history.json"
 PROFILE_CACHE_FILE = Path(__file__).resolve().parent.parent.parent / "profile_cache.json"
 
@@ -39,6 +61,16 @@ PROFILE_CACHE_FILE = Path(__file__).resolve().parent.parent.parent / "profile_ca
 # cleared = paused. Checked BEFORE each video starts, so an in-flight
 # video always finishes (pause takes effect at the next video boundary).
 run_gate = threading.Event()
+
+# Cancel control: once set, no NEW video is started. Like the pause gate,
+# cancellation takes effect at video boundaries - in-flight videos always
+# complete (their transcripts are kept, so a later run resumes cleanly).
+# batch_extract() clears it on entry; web /api/profile/batch/abort sets it.
+cancel_flag = threading.Event()
+
+
+class BatchCancelled(Exception):
+    """Raised inside worker threads when cancel_flag is seen."""
 
 
 class TranscriptHistory:
@@ -488,8 +520,10 @@ def batch_extract(
     from douyin_downloader import DouyinProcessor
     from asr_backends import resolve_backend
 
-    # Each batch starts unpaused (a previous run may have left the gate cleared)
+    # Each batch starts unpaused and uncancelled (a previous run may have
+    # left either flag in a blocking state)
     run_gate.set()
+    cancel_flag.clear()
 
     def _report(payload: dict):
         # Persist every progress/feedback event to the runtime operation log
@@ -660,8 +694,14 @@ def batch_extract(
 
     def _paced_start():
         # Block here while paused: the in-flight video finishes normally,
-        # the next one does not start until the gate is set again.
-        run_gate.wait()
+        # the next one does not start until the gate is set again. While
+        # waiting, keep checking cancel_flag so a paused+aborted job stops
+        # instead of blocking forever on a gate nobody will re-open.
+        while not run_gate.wait(0.5):
+            if cancel_flag.is_set():
+                raise BatchCancelled()
+        if cancel_flag.is_set():
+            raise BatchCancelled()
         with start_lock:
             wait = delay_seconds - (time.time() - last_start[0])
             if wait > 0:
@@ -670,6 +710,8 @@ def batch_extract(
 
     def _process_one(index: int, aweme_id: str, title: str):
         """Full per-video pipeline; runs inside a worker thread."""
+        if cancel_flag.is_set():
+            raise BatchCancelled()
         # One processor per task: isolated temp dir, auto-cleaned on exit.
         processor = DouyinProcessor(
             backend_cfg['api_key'],
@@ -726,6 +768,8 @@ def batch_extract(
             _report({"stage": "extract", "index": index + 1, "total": total,
                      "aweme_id": aweme_id, "title": title,
                      "status": "ok", "output": str(transcript_path)})
+        except BatchCancelled:
+            raise  # never record a user-cancelled video as failed
         except Exception as e:
             with state_lock:
                 counters["fail"] += 1
@@ -738,9 +782,14 @@ def batch_extract(
                      "status": "fail", "error": str(e)[:300]})
 
     workers = max(1, int(workers or 1))
+    cancelled = False
     if workers == 1 or len(pending) <= 1:
         for index, aweme_id, title in pending:
-            _process_one(index, aweme_id, title)
+            try:
+                _process_one(index, aweme_id, title)
+            except BatchCancelled:
+                cancelled = True
+                break
     else:
         with ThreadPoolExecutor(max_workers=min(workers, len(pending))) as pool:
             futures = [
@@ -748,15 +797,19 @@ def batch_extract(
                 for index, aweme_id, title in pending
             ]
             for f in futures:
-                f.result()  # errors are reported inside _process_one
+                try:
+                    f.result()  # errors are reported inside _process_one
+                except BatchCancelled:
+                    cancelled = True  # still wait for the in-flight ones
 
     ok += counters["ok"]
     fail += counters["fail"]
     # Refresh the per-author catalog (filename <-> title/desc index)
-    try:
-        update_catalog(author_dir, profile.get("nickname", ""))
-    except Exception:
-        pass
+    if not cancelled:
+        try:
+            update_catalog(author_dir, profile.get("nickname", ""))
+        except Exception:
+            pass
     summary = {
         "author": profile.get("nickname", ""),
         "sec_uid": profile.get("sec_uid", ""),
@@ -764,6 +817,10 @@ def batch_extract(
         "resumed": counters["resumed"],
         "output_dir": str(author_dir),
     }
+    if cancelled:
+        summary["aborted"] = True
+        _report({"stage": "aborted", "ok": ok, "skip": skip, "fail": fail})
+        return summary
     # Persist author -> profile URL so the WebUI can re-run this author
     try:
         if profile.get("nickname"):

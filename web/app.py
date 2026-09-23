@@ -267,6 +267,8 @@ async def get_info(req: VideoRequest):
         if is_profile_url(req.url) and "modal_id=" not in req.url:
             return VideoInfoResponse(success=False,
                                      error="This is an author profile link. Use the Batch Extract button.")
+        if _driver_info():
+            raise HTTPException(status_code=409, detail=_driver_busy_detail())
         if not _claim_extract_slot():
             raise HTTPException(
                 status_code=409,
@@ -372,6 +374,92 @@ def _batch_finish() -> None:
 # ---------------------------------------------------------------------------
 REFRESH_LOG_DIR = ROOT / "output" / "刷新日志"
 _run_ctx: dict = {}
+
+# ---------------------------------------------------------------------------
+# 后端脚本任务（driver：scripts/refresh_all.py 全 UP 刷新）检测。
+# driver 进程会写心跳文件 driver_state.json（pid + 进度），WebUI 由此：
+#   - 在前端显示"后端任务运行中"横幅和进度（页面刷新也不丢）
+#   - 拦截所有会占用 Chrome profile 的新任务（409 互斥）
+#   - 提供终止按钮（taskkill 进程树，连带 Chrome 子进程）
+# ---------------------------------------------------------------------------
+DRIVER_STATE_FILE = REFRESH_LOG_DIR / "driver_state.json"
+
+
+def _pid_alive(pid: int) -> bool:
+    if not pid or pid <= 0:
+        return False
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    import ctypes
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        return False
+    try:
+        exit_code = ctypes.c_ulong()
+        if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return exit_code.value == STILL_ACTIVE
+        return False
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _driver_info() -> dict:
+    """Running driver task info, or {} when no backend script task is alive.
+
+    pid-alive is the authoritative check; the heartbeat timestamp is a
+    secondary guard against a recycled pid showing a long-dead run.
+    """
+    try:
+        if not DRIVER_STATE_FILE.exists():
+            return {}
+        data = json.loads(DRIVER_STATE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not _pid_alive(int(data.get("pid") or 0)):
+            return {}
+        try:
+            age = time.time() - DRIVER_STATE_FILE.stat().st_mtime
+            if age > 3600:  # stale heartbeat from a recycled pid
+                return {}
+        except OSError:
+            return {}
+        return data
+    except Exception:
+        return {}
+
+
+def _terminate_driver() -> bool:
+    """Kill the driver process tree (pythonw + its Chrome children)."""
+    info = _driver_info()
+    pid = int(info.get("pid") or 0)
+    if not pid:
+        return False
+    try:
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            capture_output=True, text=True, timeout=30,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        log_operation("driver.terminate", pid=pid,
+                      author=info.get("current_author", ""))
+        return True
+    except Exception as e:
+        log_operation("driver.terminate", status="error", pid=pid, error=str(e))
+        return False
+
+
+def _driver_busy_detail() -> str:
+    info = _driver_info()
+    who = info.get("current_author") or ""
+    idx, tot = info.get("author_index"), info.get("author_total")
+    pos = f"（第 {idx}/{tot} 位：{who}）" if idx and tot else (f"（{who}）" if who else "")
+    return f"后端全 UP 刷新脚本任务正在运行{pos}：不能开始新任务。可在前端进度区终止它，或等它自动完成。"
 
 
 def _refresh_log_ctx(trigger: str, url: str = "", params: str = "",
@@ -562,6 +650,10 @@ _batch_claim_mutex = threading.Lock()
 # Playwright browser when the share page is risk-controlled, so they must be
 # serialized against batch jobs and the pending queue just like a batch.
 _extract_busy = False
+
+# Set by /api/profile/batch/abort: the queue runner stops after the aborted
+# item instead of auto-starting the next one (items stay queued on disk).
+_queue_halt_requested = False
 
 
 def _claim_batch_lock() -> bool:
@@ -770,14 +862,22 @@ def _pending_worker_loop() -> None:
     lock, so a queue item and a manual/refresh-all batch can never overlap on
     the browser profile. A manual batch always gets the lock first: this loop
     simply retries until the lock stays free."""
-    global _pending_timer, _pending_worker_alive
+    global _pending_timer, _pending_worker_alive, _queue_halt_requested
     _pending_timer = None
     _pending_worker_alive = True
     log_operation("queue.runner", status="start")
     try:
         while not (_restart_state["pending"] or _restart_state["restarting"]):
+            if _queue_halt_requested:
+                _queue_halt_requested = False
+                log_operation("queue.runner", status="halted_by_abort")
+                break
             if not any(it["status"] == "pending" for it in _pending_items()):
                 break
+            if _driver_info():
+                # 后端脚本任务独占 Chrome profile：排队项等它结束再跑
+                time.sleep(15)
+                continue
             if not _claim_batch_lock():
                 time.sleep(5)  # another job holds the lock; wait for it
                 continue
@@ -847,19 +947,33 @@ def _pending_run_up(item: dict) -> None:
             except Exception:
                 pass
         threading.Timer(2.0, _apply_restored_pause).start()
-    summary = batch_extract(
-        item["url"],
-        output_dir=str(Path(__file__).parent.parent / "output"),
-        api_key=api_key,
-        provider=None,
-        max_videos=0,
-        force=False,
-        headless=True,
-        save_video=False,
-        use_cache=False,
-        workers=3,
-        on_progress=_batch_publish,
-    )
+    from batch_extractor import batch_extract, BatchCancelled
+    try:
+        summary = batch_extract(
+            item["url"],
+            output_dir=str(Path(__file__).parent.parent / "output"),
+            api_key=api_key,
+            provider=None,
+            max_videos=0,
+            force=False,
+            headless=True,
+            save_video=False,
+            use_cache=False,
+            workers=3,
+            on_progress=_batch_publish,
+        )
+        if summary.get("aborted"):
+            _batch_publish({"stage": "aborted",
+                            "ok": summary.get("ok", 0),
+                            "skip": summary.get("skip", 0),
+                            "fail": summary.get("fail", 0)})
+            _pending_mark(item["id"], "pending",
+                          result="批量任务被终止，重新排队")
+            return
+    except BatchCancelled:
+        _batch_publish({"stage": "aborted"})
+        _pending_mark(item["id"], "pending", result="批量任务被终止，重新排队")
+        return
     _pending_mark(item["id"], "done",
                   result=f"新增 {summary.get('ok', 0)}，跳过 {summary.get('skip', 0)}，失败 {summary.get('fail', 0)}")
 
@@ -892,6 +1006,8 @@ async def pending_links_list():
 async def pending_links_add(req: PendingLinksRequest):
     """Queue links (single video / UP profile, auto-detected). Kicks the
     runner if nothing is running; otherwise it starts when the lock frees."""
+    if _driver_info():
+        raise HTTPException(status_code=409, detail=_driver_busy_detail())
     added, dup = _pending_add(req.urls, req.titles)
     if added:
         log_operation("queue.add", count=added, duplicates=dup)
@@ -925,6 +1041,9 @@ async def pending_links_extract_now(item_id: int):
             raise HTTPException(status_code=409, detail="该条目已在处理中或已完成")
         if item["kind"] != "video":
             raise HTTPException(status_code=409, detail="UP 主页链接请在队列中等待自动批量")
+
+    if _driver_info():
+        raise HTTPException(status_code=409, detail=_driver_busy_detail())
 
     if _batch_state["running"]:
         try:
@@ -1063,12 +1182,90 @@ async def service_status():
             paused = not run_gate.is_set()
         except Exception:
             paused = False
+    driver = _driver_info()
     return {
         "batch_running": running,
         "batch_paused": paused,
         "batch_label": _batch_job["label"] if running else "",
         "restart_pending": bool(_restart_state["pending"]),
+        "driver_running": bool(driver),
+        "driver": driver,
     }
+
+
+@app.post("/api/profile/batch/abort")
+async def profile_batch_abort():
+    """Terminate the current task.
+
+    - WebUI batch job: cancel_flag stops new videos at the next boundary
+      (in-flight videos finish, transcripts kept); a paused job is woken so
+      the cancel is always observed; the pending queue runner halts instead
+      of starting the next item.
+    - Backend script task (driver 全 UP 刷新): kill the pythonw process
+      tree (its Chrome children die with it); the guardian notices and
+      restarts the tray.
+    """
+    global _queue_halt_requested
+    if _driver_info():
+        if _terminate_driver():
+            # force-kill means the driver cannot clean up its own heartbeat
+            try:
+                DRIVER_STATE_FILE.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return {"status": "terminating", "target": "driver",
+                    "notice": "已发送终止指令：后端刷新任务即将退出"}
+        raise HTTPException(status_code=500, detail="终止后端任务失败（进程已退出？）")
+    if _batch_state["running"]:
+        from batch_extractor import cancel_flag, run_gate
+        _queue_halt_requested = True
+        _set_batch_pause_flag(False)
+        run_gate.set()      # wake paused workers so they see the cancel
+        cancel_flag.set()
+        log_operation("batch.abort", status="requested")
+        return {"status": "terminating", "target": "batch",
+                "notice": "已请求终止：当前视频完成后停止（已完成的文案会保留）"}
+    raise HTTPException(status_code=409, detail="当前没有正在运行的任务")
+
+
+class RefreshAllRequest(BaseModel):
+    workers: int = 3
+    force: bool = False
+
+
+@app.post("/api/refresh-all/start")
+async def refresh_all_start(req: RefreshAllRequest):
+    """Launch the backend full-UP refresh script as a detached background
+    task (hidden window, survives page reloads and browser restarts).
+
+    The driver runs refresh_guarded.ps1 (schtasks-guarded), writes a
+    heartbeat state file the WebUI polls, and refuses to start while a
+    WebUI batch holds the Chrome profile.
+    """
+    detail = _driver_busy_detail() if _driver_info() else ""
+    if detail:
+        raise HTTPException(status_code=409, detail=detail)
+    if _batch_state["running"] or _extract_busy:
+        raise HTTPException(
+            status_code=409,
+            detail="WebUI 批量/解析任务正在运行（Chrome profile 独占），请等它结束后再启动全量刷新")
+    ps1 = ROOT / "scripts" / "refresh_guarded.ps1"
+    if not ps1.exists():
+        raise HTTPException(status_code=500, detail="找不到 scripts/refresh_guarded.ps1")
+    args = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-WindowStyle", "Hidden", "-File", str(ps1),
+            "-Workers", str(max(1, min(req.workers, 8)))]
+    if req.force:
+        args.append("-Force")
+    try:
+        subprocess.Popen(
+            args, cwd=str(ROOT), close_fds=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"启动失败: {e}")
+    log_operation("refreshall.start", workers=req.workers, force=req.force)
+    return {"status": "starting",
+            "notice": "全 UP 刷新已在后台启动（关闭浏览器不影响）；进度会显示在页面上"}
 
 
 @app.post("/api/profile/batch")
@@ -1078,6 +1275,8 @@ async def profile_batch(req: BatchRequest):
     Returns a text/event-stream with JSON progress lines, then a final
     summary line, then closes.
     """
+    if _driver_info():
+        raise HTTPException(status_code=409, detail=_driver_busy_detail())
     if not _claim_batch_lock():
         if _extract_busy:
             raise HTTPException(
@@ -1121,20 +1320,28 @@ async def profile_batch(req: BatchRequest):
                           save_video=req.save_video, use_cache=req.use_cache,
                           workers=req.workers)
 
-            from batch_extractor import batch_extract
-            batch_extract(
-                req.url,
-                output_dir=str(Path(__file__).parent.parent / "output"),
-                api_key=api_key,
-                provider=req.provider or None,
-                max_videos=req.max_videos,
-                force=req.force,
-                headless=True,
-                save_video=req.save_video,
-                use_cache=req.use_cache,
-                workers=req.workers,
-                on_progress=_batch_publish,
-            )
+            from batch_extractor import batch_extract, BatchCancelled
+            try:
+                summary = batch_extract(
+                    req.url,
+                    output_dir=str(Path(__file__).parent.parent / "output"),
+                    api_key=api_key,
+                    provider=req.provider or None,
+                    max_videos=req.max_videos,
+                    force=req.force,
+                    headless=True,
+                    save_video=req.save_video,
+                    use_cache=req.use_cache,
+                    workers=req.workers,
+                    on_progress=_batch_publish,
+                )
+                if summary.get("aborted"):
+                    _batch_publish({"stage": "aborted",
+                                    "ok": summary.get("ok", 0),
+                                    "skip": summary.get("skip", 0),
+                                    "fail": summary.get("fail", 0)})
+            except BatchCancelled:
+                _batch_publish({"stage": "aborted"})
         except Exception as e:
             log_operation("batch.job", status="error", error=str(e))
             _batch_publish({"stage": "error", "error": str(e)[:400]})
@@ -1359,7 +1566,11 @@ async def douyin_login_status():
             return {"logged_in": True, "source": "cookies_backup"}
     except Exception:
         pass
-    # Try importing the session from installed browsers (no window)
+    # Try importing the session from installed browsers (no window).
+    # Skipped while a backend script task runs: the import would open a
+    # second browser on the profile the driver is using.
+    if _driver_info():
+        return {"logged_in": False, "source": "driver_busy"}
     try:
         if pf._import_browser_session_to_backup():
             return {"logged_in": True, "source": "system_browser"}
@@ -1375,6 +1586,8 @@ async def douyin_login():
     The session persists in the .douyin_profile cache; later batch runs
     reuse it silently. Runs in a background thread; progress via SSE.
     """
+    if _driver_info():
+        raise HTTPException(status_code=409, detail=_driver_busy_detail())
     if _batch_state["running"]:
         raise HTTPException(status_code=409, detail="A batch job is already running")
 
@@ -1483,6 +1696,8 @@ async def extract_transcript(req: VideoRequest):
             error="Please configure API Key first"
         )
 
+    if _driver_info():
+        raise HTTPException(status_code=409, detail=_driver_busy_detail())
     if not _claim_extract_slot():
         raise HTTPException(
             status_code=409,

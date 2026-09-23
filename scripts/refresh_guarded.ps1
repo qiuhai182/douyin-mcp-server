@@ -3,7 +3,10 @@
 # Guarded full UP refresh: uses Windows Task Scheduler (system service) to
 # launch refresh_all.py so the pythonw process escapes the Trae sandbox
 # timeout (~2 min kill). Lifecycle:
-#   stop tray -> schtasks create+run -> poll driver_live.log -> cleanup -> restart tray
+#   schtasks create+run -> poll driver_live.log -> cleanup -> ensure tray up
+#   (the tray/WebUI keeps running the whole time: mutual exclusion with the
+#    driver is enforced via the driver state file, and the WebUI shows the
+#    driver's live progress + terminate button)
 #
 # Idempotent (re-runnable after sandbox kill): detects an existing
 # schtasks task or a still-running pythonw refresh_all process, and jumps
@@ -44,9 +47,9 @@ function Join-Utf8([string]$base, [string]$child) {
 
 $pyw      = Join-Utf8 $root ".venv\Scripts\pythonw.exe"
 $driver   = Join-Utf8 $root "scripts\refresh_all.py"
-$liveLog  = Join-Utf8 (Join-Utf8 $root "output") ([char]0x5237 + [char]0x65B0 + [char]0x65E5 + [char]0x5FD7) + "\driver_live.log"
-$stopBat  = Join-Utf8 $root "stop.bat"
-$startBat = Join-Utf8 $root "start.bat"
+# "刷新日志" built from char codes: PS5 without BOM would mangle literal Chinese
+$refreshDirName = [string]([char]0x5237 + [char]0x65B0 + [char]0x65E5 + [char]0x5FD7)
+$liveLog  = Join-Utf8 (Join-Utf8 $root "output") ($refreshDirName + "\driver_live.log")
 
 $forceFlag  = if ($Force) { "force" } else { "" }
 $actionArgs = "`"$pyw`" `"$driver`" $Workers $forceFlag"
@@ -93,10 +96,21 @@ if ($existingPyw.Count -gt 0) {
 
 # ---------- 2. create + run schtasks ----------
 if ($needCreate) {
-    Write-Step "Stop tray (driver needs exclusive Chrome profile)"
-    if ([System.IO.File]::Exists($stopBat)) { & $stopBat | Out-Null; Start-Sleep -Seconds 2 }
-
+    # NOTE: the tray (WebUI) is deliberately left running. The driver and
+    # the WebUI share the Chrome profile exclusively via mutual exclusion:
+    # the driver refuses to start while a WebUI batch runs, and the WebUI
+    # blocks new tasks while the driver's heartbeat file exists. Keeping
+    # the tray alive lets the WebUI show the driver's live progress and
+    # offer a terminate button (scripts/refresh_all.py state file).
     schtasks /delete /tn $TaskName /f 2>&1 | Out-Null
+
+    # Rotate live log so stale done-marks from previous runs don't
+    # confuse the poll loop. No process holds the file here.
+    if ([System.IO.File]::Exists($liveLog)) {
+        try { [System.IO.File]::Delete($liveLog) } catch {
+            try { [System.IO.File]::Move($liveLog, "$liveLog.old") } catch {}
+        }
+    }
 
     Write-Step ("Create schtasks task: " + $TaskName)
     # TR invokes pythonw.exe directly with absolute paths — no bat/ps1
@@ -113,7 +127,10 @@ if ($needCreate) {
 }
 
 # ---------- 3. poll loop ----------
-Write-Step ("Start polling (interval={0}s)" -f $PollSec)
+# Baseline: only count done-marks appended AFTER guardian start, so a
+# leftover mark from a previous run can't trigger an early exit.
+$baseline = (Get-DriverLogTail $liveLog).Count
+Write-Step ("Start polling (interval={0}s, baseline_lines={1})" -f $PollSec, $baseline)
 Write-Host ("  log path: " + $liveLog)
 Write-Host ""
 
@@ -128,10 +145,13 @@ while ($true) {
     $alive = $pywList.Count -gt 0
 
     $lines = Get-DriverLogTail $liveLog
-    $tail  = if ($lines.Count -gt 0) { $lines[-1] } else { "(no log yet)" }
-    $done  = $false
-    foreach ($ln in $lines) {
-        if ($ln -match '=== .*[\u5b8c\u6210]|=== DRIVER DONE ===') { $done = $true; break }
+    $tail  = "(no new log yet)"
+    for ($i = $baseline; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -ne "") { $tail = $lines[$i] }
+    }
+    $done = $false
+    for ($i = $baseline; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match '=== .*[\u5b8c\u6210]|=== DRIVER DONE ===') { $done = $true; break }
     }
 
     # Compact one-line status
@@ -181,7 +201,7 @@ if ($latestReport) {
     Write-Warn ("No summary file found in: " + $reportDir)
 }
 
-# ---------- 6. restart tray (silent: no browser popup, unlike start.bat) ----------
+# ---------- 6. ensure tray is up (it was never stopped; just a safety net) ----------
 Write-Host ""
 Write-Step "Restart tray (silent)"
 $trayPy = Join-Utf8 $root "tray_server.py"
@@ -205,3 +225,4 @@ if ([System.IO.File]::Exists($trayPy)) {
 
 Write-Host ""
 Write-Ok "Guardian finished."
+exit 0
