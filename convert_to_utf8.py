@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""批量将目录内文本文件转换为 UTF-8 编码。
+# -*- coding: utf-8 -*-
+"""批量将目录内文本文件转换为 UTF-8 编码并统一换行符为 LF。
 
 用法:
-    python convert_to_utf8.py [目录] [--dry-run] [--backup] [--ext .py,.txt] [--strip-bom]
+    python convert_to_utf8.py [目录] [--dry-run] [--backup] [--ext .py,.txt] [--strip-bom] [--eol lf|crlf|none]
 
 说明:
     - 自动跳过二进制文件及常见二进制扩展名
     - 已是 UTF-8 的文件不重写（带 BOM 的 UTF-8 默认保留，可用 --strip-bom 去除）
     - 依次尝试识别编码: UTF-8 / UTF-8(BOM) / UTF-16(BOM) / GB18030 / Big5 / Shift-JIS / Latin-1
+    - 换行符统一为 LF（默认；--eol crlf 可改 Windows 风格，--eol none 跳过换行处理）——
+      统一策略：CRLF→目标、孤立 CR→目标；文件内混用（混合换行）一律拉平
 """
 
 import argparse
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -80,6 +84,26 @@ def detect_encoding(data: bytes) -> str | None:
     return None
 
 
+def unify_eol(text: str, eol: str) -> tuple[str, str | None]:
+    """统一换行符；返回 (文本, 变更说明)。变更说明为 None 表示无需改动。
+
+    先把 CRLF 与孤立 CR 拉平为 LF，再按目标形态落位——保证混合换行（LF/CRLF/CR 混用）一律统一。
+    """
+    if eol == "lf":
+        if "\r" not in text:
+            return text, None
+        fixed = text.replace("\r\n", "\n").replace("\r", "\n")
+        return fixed, "CRLF/CR -> LF"
+    if eol == "crlf":
+        has_lone_lf = bool(re.search(r"(?<!\r)\n", text))
+        has_lone_cr = bool(re.search(r"\r(?!\n)", text))
+        if not has_lone_lf and not has_lone_cr:
+            return text, None
+        fixed = text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+        return fixed, "LF/CR -> CRLF"
+    return text, None
+
+
 def process_file(path: Path, args: argparse.Namespace) -> tuple[str, str]:
     """处理单个文件，返回 (状态, 详情)。"""
     data = path.read_bytes()
@@ -90,25 +114,38 @@ def process_file(path: Path, args: argparse.Namespace) -> tuple[str, str]:
     if enc is None:
         return "unknown", "无法识别编码"
 
-    if enc == "utf-8":
-        return "utf8", ""
+    needs_rewrite = False
+    details: list[str] = []
 
     if enc == "utf-8-sig":
         if args.strip_bom:
             text = data.decode("utf-8-sig")
-            if not args.dry_run:
-                path.write_bytes(text.encode("utf-8"))
-            return "converted", "UTF-8 BOM -> UTF-8"
-        return "bom", "已是 UTF-8（带 BOM）"
+            needs_rewrite = True
+            details.append("UTF-8 BOM -> UTF-8")
+        else:
+            # BOM 保留语义：不做任何改写（换行统一也跳过，防静默剥 BOM）
+            return "bom", "已是 UTF-8（带 BOM）"
+    else:
+        text = data.decode(enc)
+        if enc != "utf-8":
+            needs_rewrite = True
+            details.append(f"{enc} -> UTF-8")
 
-    # 其他编码 -> UTF-8
-    text = data.decode(enc)
+    if args.eol != "none":
+        text, eol_detail = unify_eol(text, args.eol)
+        if eol_detail:
+            needs_rewrite = True
+            details.append(eol_detail)
+
+    if not needs_rewrite:
+        return "utf8", ""
+
     if args.dry_run:
-        return "converted", f"{enc} -> UTF-8（未写入）"
+        return "converted", "、".join(details) + "（未写入）"
     if args.backup:
         shutil.copy2(path, path.with_name(path.name + ".bak"))
     path.write_bytes(text.encode("utf-8"))
-    return "converted", f"{enc} -> UTF-8"
+    return "converted", "、".join(details)
 
 
 def main() -> None:
@@ -118,6 +155,8 @@ def main() -> None:
     parser.add_argument("--backup", action="store_true", help="转换前生成 <文件名>.bak 备份")
     parser.add_argument("--ext", default="", help="仅处理指定扩展名，逗号分隔，如: .py,.txt")
     parser.add_argument("--strip-bom", action="store_true", help="将带 BOM 的 UTF-8 文件重写为无 BOM UTF-8")
+    parser.add_argument("--eol", choices=["lf", "crlf", "none"], default="lf",
+                        help="换行符统一目标：lf（默认）/ crlf / none（跳过换行处理）")
     args = parser.parse_args()
 
     root = Path(args.directory)

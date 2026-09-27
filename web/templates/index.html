@@ -111,7 +111,7 @@
         }
     </style>
 </head>
-<body class="bg-douyin-gray-50 min-h-screen lg:h-screen lg:overflow-hidden bg-gradient-mesh flex flex-col" x-data="douyinExtractor()" x-init="checkHealth(); loadPendingLinks(); startQueueWatchers()">
+<body class="bg-douyin-gray-50 min-h-screen lg:h-screen lg:overflow-hidden bg-gradient-mesh flex flex-col" x-data="douyinExtractor()" x-init="checkHealth(); loadPendingLinks(); startQueueWatchers(); window.addEventListener('pageshow', () => { pendingLinkInput = ''; document.querySelectorAll('.pending-link-input').forEach(el => { el.value = ''; }); })">
 
     <!-- Top Navigation Bar -->
     <nav class="sticky top-0 z-50 flex-shrink-0 bg-white/80 backdrop-blur-xl border-b border-douyin-gray-100">
@@ -438,8 +438,10 @@
             <!-- Add row -->
             <div class="px-6 py-3 border-b border-douyin-gray-100 flex gap-2 flex-shrink-0">
                 <input x-model="pendingLinkInput" @keydown.enter="addPendingLinks()"
+                       @focus="const el = $event.target; if (!pendingLinkInput.trim()) { el.value = ''; } el.select(); setTimeout(() => { if (!pendingLinkInput.trim()) { el.value = ''; } }, 250)"
+                       name="pending_douyin_links" autocomplete="douyin-link" spellcheck="false"
                        placeholder="https://www.douyin.com/video/... 或 https://www.douyin.com/user/...（可一次粘贴多条）"
-                       class="flex-1 min-w-0 h-9 px-3 text-xs rounded-lg border border-douyin-gray-200 focus:border-douyin-red focus:outline-none bg-white">
+                       class="pending-link-input flex-1 min-w-0 h-9 px-3 text-xs rounded-lg border border-douyin-gray-200 focus:border-douyin-red focus:outline-none bg-white">
                 <button @click="addPendingLinks()" :disabled="pendingLinkBusy || !pendingLinkInput.trim()"
                         class="flex-shrink-0 h-9 px-4 text-xs rounded-lg bg-douyin-gray-800 hover:bg-douyin-dark text-white transition-smooth disabled:opacity-40">
                     添加
@@ -707,8 +709,10 @@
                         <p class="text-xs text-douyin-gray-400 mb-2">粘贴链接（单个视频 / UP 主页自动识别），当前批量任务结束后自动依次执行，不打断正在运行的任务。支持一次粘贴多条（换行/逗号分隔）。</p>
                         <div class="flex gap-2">
                             <input x-model="pendingLinkInput" @keydown.enter="addPendingLinks()"
+                                   @focus="const el = $event.target; if (!pendingLinkInput.trim()) { el.value = ''; } el.select(); setTimeout(() => { if (!pendingLinkInput.trim()) { el.value = ''; } }, 250)"
+                                   name="pending_douyin_links" autocomplete="douyin-link" spellcheck="false"
                                    placeholder="https://www.douyin.com/video/... 或 https://www.douyin.com/user/..."
-                                   class="flex-1 min-w-0 h-9 px-3 text-xs rounded-lg border border-douyin-gray-200 focus:border-douyin-red focus:outline-none bg-white">
+                                   class="pending-link-input flex-1 min-w-0 h-9 px-3 text-xs rounded-lg border border-douyin-gray-200 focus:border-douyin-red focus:outline-none bg-white">
                             <button @click="addPendingLinks()" :disabled="pendingLinkBusy || !pendingLinkInput.trim()"
                                     class="flex-shrink-0 h-9 px-3.5 text-xs rounded-lg bg-douyin-gray-800 hover:bg-douyin-dark text-white transition-smooth disabled:opacity-40">
                                 添加
