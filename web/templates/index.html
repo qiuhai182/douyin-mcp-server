@@ -569,29 +569,20 @@
                             获取信息
                         </button>
                         <button
-                            @click="extractText"
+                            @click="smartExtract"
                             :disabled="!url || !apiKeyConfigured"
                             class="flex-1 h-11 bg-gradient-douyin hover:opacity-90 text-white font-medium text-sm rounded-xl transition-smooth disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 shadow-lg shadow-douyin-red/20">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
                             </svg>
-                            <span x-text="queuedVideoPending() ? '提前解析' : (canJumpQueue() ? '插队解析' : ((batchActive || loading) ? '排队解析' : '提取文案'))"></span>
+                            <span x-text="queuedVideoPending() ? '提前解析' : (canJumpQueue() ? '插队解析' : ((batchActive || loading) ? '排队解析' : (isProfileLink() ? '批量提取文案' : '提取文案')))"></span>
                         </button>
                     </div>
                     <p x-show="queuedNotice" x-transition class="mt-2 text-xs text-green-600" x-text="queuedNotice"></p>
 
-                    <!-- Batch Extract Button (author profile links) -->
+                    <!-- Batch options (author profile links auto-routed by smartExtract) -->
                     <div class="mt-3">
-                        <button
-                            @click="batchExtract"
-                            :disabled="!url || !apiKeyConfigured"
-                            class="w-full h-11 border-2 border-douyin-red/30 hover:border-douyin-red hover:bg-red-50 text-douyin-red font-medium text-sm rounded-xl transition-smooth disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2">
-                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/>
-                            </svg>
-                            <span x-text="(backendBusy || loading) ? '排队解析' : '提取文案'"></span>
-                        </button>
-                        <label class="mt-2 flex items-center gap-2 text-xs text-douyin-gray-500 cursor-pointer select-none">
+                        <label class="flex items-center gap-2 text-xs text-douyin-gray-500 cursor-pointer select-none">
                             <input type="checkbox" x-model="batchUseCache" class="accent-douyin-red w-3.5 h-3.5">
                             <span>使用缓存视频列表补齐（不重新滚动主页，只重试上次失败的视频）</span>
                         </label>
@@ -2252,6 +2243,23 @@
                     const qi = this.queuedExtractItem();
                     // 空闲 或 批量已暂停（worker 空闲）时才可插队；批量运行中仍走排队
                     return (qi && qi.kind === 'video' && (!this.batchActive || this.batchPaused)) ? qi : null;
+                },
+                // 主输入框内容是否为 UP 主页链接（sec_uid 或 /user/ 且不带 modal_id）
+                isProfileLink() {
+                    const text = (this.url || '').trim();
+                    if (!text) return false;
+                    const urls = text.match(/https?:\/\/[^\s,,;，；"']+/g) || [];
+                    return urls.some(u => /MS4wLjAB/.test(u)
+                        || (/douyin\.com\/user\//.test(u) && !/modal_id=\d+/.test(u)));
+                },
+                // 合并入口：主页链接 → 批量；单个视频 → 单条提取
+                async smartExtract() {
+                    if (!this.url || !this.url.trim()) return;
+                    if (this.isProfileLink()) {
+                        await this.batchExtract();
+                    } else {
+                        await this.extractText();
+                    }
                 },
                 // 批量已暂停时，主输入的新链接（单个视频、不在队列中）可插队立即解析
                 canJumpQueue() {
