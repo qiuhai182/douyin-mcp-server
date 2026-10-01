@@ -1517,6 +1517,25 @@ async def profile_history():
     return {"count": counts["ok"], "ok": counts["ok"], "fail": counts["fail"]}
 
 
+@app.get("/api/history/failed")
+async def history_failed():
+    """List of videos whose extraction failed (history.json fail entries)."""
+    from batch_extractor import TranscriptHistory
+    h = TranscriptHistory()
+    items = []
+    for aweme_id, entry in h._data.items():
+        if entry.get("status", "ok") != "fail":
+            continue
+        items.append({
+            "aweme_id": aweme_id,
+            "title": entry.get("title", ""),
+            "error": entry.get("error", ""),
+            "extracted_at": entry.get("extracted_at", ""),
+        })
+    items.sort(key=lambda x: x["extracted_at"], reverse=True)
+    return {"items": items, "count": len(items)}
+
+
 @app.get("/api/authors")
 async def authors_list():
     """Known UPs (batch-extracted before): name, profile URL, counts."""
@@ -1672,8 +1691,18 @@ def _extract_single_video(url: str, api_key: str, provider: str = None,
         safe_author = re.sub(r'[\\/:*?"<>|]', '_', author).strip() or "未知作者"
         author_dir = (Path(__file__).resolve().parent.parent
                       / "output" / safe_author)
-        save_transcript(author_dir, video_info["video_id"],
-                        video_info["title"], author, text)
+        md_path = save_transcript(author_dir, video_info["video_id"],
+                                  video_info["title"], author, text)
+        # A previously failed batch video retried successfully here: flip its
+        # history ledger entry fail -> ok so the next batch won't redo it.
+        try:
+            from batch_extractor import TranscriptHistory
+            h = TranscriptHistory()
+            entry = h._data.get(video_info["video_id"])
+            if entry and entry.get("status") == "fail":
+                h.add(video_info["video_id"], video_info["title"], str(md_path))
+        except Exception:
+            pass  # ledger update is best-effort
     except Exception as e:
         log_operation("video.extract.save_md_failed",
                       video_id=video_info["video_id"],
