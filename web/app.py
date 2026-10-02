@@ -368,9 +368,10 @@ def _batch_finish() -> None:
 
 # ---------------------------------------------------------------------------
 # 刷新日志: every finished run (manual batch, queued UP refresh, queued single
-# video) writes its OWN standalone log file under output/刷新日志/, so each
-# incremental refresh leaves a permanent self-contained record: trigger,
-# timing, stats and a per-video detail table. output/ is git-ignored.
+# video) appends a COMPACT section to ONE monthly file under output/刷新日志/
+# (刷新日志_YYYYMM.md), so the directory stays tiny and readable: trigger,
+# timing, one stats line, failures, and a detail table limited to 新增/失败
+# (skipped videos are noise and only counted). output/ is git-ignored.
 # ---------------------------------------------------------------------------
 REFRESH_LOG_DIR = ROOT / "output" / "刷新日志"
 _run_ctx: dict = {}
@@ -475,7 +476,8 @@ def _sanitize_log_name(name: str) -> str:
 
 
 def _write_refresh_log() -> None:
-    """Dump the current job's event history into its own log file.
+    """Append the current job's outcome as one compact section to the MONTHLY
+    log file output/刷新日志/刷新日志_YYYYMM.md.
 
     Runs in the worker thread right before the job is declared over, while
     _batch_job["history"] still holds this run's events (the next
@@ -497,62 +499,50 @@ def _write_refresh_log() -> None:
         secs = max(0, int(time.time() - float(ctx.get("t0") or 0)))
         dur = f"{secs // 60}分{secs % 60:02d}秒" if secs >= 60 else f"{secs}秒"
         author = (done.get("author") or _batch_job["label"] or "").strip()
+        n_ok = done.get("ok", sum(1 for e in extracts if e.get("status") == "ok"))
+        n_skip = done.get("skip", sum(1 for e in extracts if e.get("status") == "skip"))
+        n_fail = done.get("fail", sum(1 for e in extracts if e.get("status") == "fail"))
+        resumed = done.get("resumed", 0)
 
+        # Header: time · author · trigger · duration, then ONE stats line.
         lines = [
-            f"# 刷新日志：{_sanitize_log_name(author)}",
-            "",
-            f"- 开始时间：{ctx.get('started', '')}",
-            f"- 结束时间：{time.strftime('%Y-%m-%d %H:%M:%S')}（耗时 {dur}）",
-            f"- 触发方式：{ctx.get('trigger') or '手动批量'}",
+            f"## {ctx.get('started', '')} · {_sanitize_log_name(author)} · "
+            f"{ctx.get('trigger') or '手动批量'} · {dur}",
+            f"新增 {n_ok}（续传 {resumed}）｜跳过 {n_skip}｜失败 {n_fail}",
         ]
-        if ctx.get("url"):
-            lines.append(f"- 链接：{ctx['url']}")
-        if ctx.get("params"):
-            lines.append(f"- 参数：{ctx['params']}")
         if ctx.get("note"):
-            lines.append(f"- 备注：{ctx['note']}")
-        lines += [
-            "",
-            "## 结果统计",
-            "",
-            f"- 新增：{done.get('ok', sum(1 for e in extracts if e.get('status') == 'ok'))}"
-            f"（其中断点续传 {done.get('resumed', 0)}）",
-            f"- 跳过（已有文案）：{done.get('skip', sum(1 for e in extracts if e.get('status') == 'skip'))}",
-            f"- 失败：{done.get('fail', sum(1 for e in extracts if e.get('status') == 'fail'))}",
-        ]
-        if done.get("output_dir"):
-            lines.append(f"- 输出目录：{done['output_dir']}")
-        if errors:
-            lines += ["", "## 运行错误", ""]
-            for e in errors:
-                lines.append(f"- {str(e.get('error', '')).replace('|', chr(92) + '|')}")
-        if extracts:
+            lines.append(f"备注：{ctx['note']}")
+        # Failures & run errors, if any.
+        for e in extracts:
+            if e.get("status") == "fail":
+                title = str(e.get("title", "")).replace("\n", " ")[:80]
+                lines.append(f"- 失败：{title or e.get('aweme_id', '')} — {e.get('error', '')}")
+        for e in errors:
+            lines.append(f"- 错误：{str(e.get('error', ''))[:200]}")
+        # Detail table limited to 新增/失败 (skips are counted above only).
+        interesting = [e for e in extracts if e.get("status") != "skip"]
+        if interesting:
             lines += [
                 "",
-                "## 视频明细",
-                "",
-                "| # | 标题 | 视频ID | 状态 | 备注 |",
-                "|---|------|--------|------|------|",
+                "| 标题 | 状态 | 备注 |",
+                "|------|------|------|",
             ]
-            for e in extracts:
-                status = {"ok": "新增", "skip": "跳过",
-                          "fail": "失败"}.get(e.get("status"), str(e.get("status", "")))
+            for e in interesting:
+                status = {"ok": "新增", "fail": "失败"}.get(e.get("status"), str(e.get("status", "")))
                 if e.get("resumed"):
                     status += "（续传）"
                 remark = e.get("error") or e.get("output") or ""
                 title = str(e.get("title", "")).replace("|", "\\|").replace("\n", " ")
                 lines.append(
-                    f"| {e.get('index', '')} | {title} | {e.get('aweme_id', '')} "
-                    f"| {status} | {str(remark).replace('|', chr(92) + '|')} |")
+                    f"| {title} | {status} | {str(remark).replace('|', chr(92) + '|')} |")
 
         REFRESH_LOG_DIR.mkdir(parents=True, exist_ok=True)
-        base = f"{time.strftime('%Y%m%d_%H%M%S')}_{_sanitize_log_name(author)}"
-        path = REFRESH_LOG_DIR / f"{base}.md"
-        n = 2
-        while path.exists():
-            path = REFRESH_LOG_DIR / f"{base}-{n}.md"
-            n += 1
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        month_file = REFRESH_LOG_DIR / f"刷新日志_{time.strftime('%Y%m')}.md"
+        if not month_file.exists():
+            month_file.write_text(
+                f"# 抖音文案刷新日志 · {time.strftime('%Y年%m月')}\n", encoding="utf-8")
+        with open(month_file, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n\n")
     except Exception:
         pass
 

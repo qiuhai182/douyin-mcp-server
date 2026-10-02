@@ -4,8 +4,8 @@ rem 也可直接在 WebUI（http://localhost:8080）点「一键刷新全部」�
 rem
 rem - WebUI/托盘保持运行，driver 与 WebUI 通过心跳文件互斥，前端能看到
 rem   实时进度、可以随时终止。
-rem - 日志：output\刷新日志\driver_live.log
-rem - 汇总：output\刷新日志\YYYYMMDD_HHMMSS_全UP刷新_汇总.log
+rem - 日志：logs\driver_live.log
+rem - 汇总：追加到 output\刷新日志\刷新日志_YYYYMM.md
 rem
 rem 可选参数：
 rem   run_all_refresh.bat             默认 workers=3, force=false

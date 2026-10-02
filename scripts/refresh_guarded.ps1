@@ -49,7 +49,8 @@ $pyw      = Join-Utf8 $root ".venv\Scripts\pythonw.exe"
 $driver   = Join-Utf8 $root "scripts\refresh_all.py"
 # "刷新日志" built from char codes: PS5 without BOM would mangle literal Chinese
 $refreshDirName = [string]([char]0x5237 + [char]0x65B0 + [char]0x65E5 + [char]0x5FD7)
-$liveLog  = Join-Utf8 (Join-Utf8 $root "output") ($refreshDirName + "\driver_live.log")
+# Live log now lives in logs\ (refresh_all.py writes there) - keep path ASCII
+$liveLog  = Join-Utf8 $root "logs\driver_live.log"
 
 $forceFlag  = if ($Force) { "force" } else { "" }
 $actionArgs = "`"$pyw`" `"$driver`" $Workers $forceFlag"

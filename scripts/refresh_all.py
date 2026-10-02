@@ -28,7 +28,10 @@ ROOT = Path(__file__).resolve().parent.parent
 OUTPUT = ROOT / "output"
 LOG_DIR = OUTPUT / "刷新日志"
 LOG_DIR.mkdir(exist_ok=True)
-LIVE_LOG = LOG_DIR / "driver_live.log"
+# Live runtime log goes to logs/ (not 刷新日志/) so the refresh-log directory
+# keeps only the clean per-run summaries.
+LIVE_LOG = ROOT / "logs" / "driver_live.log"
+LIVE_LOG.parent.mkdir(exist_ok=True)
 # Heartbeat state file: the WebUI polls it to detect a running backend
 # script task, show its progress and offer a terminate button. Atomic
 # writes (tmp + replace) so a concurrent read never sees partial JSON.
@@ -232,23 +235,27 @@ def main():
 
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         tag = "已终止" if aborted else "全UP刷新"
-        report_path = LOG_DIR / f"{stamp}_{tag}_汇总.log"
-        report = {
-            "started_at": datetime.fromtimestamp(t_start).strftime("%Y-%m-%d %H:%M:%S"),
-            "finished_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "duration_s": total_s,
-            "workers": workers,
-            "force": force,
-            "aborted": aborted,
-            "total_ok": ok_total,
-            "total_skip": skip_total,
-            "total_fail": fail_total,
-            "total_resumed": resumed_total,
-            "authors": summaries,
-        }
-        report_path.write_text(
-            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-        log(f"汇总已保存: {report_path}")
+        # Append one compact section to the MONTHLY refresh log instead of
+        # dropping another standalone file into the directory.
+        month_file = LOG_DIR / ("刷新日志_" + stamp[:6] + ".md")
+        if not month_file.exists():
+            month_file.write_text(
+                "# 抖音文案刷新日志 · %s年%s月\n" % (stamp[:4], stamp[4:6]),
+                encoding="utf-8")
+        dur = "%d分%02d秒" % (total_s // 60, total_s % 60) if total_s >= 60 else "%d秒" % total_s
+        lines = [
+            "## %s · %s · %s · %s" % (
+                datetime.fromtimestamp(t_start).strftime("%Y-%m-%d %H:%M:%S"),
+                "全部UP", tag, dur),
+            "新增 %d（续传 %d）｜跳过 %d｜失败 %d" % (
+                ok_total, resumed_total, skip_total, fail_total),
+        ]
+        for s in summaries:
+            if s.get("error"):
+                lines.append("- 失败：%s — %s" % (s.get("author", ""), str(s["error"])[:150]))
+        with open(month_file, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n\n")
+        log(f"汇总已追加: {month_file}")
     finally:
         write_state(stage="finished" if not aborted else "aborted",
                     finished_at=now())
