@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Browser-based fallback for single-video info parsing.
@@ -6,21 +5,114 @@ Browser-based fallback for single-video info parsing.
 Douyin risk-controls the plain-HTTP share page (videoInfoRes replaced by an
 empty shell). Opening the desktop video page in a real browser and capturing
 the aweme/detail XHR works reliably, so we use it as a fallback channel.
+
+Two channels, tried in order:
+  1. The PERSISTENT profile (profile_fetcher: .douyin_profile + saved
+     cookies) - the same channel the batch pipeline uses. Logged-in traffic
+     survives douyin risk control; the anonymous headless browser does not.
+  2. A fresh anonymous headless context (legacy behaviour, no cookies).
 """
 
 import re
 from typing import Optional
 
 
-def fetch_video_info_via_browser(video_id: str, timeout_ms: int = 60000) -> dict:
-    """Get {url, title, author, video_id} for one video via headless browser.
+def _capture_from_page(page, video_id: str, wait_ms: int) -> dict:
+    """Drive one page to douyin.com/video/<id> and capture the detail XHR.
 
-    Returns the same dict shape as DouyinProcessor.parse_share_url.
-    Raises RuntimeError if nothing could be captured.
+    Returns the info dict, or {} when nothing usable was captured.
+    """
+    found = {}
+
+    def _on_response(resp):
+        try:
+            u = resp.url
+            if "aweme/detail" not in u and "aweme/post" not in u:
+                return
+            if resp.status != 200:
+                return
+            data = resp.json()
+        except Exception:
+            return
+
+        details = []
+        detail = data.get("aweme_detail")
+        if detail:
+            details.append(detail)
+        inner = (data.get("data") or {})
+        if isinstance(inner, dict):
+            if inner.get("aweme_detail"):
+                details.append(inner["aweme_detail"])
+            for item in inner.get("aweme_list") or []:
+                details.append(item)
+        for item in data.get("aweme_list") or []:
+            details.append(item)
+        for item in data.get("item_list") or []:
+            details.append(item)
+
+        for detail in details:
+            if not isinstance(detail, dict):
+                continue
+            aweme_id = str(detail.get("aweme_id") or "")
+            if not aweme_id:
+                continue
+            play = (detail.get("video") or {}).get("play_addr") or {}
+            url_list = play.get("url_list") or []
+            entry = {
+                "url": url_list[0] if url_list else "",
+                "title": (detail.get("desc") or "").strip(),
+                "author": ((detail.get("author") or {}).get("nickname") or "").strip(),
+            }
+            if aweme_id == str(video_id):
+                found[aweme_id] = entry
+            else:
+                found.setdefault(aweme_id, entry)
+
+    page.on("response", _on_response)
+    page.goto(
+        f"https://www.douyin.com/video/{video_id}",
+        wait_until="domcontentloaded",
+        timeout=wait_ms,
+    )
+    page.wait_for_timeout(8000)
+
+    info = found.get(str(video_id))
+    if info and info.get("url"):
+        return {"url": info["url"], "title": info["title"],
+                "author": info.get("author", ""), "video_id": str(video_id)}
+    return {}
+
+
+def _via_persistent_profile(video_id: str, timeout_ms: int) -> dict:
+    """Capture via the batch pipeline's persistent profile (cookies included).
+
+    Uses profile_fetcher's lock/teardown conventions: never context.close()
+    (it hangs) - kill the browser, then release the profile lock.
     """
     from playwright.sync_api import sync_playwright
+    from profile_fetcher import (
+        _open_persistent, _kill_profile_browsers, _release_profile_lock,
+        _save_cookies,
+    )
 
-    found = {}
+    with sync_playwright() as p:
+        context = _open_persistent(p, headless=True)
+        try:
+            page = context.new_page()
+            return _capture_from_page(page, video_id, timeout_ms)
+        finally:
+            try:
+                _save_cookies(context)
+            finally:
+                try:
+                    _kill_profile_browsers()
+                finally:
+                    _release_profile_lock()
+
+
+def _via_fresh_context(video_id: str, timeout_ms: int) -> dict:
+    """Legacy channel: anonymous headless Edge/Chrome, no cookies."""
+    from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
         browser = None
@@ -43,69 +135,36 @@ def fetch_video_info_via_browser(video_id: str, timeout_ms: int = 60000) -> dict
                 locale="zh-CN",
             )
             page = context.new_page()
-
-            def _on_response(resp):
-                try:
-                    u = resp.url
-                    if "aweme/detail" not in u and "aweme/post" not in u:
-                        return
-                    if resp.status != 200:
-                        return
-                    data = resp.json()
-                except Exception:
-                    return
-
-                details = []
-                detail = data.get("aweme_detail")
-                if detail:
-                    details.append(detail)
-                inner = (data.get("data") or {})
-                if isinstance(inner, dict):
-                    if inner.get("aweme_detail"):
-                        details.append(inner["aweme_detail"])
-                    for item in inner.get("aweme_list") or []:
-                        details.append(item)
-                for item in data.get("aweme_list") or []:
-                    details.append(item)
-                for item in data.get("item_list") or []:
-                    details.append(item)
-
-                for detail in details:
-                    if not isinstance(detail, dict):
-                        continue
-                    aweme_id = str(detail.get("aweme_id") or "")
-                    if not aweme_id:
-                        continue
-                    play = (detail.get("video") or {}).get("play_addr") or {}
-                    url_list = play.get("url_list") or []
-                    entry = {
-                        "url": url_list[0] if url_list else "",
-                        "title": (detail.get("desc") or "").strip(),
-                        "author": ((detail.get("author") or {}).get("nickname") or "").strip(),
-                    }
-                    if aweme_id == str(video_id):
-                        found[aweme_id] = entry
-                    else:
-                        found.setdefault(aweme_id, entry)
-
-            page.on("response", _on_response)
-            page.goto(
-                f"https://www.douyin.com/video/{video_id}",
-                wait_until="domcontentloaded",
-                timeout=timeout_ms,
-            )
-            page.wait_for_timeout(8000)
+            return _capture_from_page(page, video_id, timeout_ms)
         finally:
             browser.close()
 
-    if str(video_id) in found:
-        info = found[str(video_id)]
-        if info.get("url"):
-            return {"url": info["url"], "title": info["title"],
-                    "author": info.get("author", ""), "video_id": str(video_id)}
 
-    # detail XHR may not fire if page loaded from cache; try slug from URL state
+def fetch_video_info_via_browser(video_id: str, timeout_ms: int = 60000) -> dict:
+    """Get {url, title, author, video_id} for one video via headless browser.
+
+    Returns the same dict shape as DouyinProcessor.parse_share_url.
+    Raises RuntimeError if nothing could be captured.
+    """
+    errors = []
+    try:
+        info = _via_persistent_profile(video_id, timeout_ms)
+        if info:
+            return info
+        errors.append("persistent profile: no detail captured")
+    except Exception as e:
+        errors.append(f"persistent profile: {str(e)[:200]}")
+
+    try:
+        info = _via_fresh_context(video_id, timeout_ms)
+        if info:
+            return info
+        errors.append("anonymous context: no detail captured")
+    except Exception as e:
+        errors.append(f"anonymous context: {str(e)[:200]}")
+
     raise RuntimeError(
         f"Browser fallback could not capture video detail for {video_id}. "
-        "The page may require login or the video may be private/removed."
+        "The page may require login or the video may be private/removed. "
+        + " | ".join(errors)
     )
