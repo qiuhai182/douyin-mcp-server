@@ -75,6 +75,10 @@ def write_state(**fields):
                 except Exception:
                     pass
             data.update(fields)
+            # Always stamp OUR pid last: merging the old file must never
+            # resurrect a dead pid, otherwise WebUI's liveness check fails
+            # and progress/mutex break while the driver is actually running.
+            data["pid"] = os.getpid()
             data["updated_at"] = now()
             tmp = STATE_FILE.with_suffix(".tmp")
             tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2),
