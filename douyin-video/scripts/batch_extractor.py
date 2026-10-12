@@ -134,6 +134,22 @@ class TranscriptHistory:
         }
         self._flush()
 
+    def mark_skip(self, aweme_id: str, title: str = "", note: str = ""):
+        """Record a non-video entry (image post) as permanently skipped:
+        not a failure, and never retried by later runs."""
+        self._data[aweme_id] = {
+            "title": title,
+            "extracted_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "output": "",
+            "status": "skip",
+            "error": (note or "")[:300],
+        }
+        self._flush()
+
+    def status_of(self, aweme_id: str) -> str:
+        entry = self._data.get(aweme_id)
+        return (entry or {}).get("status", "")
+
     def _flush(self):
         self.path.write_text(
             json.dumps(self._data, ensure_ascii=False, indent=2),
@@ -144,13 +160,16 @@ class TranscriptHistory:
         return len(self._data)
 
     def counts(self) -> dict:
-        ok = fail = 0
+        ok = fail = skip = 0
         for entry in self._data.values():
-            if entry.get("status", "ok") == "ok":
+            status = entry.get("status", "ok")
+            if status == "ok":
                 ok += 1
+            elif status == "skip":
+                skip += 1  # non-video entries are ignored, never failures
             else:
                 fail += 1
-        return {"ok": ok, "fail": fail}
+        return {"ok": ok, "fail": fail, "skip": skip}
 
 
 class ProfileCache:
@@ -536,7 +555,7 @@ def batch_extract(
     Returns summary dict.
     """
     # Import here to avoid circular import at module load
-    from douyin_downloader import DouyinProcessor
+    from douyin_downloader import DouyinProcessor, NonVideoContent
     from asr_backends import resolve_backend
 
     # Each batch starts unpaused and uncancelled (a previous run may have
@@ -545,6 +564,14 @@ def batch_extract(
     cancel_flag.clear()
 
     def _report(payload: dict):
+        # Attach the resolved nickname so every per-video result can be
+        # attributed to its UP (WebUI progress + 执行日志 /api/logs/videos).
+        if payload.get("stage") == "extract" and not payload.get("author"):
+            try:
+                payload["author"] = (profile.get("nickname")
+                                     or profile.get("sec_uid") or "")
+            except Exception:
+                pass
         # Persist every progress/feedback event to the runtime operation log
         try:
             from operation_logger import log_operation
@@ -622,7 +649,7 @@ def batch_extract(
     # Shared mutable state guarded by one lock (counters, history file,
     # library file appends).
     state_lock = threading.Lock()
-    counters = {"ok": 0, "fail": 0, "resumed": 0}
+    counters = {"ok": 0, "fail": 0, "resumed": 0, "skip": 0}
 
     # Library index (video_id -> record), loaded once, for resume lookups.
     from transcript_library import read_records as _lib_read_records
@@ -659,6 +686,15 @@ def batch_extract(
             _report({"stage": "extract", "index": i + 1, "total": total,
                      "aweme_id": aweme_id, "title": title,
                      "status": "skip", "output": ""})
+            continue
+        # Non-video entries (image posts) recorded as skip are ignored for
+        # good - re-parsing them would fail the same way every run.
+        if not hist_ok and history.status_of(aweme_id) == "skip":
+            skip += 1
+            _report({"stage": "extract", "index": i + 1, "total": total,
+                     "aweme_id": aweme_id, "title": title,
+                     "status": "skip", "output": "",
+                     "error": "非视频内容，已忽略"})
             continue
         if hist_ok:
             pending.append((i, aweme_id, title))
@@ -791,6 +827,18 @@ def batch_extract(
                      "status": "ok", "output": str(transcript_path)})
         except BatchCancelled:
             raise  # never record a user-cancelled video as failed
+        except NonVideoContent as e:
+            # Image/text post (or removed video): no spoken audio exists.
+            # Ignore it - count as skip, never as a retriable failure.
+            with state_lock:
+                counters["skip"] += 1
+                try:
+                    history.mark_skip(aweme_id, title, str(e))
+                except Exception:
+                    pass
+            _report({"stage": "extract", "index": index + 1, "total": total,
+                     "aweme_id": aweme_id, "title": title,
+                     "status": "skip", "output": "", "error": str(e)[:300]})
         except Exception as e:
             with state_lock:
                 counters["fail"] += 1
@@ -825,6 +873,7 @@ def batch_extract(
 
     ok += counters["ok"]
     fail += counters["fail"]
+    skip += counters["skip"]
     # Refresh the per-author catalog (filename <-> title/desc index)
     if not cancelled:
         try:

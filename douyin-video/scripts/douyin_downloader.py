@@ -75,6 +75,30 @@ HEADERS = {
     'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) EdgiOS/121.0.2277.107 Version/17.0 Mobile/15E148 Safari/604.1'
 }
 
+# Douyin serves this static placeholder audio for image/text posts (and
+# occasionally for removed videos): the play URL points at
+# "...images_no_sound_volume_audio_file.mp3", so every download yields the
+# same tiny mp3 file (60863 bytes) and used to surface as a cryptic
+# "downloaded file too small" error. Detect it up-front instead.
+_PLACEHOLDER_URL_MARK = "no_sound_volume_audio_file"
+
+
+class NonVideoContent(ValueError):
+    """Share link points at an image/text post (or removed video): Douyin
+    only serves a placeholder audio, there is no spoken audio to transcribe.
+
+    Callers treat this as "ignore/skip", not as a retriable failure."""
+
+
+def _check_video_usable(info: dict) -> None:
+    """Raise NonVideoContent when the play URL is a placeholder (image post
+    or removed video) - there is no spoken audio to transcribe."""
+    url = (info.get("url") or "").lower()
+    if _PLACEHOLDER_URL_MARK in url or url.endswith(".mp3"):
+        raise NonVideoContent(
+            "该链接是图集/图文帖（或源视频已失效），抖音只提供占位音频、"
+            "没有视频口播，无法提取文案")
+
 
 class DouyinProcessor:
     """Douyin video processor"""
@@ -176,6 +200,7 @@ class DouyinProcessor:
         # Replace illegal characters in filename
         desc = re.sub(r'[\\/:*?"<>|]', '_', video_info["title"])
         video_info["title"] = desc
+        _check_video_usable(video_info)
         return video_info
 
     def download_video(self, video_info: dict, output_dir: Optional[Path] = None, show_progress: bool = True) -> Path:
@@ -188,6 +213,10 @@ class DouyinProcessor:
 
         filename = f"{video_info['video_id']}.mp4"
         filepath = output_dir / filename
+
+        # Defense in depth: callers that bypass parse_share_url (e.g. a
+        # browser-captured play URL) may still hand us the placeholder.
+        _check_video_usable(video_info)
 
         if show_progress:
             print(f"Downloading video: {video_info['title']}")
@@ -234,10 +263,27 @@ class DouyinProcessor:
                             downloaded += len(chunk)
                             if show_progress and total_size > 0:
                                 pass  # quiet in batch
-                # quick sanity: file should be > 100KB for a real video
-                if filepath.exists() and filepath.stat().st_size > 100_000:
-                    return filepath
-                last_err = RuntimeError(f"downloaded file too small ({filepath.stat().st_size} bytes)")
+                # quick sanity: a real video should be > 100KB and its file
+                # header must look like media - this catches the static mp3
+                # placeholder (ID3 header) and html/json error pages early.
+                if filepath.exists():
+                    size = filepath.stat().st_size
+                    with open(filepath, 'rb') as fh:
+                        head = fh.read(16)
+                    if head[:3] == b'ID3':
+                        last_err = RuntimeError(
+                            "downloaded an audio placeholder (mp3) - "
+                            "likely an image post without video")
+                    elif head[:1] in (b'<', b'{'):
+                        last_err = RuntimeError(
+                            "downloaded an error page instead of a video")
+                    elif size > 100_000:
+                        return filepath
+                    else:
+                        last_err = RuntimeError(
+                            f"downloaded file too small ({size} bytes)")
+                else:
+                    last_err = RuntimeError("download produced no file")
             except (requests.exceptions.RequestException, RuntimeError) as e:
                 last_err = e
                 if show_progress:

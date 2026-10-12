@@ -46,6 +46,8 @@ _LIVE_F = open(LIVE_LOG, "a", encoding="utf-8", buffering=1)
 # 让 douyin-video/scripts 下的模块能被 import
 sys.path.insert(0, str(ROOT / "douyin-video" / "scripts"))
 
+from operation_logger import log_video_result  # noqa: E402  (path set above)
+
 
 def now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -130,6 +132,8 @@ def main():
     from batch_extractor import batch_extract, rename_transcripts_numbered
 
     # 每个 UP 的进度回调
+    _cur = {"author": ""}  # loop sets it; on_progress logs per-video results
+
     def on_progress(evt):
         stage = evt.get("stage", "")
         if stage == "list":
@@ -146,11 +150,20 @@ def main():
                                     "total": tot, "status": status,
                                     "aweme_id": aweme_id,
                                     "title": (evt.get("title") or "")[:60]})
+            # 执行日志：哪个 UP 的哪个视频 成功/跳过/失败（WebUI 倒序展示）
+            log_video_result(status=status,
+                             author=evt.get("author") or _cur["author"],
+                             video_id=aweme_id, title=evt.get("title") or "",
+                             trigger="全UP刷新",
+                             error=evt.get("error") or "",
+                             output=evt.get("output") or "")
             # throttle: only print every 5th or on status change
             if status != "skip" or idx == 1 or idx == tot or (isinstance(idx, int) and idx % 5 == 0):
                 log(f"    [{idx}/{tot}] {marker} {status}  {aweme_id}  {title}")
         elif stage == "error":
             log(f"    ERROR: {evt.get('error', '')[:300]}")
+            log_video_result("error", author=_cur["author"],
+                             trigger="全UP刷新", error=evt.get("error", ""))
         elif stage == "done":
             pass  # handled after the call returns
 
@@ -173,6 +186,7 @@ def main():
 
             write_state(author_index=i, current_author=name, current_url=url,
                         author_total=len(names))
+            _cur["author"] = name
             log(f"[{i}/{len(names)}] ▶ {name}  workers={workers} force={force}")
             t0 = time.time()
             try:

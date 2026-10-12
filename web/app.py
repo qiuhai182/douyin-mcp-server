@@ -69,7 +69,10 @@ from asr_backends import (
     resolve_backend, transcribe_audio_file, PROVIDERS,
     load_config_file, save_config_file,
 )
-from operation_logger import log_operation, read_logs, log_file_path
+from operation_logger import (
+    log_operation, read_logs, log_file_path,
+    log_video_result, read_video_logs, read_runtime_logs,
+)
 
 HEADERS_UA = HEADERS['User-Agent']
 
@@ -80,8 +83,11 @@ templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
 @app.middleware("http")
 async def log_http_requests(request: Request, call_next):
     """Persist every HTTP request (method, path, status, duration) to the
-    runtime operation log."""
+    runtime operation log. Log-view polling is skipped so the log never
+    grows from watching itself."""
     start = time.time()
+    if request.url.path.startswith("/api/logs"):
+        return await call_next(request)
     try:
         response = await call_next(request)
         log_operation(
@@ -354,6 +360,18 @@ def _batch_publish(event: dict) -> None:
     event["epoch"] = _batch_epoch
     history = _batch_job["history"]
     history.append(event)
+    # 视频级结果写入执行日志（/api/logs/videos 按执行时间倒序展示）
+    if event.get("stage") in ("extract", "error"):
+        log_video_result(
+            status=event.get("status")
+                   or ("error" if event.get("stage") == "error" else "ok"),
+            author=str(event.get("author") or _batch_job.get("label") or ""),
+            video_id=str(event.get("aweme_id") or ""),
+            title=str(event.get("title") or ""),
+            trigger=str((_run_ctx or {}).get("trigger") or ""),
+            error=str(event.get("error") or ""),
+            output=str(event.get("output") or ""),
+        )
     if len(history) > _BATCH_HISTORY_MAX:
         del history[: len(history) - _BATCH_HISTORY_MAX]
     for sub in list(_batch_job["subs"]):
@@ -768,7 +786,7 @@ def _pending_clear_finished() -> int:
     with _pending_lock:
         data = _load_pending()
         before = len(data["items"])
-        data["items"] = [it for it in data["items"] if it["status"] not in ("done", "fail")]
+        data["items"] = [it for it in data["items"] if it["status"] not in ("done", "fail", "skip")]
         removed = before - len(data["items"])
         if removed:
             _save_pending(data)
@@ -909,11 +927,18 @@ def _pending_run_item(item: dict) -> None:
         trigger="待解析队列", url=item.get("url", ""),
         note="类型：UP 主页" if item["kind"] == "up" else "类型：单个视频"))
     _batch_publish({"stage": "queue", "kind": item["kind"], "url": item["url"]})
+    from douyin_downloader import NonVideoContent
     try:
         if item["kind"] == "up":
             _pending_run_up(item)
         else:
             _pending_run_video(item)
+    except NonVideoContent as e:
+        # Image/text post: ignore it instead of marking the link as failed.
+        _pending_mark(item["id"], "skip", result=f"非视频已忽略：{e}")
+        _batch_publish({"stage": "extract", "index": 1, "total": 1,
+                        "title": item.get("title") or item.get("url", ""),
+                        "status": "skip", "error": str(e)[:300]})
     except Exception as e:
         _pending_mark(item["id"], "fail", result=str(e))
         _batch_publish({"stage": "error", "error": str(e)[:400]})
@@ -975,6 +1000,7 @@ def _pending_run_video(item: dict) -> None:
     video_info, _text = _extract_single_video(item["url"], api_key)
     _batch_publish({"stage": "extract", "index": 1, "total": 1,
                     "aweme_id": video_info["video_id"], "title": video_info["title"],
+                    "author": video_info.get("author") or "",
                     "status": "ok"})
     _pending_mark(item["id"], "done", result=video_info.get("title", ""))
     _batch_publish({"stage": "done", "ok": 1, "skip": 0, "fail": 0,
@@ -1066,6 +1092,7 @@ async def pending_links_extract_now(item_id: int):
             _pending_mark(item_id, "fail", result="未配置 API Key")
             return ExtractResponse(success=False, error="请先配置 API Key")
 
+        from douyin_downloader import NonVideoContent
         try:
             video_info, text = await asyncio.to_thread(
                 _extract_single_video, item["url"], api_key)
@@ -1079,6 +1106,12 @@ async def pending_links_extract_now(item_id: int):
                 text=text,
                 download_url=video_info["url"]
             )
+        except NonVideoContent as e:
+            # Image/text post: ignore instead of marking the link as failed.
+            _pending_mark(item_id, "skip", result=f"非视频已忽略：{e}")
+            log_operation("queue.extract_now", url=item["url"], ok=False,
+                          status="skip", error=str(e))
+            return ExtractResponse(success=False, error=str(e))
         except Exception as e:
             _pending_mark(item_id, "fail", result=str(e))
             log_operation("queue.extract_now", url=item["url"], ok=False, error=str(e))
@@ -1725,12 +1758,17 @@ async def extract_transcript(req: VideoRequest):
     try:
         # Resolve backend (provider/model from request or config/env), then
         # run download -> extract audio -> transcribe in a worker thread.
+        from douyin_downloader import NonVideoContent
         video_info, text = await asyncio.to_thread(
             _extract_single_video, req.url, api_key,
             req.provider or None, req.model or None)
         log_operation("video.extract", video_id=video_info["video_id"],
                       title=video_info["title"], text_length=len(text),
                       download_url=video_info["url"])
+        log_video_result("ok", author=video_info.get("author") or "",
+                         video_id=video_info["video_id"],
+                         title=video_info.get("title") or "",
+                         trigger="单个提取")
         return ExtractResponse(
             success=True,
             video_id=video_info["video_id"],
@@ -1738,8 +1776,14 @@ async def extract_transcript(req: VideoRequest):
             text=text,
             download_url=video_info["url"]
         )
+    except NonVideoContent as e:
+        # Image/text post: report as ignored (skip), not a failure.
+        log_operation("video.extract", status="skip", url=req.url, error=str(e))
+        log_video_result("skip", trigger="单个提取", url=req.url, error=str(e))
+        return ExtractResponse(success=False, error=str(e))
     except Exception as e:
         log_operation("video.extract", status="error", url=req.url, error=str(e))
+        log_video_result("error", trigger="单个提取", url=req.url, error=str(e))
         return ExtractResponse(success=False, error=str(e))
     finally:
         _release_extract_slot()
@@ -1756,6 +1800,31 @@ async def get_operation_logs(limit: int = 200, action: str = "", status: str = "
         "file": str(log_file_path()),
         "logs": read_logs(limit=limit, action=action or None, status=status or None),
     }
+
+
+@app.get("/api/logs/videos")
+async def get_video_execution_logs(limit: int = 500, status: str = "",
+                                   author: str = ""):
+    """视频执行日志：哪个 UP 的哪个视频 成功/跳过/失败，按执行时间倒序。
+
+    Optional filters: status (ok/skip/fail/error), author (substring).
+    """
+    items = read_video_logs(limit=limit, status=status, author=author)
+    return {"count": len(items), "logs": items}
+
+
+@app.get("/api/logs/runtime")
+async def get_runtime_logs(limit: int = 200, before: str = "",
+                           status: str = ""):
+    """统一日志流：driver 实时输出 + WebUI 操作 + 每视频执行结果，最新在前。
+
+    before="YYYY-MM-DD HH:MM:SS" 为「加载更早历史」的时间锚点，
+    只返回严格早于该时间的条目。status 可按状态筛选（ok/skip/fail/error…）。
+    http.request 噪音已被剔除。
+    """
+    return await asyncio.to_thread(
+        read_runtime_logs, limit=max(1, min(limit, 1000)),
+        before=before or "", status=status or "")
 
 
 def _content_disposition(filename: str) -> str:
