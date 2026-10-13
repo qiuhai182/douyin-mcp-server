@@ -224,14 +224,16 @@ def _parse_runtime_video_line(line: str) -> Optional[dict]:
 
 
 def _scan_runtime_file(path: Path, parse_fn, before: str,
-                       need: int) -> tuple:
+                       need: int, status: str = "") -> tuple:
     """Read one log file from its END and return (entries, exhausted).
 
     entries: parsed records older than `before` (ts anchor), newest first,
     capped at `need` (0 = unlimited). The scan starts with the last 512KB
     and widens x4 (up to 32MB) so「加载更多」reaches deep history cheaply.
-    exhausted=True means the beginning of the file has been reached (or the
-    scan cap hit) - no older bytes remain.
+    `status` filters entries INSIDE the scan so a requested status is
+    collected from deep history even when recent pages are dominated by
+    other statuses. exhausted=True means the beginning of the file has been
+    reached (or the scan cap hit) - no older bytes remain.
     """
     try:
         if not path.exists():
@@ -250,6 +252,8 @@ def _scan_runtime_file(path: Path, parse_fn, before: str,
                 blob = blob[nl + 1:]
             lines = blob.decode("utf-8", errors="replace").splitlines()
             entries = [e for line in lines if (e := parse_fn(line.strip()))]
+            if status:
+                entries = [e for e in entries if e.get("status") == status]
             if before:
                 entries = [e for e in entries if e["ts"] < before]
             entries.reverse()  # append order is chronological -> newest first
@@ -273,14 +277,12 @@ def read_runtime_logs(limit: int = 200, before: str = "",
     whether an even older「加载更多」page may exist.
     """
     web, web_done = _scan_runtime_file(
-        LOG_FILE, _parse_runtime_web_line, before, limit)
+        LOG_FILE, _parse_runtime_web_line, before, limit, status)
     drv, drv_done = _scan_runtime_file(
-        DRIVER_LOG_FILE, _parse_runtime_driver_line, before, limit)
+        DRIVER_LOG_FILE, _parse_runtime_driver_line, before, limit, status)
     vid, vid_done = _scan_runtime_file(
-        VIDEO_LOG_FILE, _parse_runtime_video_line, before, limit)
+        VIDEO_LOG_FILE, _parse_runtime_video_line, before, limit, status)
     merged = sorted(web + drv + vid, key=lambda e: e["ts"], reverse=True)
-    if status:
-        merged = [e for e in merged if e.get("status") == status]
     page = merged[:limit] if limit > 0 else merged
     has_more = len(merged) > len(page) or not (web_done and drv_done
                                                and vid_done)

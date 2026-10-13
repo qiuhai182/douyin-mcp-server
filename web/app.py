@@ -361,7 +361,11 @@ def _batch_publish(event: dict) -> None:
     history = _batch_job["history"]
     history.append(event)
     # 视频级结果写入执行日志（/api/logs/videos 按执行时间倒序展示）
-    if event.get("stage") in ("extract", "error"):
+    # Pre-filter skips (already-ok / known non-video, never actually
+    # re-parsed this run) stay on the progress stream but do not pollute
+    # the per-video result log - one full refresh used to write thousands
+    # of skip rows that buried the real successful extractions.
+    if event.get("stage") in ("extract", "error") and not event.get("prefilter"):
         log_video_result(
             status=event.get("status")
                    or ("error" if event.get("stage") == "error" else "ok"),

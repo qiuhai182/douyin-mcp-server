@@ -685,7 +685,7 @@ def batch_extract(
             skip += 1
             _report({"stage": "extract", "index": i + 1, "total": total,
                      "aweme_id": aweme_id, "title": title,
-                     "status": "skip", "output": ""})
+                     "status": "skip", "output": "", "prefilter": True})
             continue
         # Non-video entries (image posts) recorded as skip are ignored for
         # good - re-parsing them would fail the same way every run.
@@ -694,7 +694,7 @@ def batch_extract(
             _report({"stage": "extract", "index": i + 1, "total": total,
                      "aweme_id": aweme_id, "title": title,
                      "status": "skip", "output": "",
-                     "error": "非视频内容，已忽略"})
+                     "error": "非视频内容，已忽略", "prefilter": True})
             continue
         if hist_ok:
             pending.append((i, aweme_id, title))
