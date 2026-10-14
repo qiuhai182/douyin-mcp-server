@@ -866,7 +866,7 @@
                             </button>
                             <span x-show="batchDetached" class="text-xs text-amber-600">任务仍在后台运行，点「继续」接上</span>
                             <span x-show="batchRunning && batchPaused" class="text-xs text-amber-600">已暂停（当前视频完成后生效）</span>
-                            <button x-show="!batchRunning && !batchDetached && batchLogs.length" @click="batchLogs = []; batchTotal = 0; batchDone = 0; _resetRunStats()"
+                            <button x-show="!batchRunning && !batchDetached && batchLogs.length" @click="clearProgress()"
                                     class="text-xs text-douyin-gray-400 hover:text-douyin-gray-600">清空</button>
                         </div>
                         </div>
@@ -1326,6 +1326,7 @@
                 runSkipped: 0,             // 本轮跳过的条数（之前已提取过）
                 runFail: 0,                // 本轮失败的条数
                 runFinished: false,        // 本轮任务已结束（用于展示汇总条）
+                queueRemaining: 0,        // 后端待解析队列：当前 item 之后还剩几项（收尾判定用）
                 batchUseCache: false,
                 authors: [],
                 authorToRemove: null,      // 待确认移除的作者（弹窗确认用）
@@ -1551,7 +1552,29 @@
                         this.runSkipped = task.run_skipped || 0;
                         this.runFail = task.run_fail || 0;
                         this.runFinished = false;
+                        // 服务重启后后端内存清零：把文件里的累计灌回权威值，
+                        // 否则 6s 对账会把显示拉回 0
+                        if (typeof st.run_ok === 'number'
+                            && !st.run_ok && !st.run_skip && !st.run_fail) {
+                            this._seedRunStats(this.runNew, this.runSkipped, this.runFail);
+                        }
+                    } else if (typeof st.run_ok === 'number') {
+                        // 后端待解析队列模式：直接采用服务端权威累计，刷新页面不清零
+                        this.runNew = st.run_ok;
+                        this.runSkipped = st.run_skip;
+                        this.runFail = st.run_fail;
+                        this.runFinished = false;
                     }
+                },
+
+                _seedRunStats(ok, skip, fail) {
+                    // 把「继续上次刷新任务」恢复的累计灌进后端权威值（进程重启后
+                    // _run_stats 归零，不灌回的话 6s 对账会把显示拉回 0）
+                    fetch('/api/profile/run-stats/seed', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ ok, skip, fail })
+                    }).catch(() => {});
                 },
 
                 _saveQueueState() {
@@ -1659,6 +1682,8 @@
                     this.runSkipped = task.run_skipped || 0;
                     this.runFail = task.run_fail || 0;
                     this.runFinished = false;
+                    // 灌回后端权威值（服务重启后内存清零，否则 6s 对账会拉回 0）
+                    this._seedRunStats(this.runNew, this.runSkipped, this.runFail);
                     this.authorQueueDone = (task.done || []).slice();
                     this.authorQueue = pending
                         .map(n => this.authors.find(a => a.name === n))
@@ -1735,7 +1760,7 @@
                     this.addBatchLog('已停止逐个刷新；剩余 UP 可用「继续上次刷新任务」恢复', 'warn');
                 },
 
-                continueAuthorQueue() {
+                async continueAuthorQueue() {
                     // Called from batchExtract() finally: chain to next UP
                     if (this.authorQueueRunning && this.authorQueue.length) {
                         this._startBatchAuthor(this.authorQueue.shift());
@@ -1746,9 +1771,27 @@
                         }
                         this.authorQueueRunning = false;
                         this.authorQueueCurrent = '';
+                        this._saveQueueState();
+                        // 收尾前确认「队列确实没有下一个」：后端待解析队列 runner
+                        // 可能已/即将自动开始下一项，此时不结束本轮、不清累计。
+                        if (await this._queueHasNext()) return;
                         this._finishRunStats();
+                        return;
                     }
                     this._saveQueueState();
+                },
+
+                async _queueHasNext() {
+                    // 队列 item 开始时后端发布了剩余排队数：>0 表示这个 item
+                    // 结束后还有下一个，此时不收尾、不清累计（跨任务持续显示）。
+                    // 用这个确定性信号而非轮询 batch_running，避免 runner 刚好
+                    // 启动下一项时的竞态误判。
+                    if (this.queueRemaining > 0) {
+                        this.queueRemaining--; // 已消费一个，供下一次判定
+                        this.addBatchLog('—— 队列继续中，进度继续累计 ——', 'warn');
+                        return true;
+                    }
+                    return false;
                 },
 
                 _resetRunStats() {
@@ -1757,6 +1800,15 @@
                     this.runSkipped = 0;
                     this.runFail = 0;
                     this.runFinished = false;
+                },
+
+                clearProgress() {
+                    // 「清空」：前端清显示 + 后端清权威累计，避免 6s 对账把旧值同步回来
+                    this.batchLogs = [];
+                    this.batchTotal = 0;
+                    this.batchDone = 0;
+                    this._resetRunStats();
+                    fetch('/api/profile/run-stats/reset', { method: 'POST' }).catch(() => {});
                 },
 
                 _finishRunStats() {
@@ -2133,6 +2185,13 @@
                             const st = await this._fetchServiceStatus();
                             if (!st) return;
                             this.driverTask = st.driver_running ? (st.driver || {}) : null;
+                            // 用后端权威累计对账显示（断流/漏事件时纠偏；
+                            // 赋值而非累加，SSE 事件同样采用权威值，二者不冲突）
+                            if (typeof st.run_ok === 'number' && !this.runFinished) {
+                                this.runNew = st.run_ok;
+                                this.runSkipped = st.run_skip;
+                                this.runFail = st.run_fail;
+                            }
                             if (st.batch_running && !this.batchActive && !this.authorQueueRunning) {
                                 this.batchDetached = true;
                                 this.resumeBatch();
@@ -2378,7 +2437,8 @@
                                 url: this.url,
                                 provider: this.activeProvider,
                                 author: this.authorQueueCurrent || '',
-                                use_cache: this.batchUseCache
+                                use_cache: this.batchUseCache,
+                                chain: this.authorQueueRunning
                             })
                         });
 
@@ -2471,6 +2531,10 @@
                             // seq from 0. Without this reset every event of the
                             // new job would be filtered as "already applied" and
                             // the panel would freeze on the previous job's state.
+                            // NOTE: the run counters (runNew/runSkipped/runFail)
+                            // deliberately survive the switch - one queue run
+                            // spans many jobs and stays visible throughout. They
+                            // only reset when a NEW run is triggered.
                             if (typeof evt.epoch === 'number' && evt.epoch !== this.batchEpoch) {
                                 this.batchEpoch = evt.epoch;
                                 this.batchLastSeq = 0;
@@ -2478,7 +2542,7 @@
                                 this.batchTotal = 0;
                                 this.runFinished = false;
                                 this.backgroundLabel = '';
-                                this.addBatchLog('—— 下一个任务开始 ——', 'warn');
+                                this.addBatchLog('—— 切换任务：本轮进度继续累计 ——', 'warn');
                             }
                             // A reattach replays events this page already applied;
                             // seq restarts per job, so skipping by seq is safe.
@@ -2534,20 +2598,23 @@
                         }
                         if (evt.status === 'ok') {
                             this.batchDone++;
-                            this.runNew++;
                             this.addBatchLog(`[OK] ${evt.aweme_id} ${evt.title || ''}`, 'ok');
                         } else if (evt.status === 'skip') {
                             this.batchDone++;
-                            this.runSkipped++;
                             this.addBatchLog(`[跳过] ${evt.aweme_id} ${evt.title || ''}（已提取过）`, 'skip');
                         } else if (evt.status === 'fail') {
                             this.batchDone++;
-                            this.runFail++;
                             this.addBatchLog(`[失败] ${evt.aweme_id} ${evt.title || ''} - ${evt.error || ''}`, 'error');
                         }
+                        // 后端在每个结果事件上附带本轮累计（run_ok/run_skip/run_fail）：
+                        // 直接采用权威值，断流重放/重连不会重复计数
+                        if (typeof evt.run_ok === 'number') this.runNew = evt.run_ok;
+                        if (typeof evt.run_skip === 'number') this.runSkipped = evt.run_skip;
+                        if (typeof evt.run_fail === 'number') this.runFail = evt.run_fail;
                     } else if (stage === 'notice') {
                         this.addBatchLog(evt.message || '', 'warn');
                     } else if (stage === 'queue') {
+                        this.queueRemaining = typeof evt.remaining === 'number' ? evt.remaining : 0;
                         this.addBatchLog(evt.kind === 'up'
                             ? '—— 队列任务：开始解析 UP 主页 ——'
                             : '—— 队列任务：开始解析单个视频 ——', 'warn');

@@ -58,8 +58,9 @@ HISTORY_FILE = Path(__file__).resolve().parent.parent.parent / "history.json"
 PROFILE_CACHE_FILE = Path(__file__).resolve().parent.parent.parent / "profile_cache.json"
 
 # Ledger of newly materialized transcripts (one line per new md file, across
-# all authors), so the user can see at a glance what each run added.
-NEW_RECORDS_FILE = HISTORY_FILE.parent / "output" / "_新增记录.md"
+# all authors). Lives under 刷新日志/ to keep the output root tidy; the
+# curated increment overview with historical stats is output/_增量总览.md.
+NEW_RECORDS_FILE = HISTORY_FILE.parent / "output" / "刷新日志" / "新增记录.md"
 _new_records_lock = threading.Lock()
 
 

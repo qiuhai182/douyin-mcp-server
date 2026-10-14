@@ -309,10 +309,35 @@ class BatchRequest(BaseModel):
     save_video: bool = False
     use_cache: bool = False  # reuse cached video list (retry failed only)
     workers: int = 3  # concurrent videos
+    chain: bool = False  # True = chained refresh-queue item (keep the run's
+                         # accumulated 新增/跳过/失败 totals); False = a NEW run,
+                         # which restarts those totals from zero
 
 
 # Global batch job state (one job at a time keeps things simple)
 _batch_state = {"running": False}
+
+# Per-run accumulated video stats (新增/跳过/失败) across task switches. The
+# UI shows these to keep the whole queue run visible; the backend is the
+# authoritative source (exposed via /api/service/status) so a page reload or
+# a dropped SSE stream never loses the totals. Reset ONLY when a NEW run is
+# triggered: a manual batch (chain=False), a fresh queue-runner loop.
+_run_stats = {"ok": 0, "skip": 0, "fail": 0}
+
+
+def _reset_run_stats() -> None:
+    """Start-of-run reset for the cross-task run totals (see _run_stats)."""
+    _run_stats["ok"] = 0
+    _run_stats["skip"] = 0
+    _run_stats["fail"] = 0
+
+
+# Set by a finishing manual batch that hands straight off to queued links
+# (the lock is released and pending items exist). The queue runner then keeps
+# the run totals instead of resetting: from the user's view it is ONE
+# uninterrupted execution. Consumed by the runner's first claimed item.
+_queue_continues_manual = False
+
 
 # Live view of the running batch job. A page reload (or a closed and reopened
 # tab) drops the SSE stream while the worker thread keeps going, so without
@@ -376,6 +401,17 @@ def _batch_publish(event: dict) -> None:
             error=str(event.get("error") or ""),
             output=str(event.get("output") or ""),
         )
+    # Run totals count EVERY result (prefilter skips included), mirroring the
+    # WebUI's run counters so the two never drift. The totals ride along on
+    # each result event so a reattach replay or a reconnecting page just
+    # (re)adopts the authoritative numbers instead of double-counting.
+    if event.get("stage") == "extract":
+        _st = event.get("status")
+        if _st in ("ok", "skip", "fail"):
+            _run_stats[_st] += 1
+        event["run_ok"] = _run_stats["ok"]
+        event["run_skip"] = _run_stats["skip"]
+        event["run_fail"] = _run_stats["fail"]
     if len(history) > _BATCH_HISTORY_MAX:
         del history[: len(history) - _BATCH_HISTORY_MAX]
     for sub in list(_batch_job["subs"]):
@@ -874,9 +910,11 @@ def _pending_worker_loop() -> None:
     lock, so a queue item and a manual/refresh-all batch can never overlap on
     the browser profile. A manual batch always gets the lock first: this loop
     simply retries until the lock stays free."""
-    global _pending_timer, _pending_worker_alive, _queue_halt_requested
+    global _pending_timer, _pending_worker_alive, _queue_halt_requested, \
+        _queue_continues_manual
     _pending_timer = None
     _pending_worker_alive = True
+    first_item = True
     log_operation("queue.runner", status="start")
     try:
         while not (_restart_state["pending"] or _restart_state["restarting"]):
@@ -897,6 +935,14 @@ def _pending_worker_loop() -> None:
             if item is None:
                 _batch_state["running"] = False  # claim released, nothing to do
                 break
+            if first_item:
+                # The runner's first claimed item decides the run boundary: it
+                # continues a manual batch that just handed the lock over, or
+                # starts fresh totals for a standalone queue run.
+                if not _queue_continues_manual:
+                    _reset_run_stats()
+                _queue_continues_manual = False
+                first_item = False
             try:
                 _pending_run_item(item)
             except Exception as e:
@@ -930,7 +976,12 @@ def _pending_run_item(item: dict) -> None:
     _batch_new_job("待解析队列", _refresh_log_ctx(
         trigger="待解析队列", url=item.get("url", ""),
         note="类型：UP 主页" if item["kind"] == "up" else "类型：单个视频"))
-    _batch_publish({"stage": "queue", "kind": item["kind"], "url": item["url"]})
+    # remaining = items still queued behind this one: lets the WebUI tell
+    # "queue goes on" from "queue is done" when this item finishes, so it
+    # only closes the run when nothing follows (cross-task totals stay).
+    _batch_publish({"stage": "queue", "kind": item["kind"], "url": item["url"],
+                    "remaining": sum(1 for it in _pending_items()
+                                     if it["status"] == "pending")})
     from douyin_downloader import NonVideoContent
     try:
         if item["kind"] == "up":
@@ -1217,7 +1268,49 @@ async def service_status():
         "restart_pending": bool(_restart_state["pending"]),
         "driver_running": bool(driver),
         "driver": driver,
+        # Cross-task run totals (新增/跳过/失败): the WebUI seeds/reconciles
+        # its display from these so a reload never loses the numbers.
+        "run_ok": _run_stats["ok"],
+        "run_skip": _run_stats["skip"],
+        "run_fail": _run_stats["fail"],
     }
+
+
+@app.post("/api/profile/run-stats/reset")
+async def run_stats_reset():
+    """Clear the cross-task run totals (WebUI 「清空」button).
+
+    The UI's own counters are cleared client-side; this keeps the backend's
+    authoritative copy in sync so the 6s status poll does not restore the
+    old numbers a moment later. Refused while a job is running: its in-flight
+    results would keep adding onto a cleared base.
+    """
+    if _batch_state["running"]:
+        raise HTTPException(status_code=409, detail="任务运行中，结束后才能清空统计")
+    _reset_run_stats()
+    return {"status": "ok"}
+
+
+class RunStatsSeedRequest(BaseModel):
+    """Seed the cross-task run totals (continue-last-task after a restart)."""
+    ok: int = 0
+    skip: int = 0
+    fail: int = 0
+
+
+@app.post("/api/profile/run-stats/seed")
+async def run_stats_seed(req: RunStatsSeedRequest):
+    """Continue-last-task restores totals from the durable task file, but
+    _run_stats lives in process memory (zero after a restart). Seed the
+    backend with the restored values so the 6s reconciliation poll does not
+    drag the display back down to zero.
+    """
+    if _batch_state["running"]:
+        raise HTTPException(status_code=409, detail="任务运行中，不能改写统计")
+    _run_stats["ok"] = max(0, int(req.ok))
+    _run_stats["skip"] = max(0, int(req.skip))
+    _run_stats["fail"] = max(0, int(req.fail))
+    return {"status": "ok"}
 
 
 @app.post("/api/profile/batch/abort")
@@ -1334,6 +1427,10 @@ async def profile_batch(req: BatchRequest):
     # the page renderer and hangs the run forever.
     # Start a fresh job view: subscribing clients must never see the previous
     # job's events replayed as if they belonged to this one.
+    if not req.chain:
+        # New run (manual batch): cross-task totals restart. A chained
+        # refresh-queue item keeps them so the whole queue run stays visible.
+        _reset_run_stats()
     _batch_new_job(req.author or "", _refresh_log_ctx(
         trigger="手动批量", url=req.url,
         params=f"max_videos={req.max_videos}, force={req.force}, "
@@ -1378,6 +1475,12 @@ async def profile_batch(req: BatchRequest):
             _write_refresh_log()  # needs history before any next job clears it
             _batch_state["running"] = False
             _batch_finish()
+            # If queued links take over immediately this is ONE uninterrupted
+            # run from the user's view: tell the runner to keep the totals.
+            global _queue_continues_manual
+            _queue_continues_manual = (
+                not _queue_halt_requested
+                and any(it["status"] == "pending" for it in _pending_items()))
             _maybe_start_pending(delay=2.0)  # queued links take over next
             _restart_after_batch()
 
