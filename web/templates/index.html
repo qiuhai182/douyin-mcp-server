@@ -2422,7 +2422,10 @@
                     // 已提取过的视频由 TranscriptHistory 自动跳过，无重复工作。
                     const it = this.interruptedBatch;
                     if (!it || !it.url) return;
-                    if (this.batchRunning || this.batchDetached || this.driverTask) return;
+                    if (this.batchRunning || this.batchDetached || this.driverTask) {
+                        this.showToast('当前有任务在运行，完成后再点「一键续跑」');
+                        return;
+                    }
                     if (!this.apiKeyConfigured) {
                         this.showSettings = true;
                         return;
@@ -2432,7 +2435,8 @@
                     this.authorQueue = [];
                     this.authorQueueRunning = false;
                     this.batchUseCache = !!it.use_cache;
-                    this.interruptedBatch = null;
+                    // 横幅不在此处清除：由 6s 状态轮询按后端权威值管理。若提交
+                    // 被拒（如 409 已有任务在运行），横幅仍在，可直接再点一次。
                     this.addBatchLog('续跑上次未完成的批量任务（已提取内容自动跳过）', 'warn');
                     await this.batchExtract();
                 },
@@ -2499,6 +2503,9 @@
                             throw new Error(err.detail || '批量任务启动失败');
                         }
 
+                        // 列表采集期（打开浏览器+滚动主页）没有逐条事件，
+                        // 先给一条明确提示，避免误以为提交没有生效。
+                        this.addBatchLog('已提交：正在打开主页并采集视频列表（视频多时需 1-3 分钟，期间无逐条提示属正常）...', 'warn');
                         ended = await this._consumeBatchStream(res);
                     } catch (e) {
                         this.addBatchLog('批量任务失败: ' + (e.message || e), 'error');
@@ -2647,7 +2654,8 @@
                             return;
                         }
                         const n = evt.found || 0;
-                        this.addBatchLog(`已发现 ${n} 个视频...`);
+                        // 每次滚动都发一条会刷屏（400+ 条），每 25 条提示一次
+                        if (n === 1 || n % 25 === 0) this.addBatchLog(`已发现 ${n} 个视频...`);
                     } else if (stage === 'extract') {
                         if (evt.index === 1 && evt.total) {
                             this.batchTotal = evt.total;
