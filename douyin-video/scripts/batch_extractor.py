@@ -526,6 +526,7 @@ def batch_extract(
     retry_failed: bool = True,
     workers: int = 3,
     on_progress: Optional[Callable[[dict], None]] = None,
+    start_paused: bool = False,
 ) -> dict:
     """Extract transcripts for every (new) video of an author profile.
 
@@ -559,10 +560,21 @@ def batch_extract(
     from douyin_downloader import DouyinProcessor, NonVideoContent
     from asr_backends import resolve_backend
 
-    # Each batch starts unpaused and uncancelled (a previous run may have
-    # left either flag in a blocking state)
-    run_gate.set()
+    # Each batch starts uncancelled; pause state depends on `start_paused`:
+    # auto-started follow-up work (queue advance, chained refresh, restart
+    # restore) passes True so a user pause is sticky - nothing processes
+    # until an explicit resume.
     cancel_flag.clear()
+    if start_paused:
+        run_gate.clear()
+    else:
+        run_gate.set()
+
+    # Dynamic concurrency gate: starts at `workers` and can be lowered live
+    # (set_dynamic_concurrency, driven by app.py's CPU monitor). Lowering is
+    # lossless - in-flight videos finish, queued ones just start later.
+    global _dyn_gate
+    _dyn_gate = _DynamicGate(max(1, int(workers or 1)))
 
     def _report(payload: dict):
         # Attach the resolved nickname so every per-video result can be
@@ -776,6 +788,9 @@ def batch_extract(
             model=backend_cfg['model'],
             api_base_url=backend_cfg['api_base_url'] or "",
         )
+        # Dynamic concurrency: may wait here when the monitor lowered the
+        # live limit; cancel is re-checked inside _paced_start right after.
+        _dyn_gate_acquire()
         _paced_start()
         try:
             share_url = f"https://www.iesdouyin.com/share/video/{aweme_id}"
@@ -850,6 +865,8 @@ def batch_extract(
             _report({"stage": "extract", "index": index + 1, "total": total,
                      "aweme_id": aweme_id, "title": title,
                      "status": "fail", "error": str(e)[:300]})
+        finally:
+            _dyn_gate_release()
 
     workers = max(1, int(workers or 1))
     cancelled = False
@@ -891,6 +908,7 @@ def batch_extract(
     if cancelled:
         summary["aborted"] = True
         _report({"stage": "aborted", "ok": ok, "skip": skip, "fail": fail})
+        _dyn_gate = None
         return summary
     # Persist author -> profile URL so the WebUI can re-run this author
     try:
@@ -900,4 +918,69 @@ def batch_extract(
     except Exception:
         pass
     _report({"stage": "done", **summary})
+    _dyn_gate = None
     return summary
+
+
+class _DynamicGate:
+    """Caps how many video pipelines run in parallel; the cap is changeable
+    live. acquire() blocks while `active >= limit`. Lowering the limit never
+    touches in-flight videos (lossless): they finish, only new starts wait.
+    Raise is capped at this run's configured workers (`_max`)."""
+
+    def __init__(self, limit: int):
+        self._cond = threading.Condition()
+        self._limit = max(1, int(limit))
+        self._max = self._limit
+        self._active = 0
+
+    def acquire(self) -> None:
+        with self._cond:
+            while self._active >= self._limit:
+                self._cond.wait(0.5)  # periodic wake: observe limit raises too
+            self._active += 1
+
+    def release(self) -> None:
+        with self._cond:
+            self._active = max(0, self._active - 1)
+            self._cond.notify_all()
+
+    def set_limit(self, n: int) -> None:
+        with self._cond:
+            self._limit = max(1, min(int(n), self._max))
+            self._cond.notify_all()
+
+    def state(self):
+        with self._cond:
+            return self._limit, self._max
+
+
+# The running batch's gate (one batch at a time via the global job lock;
+# None = idle). Left stale if a run dies on an exception - harmless, the
+# next run always overwrites it.
+_dyn_gate = None
+
+
+def _dyn_gate_acquire() -> None:
+    gate = _dyn_gate
+    if gate is not None:
+        gate.acquire()
+
+
+def _dyn_gate_release() -> None:
+    gate = _dyn_gate
+    if gate is not None:
+        gate.release()
+
+
+def set_dynamic_concurrency(n: int) -> None:
+    """Live-adjust how many videos the running batch processes in parallel."""
+    gate = _dyn_gate
+    if gate is not None:
+        gate.set_limit(n)
+
+
+def dyn_concurrency_state():
+    """(current_limit, configured_max) of the running batch, or (None, 0)."""
+    gate = _dyn_gate
+    return gate.state() if gate is not None else (None, 0)

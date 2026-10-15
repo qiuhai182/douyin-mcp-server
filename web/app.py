@@ -668,13 +668,32 @@ def _restart_now(delay: float = 1.0) -> None:
     threading.Thread(target=_run, daemon=True).start()
 
 
+def _restart_when_settled(status: str) -> None:
+    """Latch `restarting` and fire the restart only once no batch is alive.
+
+    A point-in-time check is not enough: between the check and the exec a
+    queue advance or manual start can claim the lock, and a PAUSED batch
+    holds it indefinitely (it never "finishes" on its own). So poll until
+    the lock is truly free, however long that takes - a restart must never
+    kill a running or paused batch.
+    """
+    _restart_state["restarting"] = True
+
+    def _run():
+        while _batch_state["running"]:
+            time.sleep(2.0)
+        log_operation("service.restart", status=status)
+        _restart_now(delay=1.0)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def _restart_after_batch():
     """Run a restart that was deferred because a batch job was running."""
-    if _restart_state["pending"]:
-        _restart_state["pending"] = False
-        _restart_state["restarting"] = True
-        log_operation("service.restart", status="run_deferred")
-        _restart_now(delay=3.0)
+    if not _restart_state["pending"]:
+        return
+    _restart_state["pending"] = False
+    _restart_when_settled("run_deferred")
 
 
 # ------------------------------------------------------------------
@@ -951,7 +970,9 @@ def _pending_worker_loop() -> None:
             finally:
                 _write_refresh_log()  # one standalone log per queued run
                 _batch_state["running"] = False
-                _set_batch_pause_flag(False)  # item ended; don't pause the next one
+                # Pause flag intentionally NOT cleared here: 暂停就是暂停 -
+                # a user pause is sticky across queue items until they hit
+                # 「继续」(/resume) or start a new manual batch (which clears).
                 _batch_finish()
                 _restart_after_batch()
     finally:
@@ -1003,20 +1024,6 @@ def _pending_run_up(item: dict) -> None:
     api_key = _pending_api_key()
     if not api_key:
         raise RuntimeError("未配置 API Key")
-    from batch_extractor import batch_extract, run_gate
-    # Restore a pause that was active when the service stopped (e.g. the
-    # deferred hot-reload restart): start the batch paused instead of
-    # silently resuming. batch_extract re-sets run_gate on entry, so the
-    # clear is applied shortly after it starts (workers check the gate
-    # before every video, well past this point).
-    if _batch_pause_flag():
-        def _apply_restored_pause():
-            try:
-                if _batch_state["running"] and _batch_pause_flag():
-                    run_gate.clear()
-            except Exception:
-                pass
-        threading.Timer(2.0, _apply_restored_pause).start()
     from batch_extractor import batch_extract, BatchCancelled
     try:
         summary = batch_extract(
@@ -1030,6 +1037,9 @@ def _pending_run_up(item: dict) -> None:
             save_video=False,
             use_cache=False,
             workers=3,
+            # 暂停即卡控：队列自动接续的下一项若处于暂停态（含服务重启
+            # 恢复），以暂停态启动，点「继续」前不会拉取任何新视频。
+            start_paused=_batch_pause_flag(),
             on_progress=_batch_publish,
         )
         if summary.get("aborted"):
@@ -1240,8 +1250,74 @@ async def service_restart():
             status_code=202,
         )
     log_operation("service.restart", status="now")
-    _restart_now()
+    _restart_when_settled("exec_now")
     return {"status": "restarting"}
+
+
+# --- Dynamic concurrency -----------------------------------------------------
+# While a batch runs, a background monitor watches system CPU and throttles
+# the batch losslessly: >=85% -> one fewer concurrent video (in-flight ones
+# finish, queued ones just start later, floor of 1); <=60% -> one more, up to
+# the run's configured workers. CPU comes from kernel32.GetSystemTimes deltas
+# (psutil is not a dependency of this project).
+_dyn_monitor = {"cpu": None}
+_cpu_prev = {"idle": 0, "total": 0}
+
+
+def _cpu_percent():
+    """System-wide CPU percent since the previous call, or None (needs 2 samples)."""
+    try:
+        import ctypes
+        idle, kernel, user = (ctypes.c_ulonglong(), ctypes.c_ulonglong(),
+                              ctypes.c_ulonglong())
+        if not ctypes.windll.kernel32.GetSystemTimes(
+                ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)):
+            return None
+        total = kernel.value + user.value
+        last_idle, last_total = _cpu_prev["idle"], _cpu_prev["total"]
+        _cpu_prev["idle"], _cpu_prev["total"] = idle.value, total
+        if not last_total or total <= last_total:
+            return None
+        busy = (total - last_total) - (idle.value - last_idle)
+        return max(0.0, min(100.0, busy / (total - last_total) * 100.0))
+    except Exception:
+        return None
+
+
+def _dyn_workers_now():
+    try:
+        import batch_extractor
+        limit, _cap = batch_extractor.dyn_concurrency_state()
+        return limit
+    except Exception:
+        return None
+
+
+def _dyn_concurrency_monitor() -> None:
+    while True:
+        time.sleep(4)
+        try:
+            if not _batch_state["running"]:
+                _dyn_monitor["cpu"] = None
+                continue
+            cpu = _cpu_percent()
+            if cpu is None:
+                continue
+            _dyn_monitor["cpu"] = round(cpu, 1)
+            import batch_extractor
+            limit, cap = batch_extractor.dyn_concurrency_state()
+            if limit is None:
+                continue
+            if cpu >= 85 and limit > 1:
+                batch_extractor.set_dynamic_concurrency(limit - 1)
+            elif cpu <= 60 and limit < cap:
+                batch_extractor.set_dynamic_concurrency(limit + 1)
+        except Exception:
+            continue
+
+
+threading.Thread(target=_dyn_concurrency_monitor, daemon=True,
+                 name="dyn-concurrency").start()
 
 
 @app.get("/api/service/status")
@@ -1265,7 +1341,7 @@ async def service_status():
         "batch_running": running,
         "batch_paused": paused,
         "batch_label": _batch_job["label"] if running else "",
-        "restart_pending": bool(_restart_state["pending"]),
+        "restart_pending": bool(_restart_state["pending"] or _restart_state["restarting"]),
         "driver_running": bool(driver),
         "driver": driver,
         # Cross-task run totals (新增/跳过/失败): the WebUI seeds/reconciles
@@ -1273,6 +1349,9 @@ async def service_status():
         "run_ok": _run_stats["ok"],
         "run_skip": _run_stats["skip"],
         "run_fail": _run_stats["fail"],
+        # Dynamic concurrency: current parallel-video cap (auto CPU throttling)
+        "dyn_workers": _dyn_workers_now(),
+        "dyn_cpu": _dyn_monitor["cpu"],
     }
 
 
@@ -1339,8 +1418,9 @@ async def profile_batch_abort():
     if _batch_state["running"]:
         from batch_extractor import cancel_flag, run_gate
         _queue_halt_requested = True
-        _set_batch_pause_flag(False)
         run_gate.set()      # wake paused workers so they see the cancel
+        # NOTE: the pause flag is deliberately kept - a user pause outlives
+        # the aborted task, so auto-started follow-up work stays paused.
         cancel_flag.set()
         log_operation("batch.abort", status="requested")
         return {"status": "terminating", "target": "batch",
@@ -1406,7 +1486,13 @@ async def profile_batch(req: BatchRequest):
             status_code=409,
             detail="已有批量任务在运行（若界面看不到进度，可能是页面刷新后任务仍在后台继续，"
                    "请等它结束后再试）")
-    _set_batch_pause_flag(False)  # a manual batch always starts unpaused
+    if req.chain:
+        # Chained refresh-queue advance is not a new user execution: a sticky
+        # pause carries over (暂停就是暂停) and the next UP starts paused.
+        start_paused = _batch_pause_flag()
+    else:
+        _set_batch_pause_flag(False)  # a manual batch always starts unpaused
+        start_paused = False
 
     # Resolve key like the single-video endpoint does (config file / env)
     from asr_backends import load_config_file
@@ -1457,6 +1543,7 @@ async def profile_batch(req: BatchRequest):
                     save_video=req.save_video,
                     use_cache=req.use_cache,
                     workers=req.workers,
+                    start_paused=start_paused,
                     on_progress=_batch_publish,
                 )
                 if summary.get("aborted"):
@@ -1588,8 +1675,10 @@ async def profile_batch_resume():
     """
     global _resume_waiting
     from batch_extractor import run_gate
-    if run_gate.is_set():
+    if run_gate.is_set() and _batch_state["running"]:
         raise HTTPException(status_code=409, detail="Batch job is not paused")
+    # Idle but a sticky pause is set (e.g. pause -> abort with an empty
+    # queue): the resume click simply clears it so future auto-starts run.
     if _extract_busy:
         with _batch_claim_mutex:
             if not _resume_waiting:

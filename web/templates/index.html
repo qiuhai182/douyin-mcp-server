@@ -827,6 +827,9 @@
                                 <span x-show="(authorQueueCurrent || backgroundLabel) && (batchRunning || batchDetached)" class="text-douyin-red font-normal">
                                     · 正在解析「<span x-text="authorQueueCurrent || backgroundLabel"></span>」
                                 </span>
+                                <span x-show="batchRunning && batchPaused" class="text-amber-600 font-semibold">
+                                    · 已暂停<span class="font-normal">（在途视频收尾后不再拉新）</span>
+                                </span>
                                 <span x-show="runNew || runSkipped" class="text-green-600 font-normal"
                                       :title="'本轮任务新增 ' + runNew + ' 条，跳过 ' + runSkipped + ' 条，失败 ' + runFail + ' 条'">
                                     · 本轮新增 <span x-text="runNew"></span> 条<span x-show="runSkipped" class="text-douyin-gray-400">（跳过 <span x-text="runSkipped"></span>）</span>
@@ -2192,6 +2195,10 @@
                                 this.runSkipped = st.run_skip;
                                 this.runFail = st.run_fail;
                             }
+                            // 暂停状态同样以后端为准（页面刷新/重接流后不失忆）
+                            if (st.batch_running) {
+                                this.batchPaused = !!st.batch_paused;
+                            }
                             if (st.batch_running && !this.batchActive && !this.authorQueueRunning) {
                                 this.batchDetached = true;
                                 this.resumeBatch();
@@ -2408,15 +2415,19 @@
                     }
 
                     this.batchRunning = true;
-                    this.batchPaused = false;
                     this.batchLastSeq = 0;
                     if (this.authorQueueRunning) {
-                        // Refresh-all mode: keep earlier UPs' logs, mark a new section
+                        // Refresh-all mode: keep earlier UPs' logs, mark a new section.
+                        // 暂停态延续：后端会以暂停态接续下一个 UP（暂停就是暂停）
                         this.batchTotal = 0;
                         this.batchDone = 0;
                         const remaining = this.authorQueue.length;
                         this.addBatchLog(`—— 开始刷新「${this.authorQueueCurrent}」（该 UP 完成后还剩 ${remaining} 位）——`, 'warn');
+                        if (this.batchPaused) {
+                            this.addBatchLog('暂停状态延续到该任务：点「继续」后才会真正拉取', 'warn');
+                        }
                     } else {
+                        this.batchPaused = false;
                         this.batchLogs = [];
                         this.batchTotal = 0;
                         this.batchDone = 0;
@@ -2480,6 +2491,11 @@
                             this.batchDetached = false;
                             await this._finishBatchStep(false);
                             return;
+                        }
+                        // 任务还在：恢复真实的暂停状态（不能默认成运行中）
+                        this.batchPaused = !!st.batch_paused;
+                        if (this.batchPaused) {
+                            this.addBatchLog('当前任务处于暂停状态（点「继续」恢复）', 'warn');
                         }
                     } catch (e) { /* 状态查询失败：仍尝试连接流 */ }
 
