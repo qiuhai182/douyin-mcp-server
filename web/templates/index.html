@@ -830,6 +830,10 @@
                                 <span x-show="batchRunning && batchPaused" class="text-amber-600 font-semibold">
                                     · 已暂停<span class="font-normal">（在途视频收尾后不再拉新）</span>
                                 </span>
+                                <span x-show="batchRunning && restartPending" class="text-blue-600 font-semibold"
+                                      title="已请求重启服务：将在本轮批量结束后自动执行，不会打断任务">
+                                    · 重启已排队<span class="font-normal">（本轮批量结束后自动执行）</span>
+                                </span>
                                 <span x-show="runNew || runSkipped" class="text-green-600 font-normal"
                                       :title="'本轮任务新增 ' + runNew + ' 条，跳过 ' + runSkipped + ' 条，失败 ' + runFail + ' 条'">
                                     · 本轮新增 <span x-text="runNew"></span> 条<span x-show="runSkipped" class="text-douyin-gray-400">（跳过 <span x-text="runSkipped"></span>）</span>
@@ -876,6 +880,18 @@
                         <div x-show="runFinished" x-transition
                              class="mb-2 rounded-lg bg-green-50 border border-green-200 px-3 py-2 text-xs text-green-700">
                             本轮任务完成：共新增 <span class="font-semibold" x-text="runNew"></span> 条文案<span x-show="runSkipped">，跳过 <span x-text="runSkipped"></span> 条</span><span x-show="runFail">，失败 <span x-text="runFail"></span> 条</span>
+                        </div>
+                        <div x-show="interruptedBatch && !batchRunning && !batchDetached" x-transition
+                             class="mb-2 rounded-lg bg-amber-50 border border-amber-300 px-3 py-2 text-xs text-amber-800 flex items-center justify-between gap-3">
+                            <span class="min-w-0">
+                                检测到上次批量未完成<span x-show="interruptedBatch?.started_at">（<span x-text="interruptedBatch?.started_at"></span> 发起，服务中断导致丢失）</span>：已提取的内容会自动跳过，可一键续跑。
+                            </span>
+                            <span class="flex items-center gap-2 shrink-0">
+                                <button @click="resumeInterruptedBatch()"
+                                        class="px-2.5 py-1 rounded-lg bg-amber-600 text-white hover:bg-amber-700 font-semibold transition-smooth">一键续跑</button>
+                                <button @click="interruptedBatch = null" title="忽略本次提示"
+                                        class="text-amber-500 hover:text-amber-700 font-semibold">✕</button>
+                            </span>
                         </div>
                         <div class="max-h-56 overflow-y-auto font-mono text-xs space-y-1" id="batch-log">
                             <template x-for="(log, idx) in batchLogs" :key="idx">
@@ -1317,6 +1333,8 @@
                 batchRunning: false,
                 batchPaused: false,
                 batchDetached: false,      // a background job this page is not attached to
+                interruptedBatch: null,    // 上次未完成手动批量的恢复标记（服务中断遗留）
+                restartPending: false,     // 服务重启已排队（等批量结束自动执行）
                 backgroundLabel: '',       // UP name of that background job
                 batchLastSeq: 0,           // last stream event applied (per job)
                 batchEpoch: 0,             // server-side job generation (queue items / new batches bump it)
@@ -2199,6 +2217,9 @@
                             if (st.batch_running) {
                                 this.batchPaused = !!st.batch_paused;
                             }
+                            this.restartPending = !!st.restart_pending;
+                            // 服务中断遗留的未完成手动批量：一键续跑横幅
+                            this.interruptedBatch = st.batch_running ? null : (st.interrupted_batch || null);
                             if (st.batch_running && !this.batchActive && !this.authorQueueRunning) {
                                 this.batchDetached = true;
                                 this.resumeBatch();
@@ -2394,6 +2415,26 @@
                     } catch (e) {
                         this.showToast(e.message || '启动失败');
                     }
+                },
+
+                async resumeInterruptedBatch() {
+                    // 一键续跑上次因服务中断丢失的手动批量：沿用原参数重新发起，
+                    // 已提取过的视频由 TranscriptHistory 自动跳过，无重复工作。
+                    const it = this.interruptedBatch;
+                    if (!it || !it.url) return;
+                    if (this.batchRunning || this.batchDetached || this.driverTask) return;
+                    if (!this.apiKeyConfigured) {
+                        this.showSettings = true;
+                        return;
+                    }
+                    this.url = it.url;
+                    this.authorQueueCurrent = it.author || '';
+                    this.authorQueue = [];
+                    this.authorQueueRunning = false;
+                    this.batchUseCache = !!it.use_cache;
+                    this.interruptedBatch = null;
+                    this.addBatchLog('续跑上次未完成的批量任务（已提取内容自动跳过）', 'warn');
+                    await this.batchExtract();
                 },
 
                 async batchExtract() {

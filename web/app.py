@@ -1256,10 +1256,10 @@ async def service_restart():
 
 # --- Dynamic concurrency -----------------------------------------------------
 # While a batch runs, a background monitor watches system CPU and throttles
-# the batch losslessly: >=85% -> one fewer concurrent video (in-flight ones
-# finish, queued ones just start later, floor of 1); <=60% -> one more, up to
-# the run's configured workers. CPU comes from kernel32.GetSystemTimes deltas
-# (psutil is not a dependency of this project).
+# the batch losslessly: >90% -> at most ONE concurrent video (in-flight ones
+# finish, queued ones just start later); >=85% -> one fewer (floor of 1);
+# <=60% -> one more, up to the run's configured workers. CPU comes from
+# kernel32.GetSystemTimes deltas (psutil is not a dependency of this project).
 _dyn_monitor = {"cpu": None}
 _cpu_prev = {"idle": 0, "total": 0}
 
@@ -1308,7 +1308,11 @@ def _dyn_concurrency_monitor() -> None:
             limit, cap = batch_extractor.dyn_concurrency_state()
             if limit is None:
                 continue
-            if cpu >= 85 and limit > 1:
+            if cpu > 90 and limit > 1:
+                # Over 90% system CPU: keep at most ONE task. In-flight videos
+                # finish naturally, queued ones wait - nothing is lost.
+                batch_extractor.set_dynamic_concurrency(1)
+            elif cpu >= 85 and limit > 1:
                 batch_extractor.set_dynamic_concurrency(limit - 1)
             elif cpu <= 60 and limit < cap:
                 batch_extractor.set_dynamic_concurrency(limit + 1)
@@ -1337,7 +1341,7 @@ async def service_status():
         except Exception:
             paused = False
     driver = _driver_info()
-    return {
+    payload = {
         "batch_running": running,
         "batch_paused": paused,
         "batch_label": _batch_job["label"] if running else "",
@@ -1353,6 +1357,13 @@ async def service_status():
         "dyn_workers": _dyn_workers_now(),
         "dyn_cpu": _dyn_monitor["cpu"],
     }
+    if not running:
+        # A manual batch that died with the process (service killed, crash)
+        # leaves its intent marker behind: the UI shows a one-click resume.
+        intent = _read_batch_intent()
+        if intent:
+            payload["interrupted_batch"] = intent
+    return payload
 
 
 @app.post("/api/profile/run-stats/reset")
@@ -1468,6 +1479,49 @@ async def refresh_all_start(req: RefreshAllRequest):
             "notice": "全 UP 刷新已在后台启动（关闭浏览器不影响）；进度会显示在页面上"}
 
 
+# --- Interrupted-manual-batch recovery marker --------------------------------
+# A manual batch has no resume handle (refresh_task.json only covers the
+# front-end refresh-queue flow). If the process dies mid-run (service killed
+# externally, power loss) the batch used to vanish without a trace: no monthly
+# log section, stats zeroed on reboot, nothing to click. This marker records
+# the batch intent on start and is cleared in the worker's finally, so a
+# marker surviving a reboot means "the last manual batch never finished" and
+# the UI offers a one-click resume (already-extracted items auto-skip).
+BATCH_INTENT_FILE = Path(__file__).parent.parent / "batch_intent.json"
+
+
+def _write_batch_intent(req) -> None:
+    try:
+        data = {
+            "url": req.url, "author": req.author or "",
+            "provider": req.provider or "", "max_videos": req.max_videos,
+            "force": bool(req.force), "save_video": bool(req.save_video),
+            "use_cache": bool(req.use_cache), "workers": req.workers,
+            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        BATCH_INTENT_FILE.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _clear_batch_intent() -> None:
+    try:
+        BATCH_INTENT_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _read_batch_intent():
+    try:
+        data = json.loads(BATCH_INTENT_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and data.get("url"):
+            return data
+    except Exception:
+        pass
+    return None
+
+
 @app.post("/api/profile/batch")
 async def profile_batch(req: BatchRequest):
     """Batch extract author profile transcripts.
@@ -1522,6 +1576,10 @@ async def profile_batch(req: BatchRequest):
         params=f"max_videos={req.max_videos}, force={req.force}, "
                f"save_video={req.save_video}, use_cache={req.use_cache}, "
                f"workers={req.workers}"))
+    if not req.chain:
+        # Recovery marker: survives a mid-run process death so the UI can
+        # offer a one-click resume after reboot. Cleared in _worker finally.
+        _write_batch_intent(req)
 
     def _worker():
         try:
@@ -1559,6 +1617,7 @@ async def profile_batch(req: BatchRequest):
         finally:
             # Order matters: a late subscriber treats "not running" as "the job
             # is over", so the flag must be down before the streams are closed.
+            _clear_batch_intent()  # the run reached its end (ok/abort/error)
             _write_refresh_log()  # needs history before any next job clears it
             _batch_state["running"] = False
             _batch_finish()
