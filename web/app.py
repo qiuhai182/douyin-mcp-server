@@ -669,17 +669,27 @@ def _restart_now(delay: float = 1.0) -> None:
 
 
 def _restart_when_settled(status: str) -> None:
-    """Latch `restarting` and fire the restart only once no batch is alive.
+    """Latch `restarting`, wind the batch down gracefully, then restart.
 
-    A point-in-time check is not enough: between the check and the exec a
-    queue advance or manual start can claim the lock, and a PAUSED batch
-    holds it indefinitely (it never "finishes" on its own). So poll until
-    the lock is truly free, however long that takes - a restart must never
-    kill a running or paused batch.
+    "Settled" is NOT the whole batch drained: the latched flag first trips the
+    extractor's cancel boundary (in-flight videos finish, no new ones start,
+    a paused batch is woken so it can see the cancel) and it also stops the
+    pending-links runner from starting new items. The poll below then just
+    waits for the in-flight tail - typically a couple of minutes, not hours.
+    If the wind-down itself fails for any reason, the poll still falls back to
+    waiting for a natural batch end, so a restart never kills a running video.
     """
     _restart_state["restarting"] = True
 
     def _run():
+        if _batch_state["running"]:
+            try:
+                from batch_extractor import cancel_flag, run_gate
+                cancel_flag.set()  # no new videos after the in-flight ones
+                run_gate.set()     # wake a paused batch so it sees the cancel
+                log_operation("batch.winddown", reason="restart")
+            except Exception:
+                pass
         while _batch_state["running"]:
             time.sleep(2.0)
         log_operation("service.restart", status=status)
@@ -1239,12 +1249,14 @@ async def _resume_pending_queue():
 async def service_restart():
     """Reload the service with the latest code.
 
-    Returns 200 when the restart starts immediately, or 202 when a batch job
-    is running and the restart has been queued for when it finishes.
+    With a batch job running, the restart first winds it down gracefully:
+    in-flight videos finish, no new ones start, then the process reloads -
+    usually within minutes. The 202 shape is kept for clients that branch on
+    it, but the restart no longer waits for the whole batch to drain.
     """
     if _batch_state["running"]:
-        _restart_state["pending"] = True
-        log_operation("service.restart", status="deferred")
+        log_operation("service.restart", status="winddown")
+        _restart_when_settled("exec_winddown")
         return JSONResponse(
             {"status": "deferred", "restart_pending": True},
             status_code=202,
@@ -1617,7 +1629,10 @@ async def profile_batch(req: BatchRequest):
         finally:
             # Order matters: a late subscriber treats "not running" as "the job
             # is over", so the flag must be down before the streams are closed.
-            _clear_batch_intent()  # the run reached its end (ok/abort/error)
+            # A restart wind-down KEEPS the marker: after the reload the UI
+            # offers a one-click resume of the batch that got cut short.
+            if not _restart_state["restarting"]:
+                _clear_batch_intent()  # the run reached its end (ok/abort/error)
             _write_refresh_log()  # needs history before any next job clears it
             _batch_state["running"] = False
             _batch_finish()

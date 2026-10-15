@@ -831,8 +831,8 @@
                                     · 已暂停<span class="font-normal">（在途视频收尾后不再拉新）</span>
                                 </span>
                                 <span x-show="batchRunning && restartPending" class="text-blue-600 font-semibold"
-                                      title="已请求重启服务：将在本轮批量结束后自动执行，不会打断任务">
-                                    · 重启已排队<span class="font-normal">（本轮批量结束后自动执行）</span>
+                                      title="已请求重启服务：在途视频完成后不再拉新，随即自动重启">
+                                    · 重启已排队<span class="font-normal">（在途视频完成后自动重启）</span>
                                 </span>
                                 <span x-show="runNew || runSkipped" class="text-green-600 font-normal"
                                       :title="'本轮任务新增 ' + runNew + ' 条，跳过 ' + runSkipped + ' 条，失败 ' + runFail + ' 条'">
