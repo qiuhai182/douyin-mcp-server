@@ -1270,16 +1270,64 @@ async def service_restart():
 # While a batch runs, a background monitor watches system CPU and throttles
 # the batch losslessly: >90% -> at most ONE concurrent video (in-flight ones
 # finish, queued ones just start later); >=85% -> one fewer (floor of 1);
-# <=60% -> one more, up to the run's configured workers. CPU comes from
-# kernel32.GetSystemTimes deltas (psutil is not a dependency of this project).
-_dyn_monitor = {"cpu": None}
+# <=60% on two consecutive samples -> one more, up to the run's workers.
+# CPU is read Task-Manager style via PDH "% Processor Utility": plain
+# GetSystemTimes (% Processor Time) under-reports ~2x on turbo-boosted
+# machines, which made a 90% threshold effectively unreachable there.
+_dyn_monitor = {"cpu": None, "src": None}
 _cpu_prev = {"idle": 0, "total": 0}
+_pdh = {"ok": False, "dll": None, "query": None, "counter": None}
+try:
+    import ctypes as _ctypes
+
+    class _PdhFmtValue(_ctypes.Structure):
+        _fields_ = [("CStatus", _ctypes.c_ulong), ("dbl", _ctypes.c_double)]
+
+    _pdh["dll"] = _ctypes.WinDLL("pdh")
+    _pdh_query = _ctypes.c_void_p()
+    _pdh_counter = _ctypes.c_void_p()
+    if _pdh["dll"].PdhOpenQueryW(None, 0, _ctypes.byref(_pdh_query)) == 0:
+        if _pdh["dll"].PdhAddEnglishCounterW(
+                _pdh_query,
+                _ctypes.c_wchar_p("\\Processor Information(_Total)\\% Processor Utility"),
+                0, _ctypes.byref(_pdh_counter)) == 0:
+            _pdh["ok"] = True
+            _pdh["query"] = _pdh_query
+            _pdh["counter"] = _pdh_counter
+            # Prime the rate counter: each later collect measures the interval
+            # since the previous one, so the first reading needs a baseline.
+            _pdh["dll"].PdhCollectQueryData(_pdh_query)
+except Exception:
+    _pdh["ok"] = False
+
+
+def _cpu_util_pdh():
+    """CPU% as Task Manager shows it (PDH '% Processor Utility'), or None."""
+    if not _pdh["ok"]:
+        return None
+    try:
+        if _pdh["dll"].PdhCollectQueryData(_pdh["query"]) != 0:
+            return None
+        v = _PdhFmtValue()
+        if _pdh["dll"].PdhGetFormattedCounterValue(
+                _pdh["counter"], 0x0200, None, _ctypes.byref(v)) != 0:
+            return None
+        if v.CStatus != 0:
+            return None
+        return max(0.0, min(200.0, v.dbl))
+    except Exception:
+        return None
 
 
 def _cpu_percent():
-    """System-wide CPU percent since the previous call, or None (needs 2 samples)."""
+    """System CPU percent, Task-Manager style; GetSystemTimes as fallback."""
+    util = _cpu_util_pdh()
+    if util is not None:
+        _dyn_monitor["src"] = "utility"
+        return util
     try:
         import ctypes
+        _dyn_monitor["src"] = "systemtimes"
         idle, kernel, user = (ctypes.c_ulonglong(), ctypes.c_ulonglong(),
                               ctypes.c_ulonglong())
         if not ctypes.windll.kernel32.GetSystemTimes(
@@ -1305,12 +1353,16 @@ def _dyn_workers_now():
         return None
 
 
+_calm_streak = {"n": 0}
+
+
 def _dyn_concurrency_monitor() -> None:
     while True:
         time.sleep(4)
         try:
             if not _batch_state["running"]:
                 _dyn_monitor["cpu"] = None
+                _calm_streak["n"] = 0
                 continue
             cpu = _cpu_percent()
             if cpu is None:
@@ -1321,13 +1373,22 @@ def _dyn_concurrency_monitor() -> None:
             if limit is None:
                 continue
             if cpu > 90 and limit > 1:
-                # Over 90% system CPU: keep at most ONE task. In-flight videos
-                # finish naturally, queued ones wait - nothing is lost.
+                # Over 90% CPU as Task Manager shows it: keep at most ONE task.
+                # In-flight videos finish naturally, queued ones wait.
                 batch_extractor.set_dynamic_concurrency(1)
+                _calm_streak["n"] = 0
             elif cpu >= 85 and limit > 1:
                 batch_extractor.set_dynamic_concurrency(limit - 1)
+                _calm_streak["n"] = 0
             elif cpu <= 60 and limit < cap:
-                batch_extractor.set_dynamic_concurrency(limit + 1)
+                # Climb back only after two consecutive calm samples, so a
+                # machine idling near 60% does not ping-pong every 4 seconds.
+                _calm_streak["n"] += 1
+                if _calm_streak["n"] >= 2:
+                    batch_extractor.set_dynamic_concurrency(limit + 1)
+                    _calm_streak["n"] = 0
+            else:
+                _calm_streak["n"] = 0
         except Exception:
             continue
 
@@ -1368,6 +1429,7 @@ async def service_status():
         # Dynamic concurrency: current parallel-video cap (auto CPU throttling)
         "dyn_workers": _dyn_workers_now(),
         "dyn_cpu": _dyn_monitor["cpu"],
+        "cpu_src": _dyn_monitor["src"],
     }
     if not running:
         # A manual batch that died with the process (service killed, crash)
