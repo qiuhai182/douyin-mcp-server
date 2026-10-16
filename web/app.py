@@ -824,16 +824,27 @@ def _pending_add(urls: list, titles: list = None) -> tuple:
             if url in queued:
                 dup += 1
                 continue
+            title = (titles[idx].strip() if idx < len(titles) and titles[idx] else "")
+            kind = classify_link(url)
             data["items"].append({
                 "id": data["next_id"], "url": url,
-                "kind": classify_link(url), "status": "pending",
-                "title": (titles[idx].strip() if idx < len(titles) and titles[idx] else ""),
+                "kind": kind, "status": "pending",
+                "title": title,
                 "added_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "started_at": "", "finished_at": "", "result": "",
             })
             data["next_id"] += 1
             queued.add(url)
             added += 1
+            # Any queued UP joins the parsed-UP registry at once, even if the
+            # task never runs (placeholder name until a batch resolves the
+            # real nickname). Best-effort: queueing must never fail on this.
+            if kind == "up":
+                try:
+                    from batch_extractor import author_registry
+                    author_registry.ensure_registered(url, title)
+                except Exception:
+                    pass
         if added:
             _save_pending(data)
     return added, dup

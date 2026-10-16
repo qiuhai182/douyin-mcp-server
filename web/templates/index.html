@@ -1729,7 +1729,10 @@
                     try {
                         const res = await fetch('/api/authors');
                         const data = await res.json();
-                        this.authors = data.authors || [];
+                        // 展示序：UP 名字自然排序（数字按数值比较，UP2 在 UP10 前）；
+                        // 后端刷新仍按视频数升序，互不影响。
+                        this.authors = (data.authors || []).slice().sort((a, b) =>
+                            (a.name || '').localeCompare(b.name || '', 'zh-Hans-CN', { numeric: true }));
                     } catch (e) { /* ignore */ }
                 },
 

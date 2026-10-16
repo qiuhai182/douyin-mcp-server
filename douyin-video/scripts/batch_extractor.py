@@ -253,6 +253,12 @@ class AuthorRegistry:
         name = (name or "").strip()
         if not name:
             return
+        # URL-dedup: one UP keeps one entry. A queued-but-unexecuted UP is
+        # pre-recorded under a placeholder name (see ensure_registered); once
+        # a batch resolves the real nickname the placeholder moves aside.
+        for old in [n for n, e in self._data.items()
+                    if n != name and e.get("profile_url") == profile_url]:
+            self._data.pop(old, None)
         self._data[name] = {
             "profile_url": profile_url,
             "sec_uid": sec_uid or self._data.get(name, {}).get("sec_uid", ""),
@@ -265,6 +271,40 @@ class AuthorRegistry:
 
     def get(self, name: str) -> Optional[dict]:
         return self._data.get(name)
+
+    def ensure_registered(self, profile_url: str, title: str = "") -> str:
+        """Record a UP at queue-add time, before any batch has ever run.
+
+        The real nickname only becomes known when a batch visits the profile,
+        so: warm profile cache wins, then the pasted title, then a stable
+        placeholder ("未解析UP-xxxxxx") that register() migrates to the real
+        name on first run. Never opens a browser. Returns the recorded name
+        ("" when the UP is already known or the URL is empty).
+        """
+        url = (profile_url or "").strip()
+        if not url:
+            return ""
+        canonical = url
+        try:
+            canonical = normalize_profile_url(url)
+        except Exception:
+            pass
+        for e in self._data.values():
+            if e.get("profile_url") == canonical:
+                return ""
+        nickname = ""
+        try:
+            cached = ProfileCache().get(canonical)
+            nickname = (cached or {}).get("nickname", "")
+        except Exception:
+            pass
+        if not nickname:
+            nickname = (title or "").strip()
+        if not nickname:
+            tail = canonical.rstrip("/").split("/")[-1]
+            nickname = "未解析UP-" + (tail[-6:] or "unknown")
+        self.register(nickname, canonical)
+        return nickname
 
 
 def _register_author_from_url(profile_link: str):
