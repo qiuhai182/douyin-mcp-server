@@ -771,6 +771,17 @@ def classify_link(url: str) -> str:
     return "video"
 
 
+def _queue_url_key(url: str) -> str:
+    """Dedup key for the queue: UP profile links drop query/fragment —
+    share links carry varying from_tab_name/vid= params per paste, which
+    made the same UP addable again and again. Video permalinks (with
+    modal_id) keep their query — the modal_id IS the video identity."""
+    u = (url or "").strip()
+    if classify_link(u) == "up":
+        return u.split("?", 1)[0].split("#", 1)[0]
+    return u
+
+
 def _load_pending() -> dict:
     try:
         if PENDING_LINKS_FILE.exists():
@@ -816,16 +827,21 @@ def _pending_add(urls: list, titles: list = None) -> tuple:
     titles = titles or []
     with _pending_lock:
         data = _load_pending()
-        queued = {it["url"] for it in data["items"] if it["status"] in ("pending", "running")}
+        queued = {_queue_url_key(it["url"]) for it in data["items"]
+                  if it["status"] in ("pending", "running")}
         for idx, raw in enumerate(urls):
             url = (raw or "").strip()
             if not url or not re.match(r"^https?://", url, re.I):
                 continue
+            kind = classify_link(url)
+            # Canonicalize UP profile links before dedup AND before storing
+            # (share links carry varying query params per paste).
+            if kind == "up":
+                url = _queue_url_key(url)
             if url in queued:
                 dup += 1
                 continue
             title = (titles[idx].strip() if idx < len(titles) and titles[idx] else "")
-            kind = classify_link(url)
             data["items"].append({
                 "id": data["next_id"], "url": url,
                 "kind": kind, "status": "pending",

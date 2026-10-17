@@ -679,6 +679,17 @@ def batch_extract(
     _report({"stage": "list", "found": len(videos),
              "nickname": profile.get("nickname", "")})
 
+    # Register the UP as soon as the nickname is known (batch start), not
+    # only at batch end — the parsed-UP list shows it immediately and the
+    # entry survives an aborted batch. The register at batch end below just
+    # refreshes last_batch_at.
+    try:
+        if profile.get("nickname"):
+            author_registry.register(
+                profile["nickname"], canonical, profile.get("sec_uid", ""))
+    except Exception:
+        pass
+
     history = TranscriptHistory()
     backend_cfg = resolve_backend(api_key, provider, model, api_base_url)
 
