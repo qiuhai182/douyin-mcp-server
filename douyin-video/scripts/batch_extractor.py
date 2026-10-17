@@ -252,22 +252,45 @@ class AuthorRegistry:
     def register(self, name: str, profile_url: str, sec_uid: str = ""):
         name = (name or "").strip()
         if not name:
-            return
-        # URL-dedup: one UP keeps one entry. A queued-but-unexecuted UP is
-        # pre-recorded under a placeholder name (see ensure_registered); once
-        # a batch resolves the real nickname the placeholder moves aside.
+            return ""
+        # Douyin nicknames are NOT unique. This UP may already have an entry
+        # under another real name (a numeric-collision suffix from an earlier
+        # run) — keep it stable so one UP always maps to one entry/dir.
+        stable = next(
+            (n for n, e in self._data.items()
+             if e.get("profile_url") == profile_url and n != name
+             and not n.startswith("未解析UP-")), "")
+        # Placeholder entries for this URL migrate to the real name below.
         for old in [n for n, e in self._data.items()
-                    if n != name and e.get("profile_url") == profile_url]:
+                    if e.get("profile_url") == profile_url and n != name
+                    and n.startswith("未解析UP-")]:
             self._data.pop(old, None)
+        taken = self._data.get(name)
+        if taken and (taken.get("profile_url") or "") != (profile_url or ""):
+            # Name collision with a DIFFERENT UP: reuse our stable entry, or
+            # allocate the lowest free numeric suffix ("小雨(2)").
+            if stable:
+                name = stable
+            else:
+                i = 2
+                while f"{name}({i})" in self._data:
+                    i += 1
+                name = f"{name}({i})"
         self._data[name] = {
             "profile_url": profile_url,
             "sec_uid": sec_uid or self._data.get(name, {}).get("sec_uid", ""),
             "last_batch_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
+        # One UP = one entry: drop any other stale entries for this URL
+        # (e.g. the old name after the UP renamed itself on douyin).
+        for old in [n for n, e in self._data.items()
+                    if e.get("profile_url") == profile_url and n != name]:
+            self._data.pop(old, None)
         self.path.write_text(
             json.dumps(self._data, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        return name
 
     def get(self, name: str) -> Optional[dict]:
         return self._data.get(name)
@@ -679,25 +702,24 @@ def batch_extract(
     _report({"stage": "list", "found": len(videos),
              "nickname": profile.get("nickname", "")})
 
-    # Register the UP as soon as the nickname is known (batch start), not
-    # only at batch end — the parsed-UP list shows it immediately and the
-    # entry survives an aborted batch. The register at batch end below just
-    # refreshes last_batch_at.
+    # The registry is the name authority: it sanitizes the raw nickname and
+    # resolves douyin nickname collisions with a stable numeric suffix
+    # ("小雨" vs "小雨(2)"). The returned name is used BOTH for the parsed-UP
+    # registry and the output directory, so the two never diverge.
+    raw_name = (profile.get("nickname") or profile.get("sec_uid") or "author")
+    raw_name = "".join(c for c in raw_name if c not in r'\/:*?"<>|').strip() or "author"
     try:
-        if profile.get("nickname"):
-            author_registry.register(
-                profile["nickname"], canonical, profile.get("sec_uid", ""))
+        author_name = author_registry.register(raw_name, canonical,
+                                               profile.get("sec_uid", ""))
     except Exception:
-        pass
+        author_name = raw_name
 
     history = TranscriptHistory()
     backend_cfg = resolve_backend(api_key, provider, model, api_base_url)
 
     out_base = Path(output_dir)
     out_base.mkdir(parents=True, exist_ok=True)
-    author_dir_name = (profile.get("nickname") or profile.get("sec_uid") or "author")
-    author_dir_name = "".join(c for c in author_dir_name if c not in r'\/:*?"<>|').strip() or "author"
-    author_dir = out_base / author_dir_name
+    author_dir = out_base / author_name
     author_dir.mkdir(parents=True, exist_ok=True)
 
     # Migrate legacy '<aweme_id>.md' files to 'N-<aweme_id>.md' before any
@@ -962,10 +984,10 @@ def batch_extract(
         _dyn_gate = None
         return summary
     # Persist author -> profile URL so the WebUI can re-run this author
+    # (refreshes last_batch_at; the entry was created at batch start).
     try:
-        if profile.get("nickname"):
-            author_registry.register(
-                profile["nickname"], canonical, profile.get("sec_uid", ""))
+        author_registry.register(author_name, canonical,
+                                 profile.get("sec_uid", ""))
     except Exception:
         pass
     _report({"stage": "done", **summary})
