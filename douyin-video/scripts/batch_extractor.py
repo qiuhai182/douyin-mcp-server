@@ -221,6 +221,10 @@ class AuthorRegistry:
 
     def __init__(self, path: Path = AUTHORS_FILE):
         self.path = Path(path)
+        # Two threads may register concurrently (a batch + the queue-add
+        # nickname lookup), and every register() rewrites the whole file:
+        # serialize the read-modify-write so the JSON can never interleave.
+        self._lock = threading.RLock()
         try:
             self._data = json.loads(self.path.read_text(encoding="utf-8"))
         except Exception:
@@ -250,6 +254,10 @@ class AuthorRegistry:
         return items
 
     def register(self, name: str, profile_url: str, sec_uid: str = ""):
+        with self._lock:
+            return self._register_locked(name, profile_url, sec_uid)
+
+    def _register_locked(self, name: str, profile_url: str, sec_uid: str = ""):
         name = (name or "").strip()
         if not name:
             return ""
@@ -295,14 +303,20 @@ class AuthorRegistry:
     def get(self, name: str) -> Optional[dict]:
         return self._data.get(name)
 
-    def ensure_registered(self, profile_url: str, title: str = "") -> str:
+    def ensure_registered(self, profile_url: str, title: str = "",
+                          allow_network: bool = False) -> str:
         """Record a UP at queue-add time, before any batch has ever run.
 
-        The real nickname only becomes known when a batch visits the profile,
-        so: warm profile cache wins, then the pasted title, then a stable
+        Warm profile cache wins, then the pasted title, then a stable
         placeholder ("未解析UP-xxxxxx") that register() migrates to the real
-        name on first run. Never opens a browser. Returns the recorded name
-        ("" when the UP is already known or the URL is empty).
+        name on first run.
+
+        allow_network=True additionally asks the browser for the real douyin
+        nickname — one short headless visit, no video list, no window. It is
+        also what upgrades an ALREADY recorded placeholder once the name is
+        known, so it is safe to call on an existing entry. Returns the
+        recorded name ("" when the UP is already known by its real name or
+        the URL is empty).
         """
         url = (profile_url or "").strip()
         if not url:
@@ -312,9 +326,15 @@ class AuthorRegistry:
             canonical = normalize_profile_url(url)
         except Exception:
             pass
-        for e in self._data.values():
+        existing = ""
+        for n, e in self._data.items():
             if e.get("profile_url") == canonical:
-                return ""
+                existing = n
+                break
+        # Known by its real name -> nothing to do. A placeholder entry is left
+        # alone too, unless allow_network can still resolve the real nickname.
+        if existing and not (allow_network and existing.startswith("未解析UP-")):
+            return ""
         nickname = ""
         try:
             cached = ProfileCache().get(canonical)
@@ -323,11 +343,18 @@ class AuthorRegistry:
             pass
         if not nickname:
             nickname = (title or "").strip()
+        if not nickname and allow_network:
+            # 顺带抓一次主页昵称（短促无头访问，失败就退回占位名）
+            try:
+                import profile_fetcher
+                nickname = (profile_fetcher.fetch_nickname(canonical) or "").strip()
+            except Exception:
+                nickname = ""
         if not nickname:
             tail = canonical.rstrip("/").split("/")[-1]
             nickname = "未解析UP-" + (tail[-6:] or "unknown")
-        self.register(nickname, canonical)
-        return nickname
+        with self._lock:
+            return self.register(nickname, canonical)
 
 
 def _register_author_from_url(profile_link: str):

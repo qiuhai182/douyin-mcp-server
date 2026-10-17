@@ -833,6 +833,51 @@ def _pending_items() -> list:
         return _load_pending()["items"]
 
 
+def _upgrade_queued_author_name(url: str, title: str = "",
+                                attempts: int = 3) -> None:
+    """Background: look up this queued UP's real douyin nickname and replace
+    the placeholder entry ("未解析UP-xxxxxx"). One short headless visit per
+    attempt - no video list, no window. The profile lock serializes it against
+    batch browsers, so a busy batch just means "retry", never a stall.
+    Best-effort: queueing already succeeded; failure keeps the placeholder.
+    """
+    from batch_extractor import author_registry
+    for i in range(max(1, attempts)):
+        try:
+            name = author_registry.ensure_registered(url, title, allow_network=True)
+        except Exception as e:
+            log_operation("authors.nickname", status="fail", error=str(e)[:120])
+            return
+        if name == "" or not name.startswith("未解析UP-"):
+            # "" = already known by its real name; else the nickname arrived
+            log_operation("authors.nickname", status="ok", name=name or "-")
+            return
+        if i + 1 < attempts:
+            time.sleep(30)
+    log_operation("authors.nickname", status="giveup", url=str(url)[:90])
+
+
+def _backfill_placeholder_names() -> None:
+    """One background pass over placeholder entries in the author registry.
+
+    Entries recorded before the nickname lookup existed (or whose lookup hit a
+    busy profile) stay "未解析UP-xxxxxx"; this asks the browser for their real
+    names so the author list shows recognizable names. Strictly serial and
+    best-effort — a batch that keeps the profile busy wins, since it registers
+    the real name itself when it reaches those UPs.
+    """
+    time.sleep(15)  # let startup (queue resume) settle first
+    try:
+        from batch_extractor import author_registry
+        todo = [e.get("profile_url", "")
+                for n, e in list(author_registry._data.items())
+                if n.startswith("未解析UP-") and e.get("profile_url")]
+    except Exception:
+        return
+    for url in todo:
+        _upgrade_queued_author_name(url, "", attempts=3)
+
+
 def _pending_add(urls: list, titles: list = None) -> tuple:
     """Append links, deduped against still-queued ones. Returns (added, duplicates).
     Optional parallel `titles` list labels items (e.g. a known UP's name)."""
@@ -875,6 +920,11 @@ def _pending_add(urls: list, titles: list = None) -> tuple:
                     author_registry.ensure_registered(url, title)
                 except Exception:
                     pass
+                # 顺带抓一次主页昵称：后台线程做一次短促无头访问，把占位名升级成
+                # 真实昵称（不阻塞入队响应；失败就保留占位名，批量跑到时再迁移）
+                threading.Thread(
+                    target=_upgrade_queued_author_name, args=(url, title),
+                    daemon=True, name="nickname-lookup").start()
         if added:
             _save_pending(data)
     return added, dup
@@ -1284,6 +1334,9 @@ async def _resume_pending_queue():
         if changed:
             _save_pending(data)
     _maybe_start_pending(delay=8.0)
+    # 占位名回填：把「未解析UP-xxxxxx」条目补成真实昵称（后台串行，尽力而为）
+    threading.Thread(target=_backfill_placeholder_names, daemon=True,
+                     name="nickname-backfill").start()
 
 
 @app.post("/api/service/restart")

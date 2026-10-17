@@ -223,7 +223,7 @@ def _kill_profile_browsers(timeout: int = 20) -> int:
     return 0
 
 
-def _open_persistent(p, headless: bool):
+def _open_persistent(p, headless: bool, lock_timeout: int = None):
     """Open a persistent browser context.
 
     Tries the system default browser's real executable first (resolved
@@ -233,11 +233,14 @@ def _open_persistent(p, headless: bool):
 
     Holds _PROFILE_LOCK until the context is torn down: callers must release
     it via _release_profile_lock() right after _kill_profile_browsers().
+    lock_timeout overrides how long to wait for a busy profile (a short
+    nickname lookup gives up quickly instead of stalling for minutes).
     """
-    if not _PROFILE_LOCK.acquire(timeout=_PROFILE_LOCK_TIMEOUT):
+    wait_for = _PROFILE_LOCK_TIMEOUT if lock_timeout is None else int(lock_timeout)
+    if not _PROFILE_LOCK.acquire(timeout=wait_for):
         raise RuntimeError(
             "上一个批次仍占用抖音浏览器配置，"
-            f"已等待 {_PROFILE_LOCK_TIMEOUT}s 仍未释放；本次抓取已中止（避免卡死）"
+            f"已等待 {wait_for}s 仍未释放；本次抓取已中止（避免卡死）"
         )
     # A browser left behind by a killed/crashed run still holds the profile
     # dir; the new instance's page would then freeze (scroll/XHR hang forever).
@@ -639,6 +642,58 @@ def interactive_login(timeout: int = 240, on_notice=None) -> bool:
             except Exception:
                 pass
             _release_profile_lock()
+
+
+def fetch_nickname(profile_url: str, wait_ms: int = 6000,
+                   lock_timeout: int = 45) -> str:
+    """Look up ONLY the profile's display nickname - no video list.
+
+    Used when a UP is queued: the author registry wants the real douyin
+    nickname instead of a "未解析UP-xxxxxx" placeholder. Opens the persistent
+    (headless) browser for a few seconds and closes it again, so this is much
+    cheaper than fetch_profile_videos() (no scrolling, no XHR capture).
+    Best-effort: returns "" on any failure and the caller keeps its placeholder
+    (lock_timeout keeps a busy profile from stalling the caller for minutes).
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        return ""
+    try:
+        canonical = normalize_profile_url(profile_url)
+    except Exception:
+        return ""
+    if not _has_saved_session():
+        try:
+            _import_browser_session_to_backup()
+        except Exception:
+            pass
+    nickname = ""
+    with sync_playwright() as p:
+        try:
+            context = _open_persistent(p, headless=True, lock_timeout=lock_timeout)
+        except Exception:
+            return ""
+        try:
+            page = context.new_page()
+            page.goto(canonical, wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(wait_ms)
+            nickname = page.evaluate(
+                "() => { const el = document.querySelector('[data-e2e=\"user-info\"] span,"
+                " h1, .author-name, [class*=nickname]');"
+                " return el ? el.textContent.trim().slice(0, 60) : ''; }"
+            ) or ""
+        except Exception:
+            nickname = ""
+        finally:
+            try:
+                context.close()
+            except Exception:
+                pass
+            # _open_persistent holds the profile lock; give it back, otherwise
+            # the running batch (and every later lookup) waits out the timeout.
+            _release_profile_lock()
+    return nickname.strip()
 
 
 def fetch_profile_videos(
