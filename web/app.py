@@ -22,6 +22,14 @@ import threading
 from pathlib import Path
 from urllib.parse import quote
 
+# Under pythonw (windowless autostart) sys.stdout/stderr are None; uvicorn's
+# dictConfig crashes on that since Python 3.12+ ("Unable to configure
+# formatter 'default'"). Point them at devnull so `pythonw web\app.py` works.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
 # Add project path
 sys.path.insert(0, str(Path(__file__).parent.parent / "douyin-video" / "scripts"))
 
@@ -141,7 +149,13 @@ class ExtractResponse(BaseModel):
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     """Main page"""
-    return templates.TemplateResponse(request, "index.html")
+    resp = templates.TemplateResponse(request, "index.html")
+    # Never let a browser serve this page from its cache: template fixes
+    # (author list auto-refresh, panel refresh button...) must reach tabs
+    # that were already open before the change, on a plain reload.
+    resp.headers["Cache-Control"] = "no-store, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    return resp
 
 
 @app.get("/api/health")
@@ -1399,9 +1413,20 @@ def _dyn_concurrency_monitor() -> None:
             limit, cap = batch_extractor.dyn_concurrency_state()
             if limit is None:
                 continue
-            if cpu >= 80 and limit > 1:
+            if cpu > 90 and limit != 0:
+                # Low-occupancy mode: system is overloaded as Task Manager
+                # shows it — pull NO new videos at all (gate closed, limit 0);
+                # in-flight ones finish naturally. Reopens below 70%.
+                batch_extractor.set_dynamic_concurrency(0)
+                _calm_streak["n"] = 0
+            elif cpu >= 80 and limit > 1:
                 # At/over 80% CPU as Task Manager shows it: keep at most ONE
                 # task. In-flight videos finish naturally, queued ones wait.
+                batch_extractor.set_dynamic_concurrency(1)
+                _calm_streak["n"] = 0
+            elif cpu <= 70 and limit == 0:
+                # Leave low-occupancy mode: reopen the gate with one task;
+                # the regular climb ladder below takes over from here.
                 batch_extractor.set_dynamic_concurrency(1)
                 _calm_streak["n"] = 0
             elif cpu <= 60 and limit < cap:
@@ -1531,6 +1556,10 @@ async def profile_batch_abort():
         # NOTE: the pause flag is deliberately kept - a user pause outlives
         # the aborted task, so auto-started follow-up work stays paused.
         cancel_flag.set()
+        # Abort is an explicit user decision: drop the crash-recovery intent
+        # so the auto-resume monitor does not resurrect this batch right
+        # after it winds down (that made the task feel unstoppable).
+        _clear_batch_intent()
         log_operation("batch.abort", status="requested")
         return {"status": "terminating", "target": "batch",
                 "notice": "已请求终止：当前视频完成后停止（已完成的文案会保留）"}

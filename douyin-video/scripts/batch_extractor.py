@@ -999,7 +999,10 @@ class _DynamicGate:
     """Caps how many video pipelines run in parallel; the cap is changeable
     live. acquire() blocks while `active >= limit`. Lowering the limit never
     touches in-flight videos (lossless): they finish, only new starts wait.
-    Raise is capped at this run's configured workers (`_max`)."""
+    Raise is capped at this run's configured workers (`_max`). Limit 0 is a
+    legal "low-occupancy mode": no new video starts at all until the system
+    load drops. A user abort must never get stuck behind the gate, so the
+    wait observes cancel_flag and raises BatchCancelled."""
 
     def __init__(self, limit: int):
         self._cond = threading.Condition()
@@ -1010,6 +1013,8 @@ class _DynamicGate:
     def acquire(self) -> None:
         with self._cond:
             while self._active >= self._limit:
+                if cancel_flag.is_set():
+                    raise BatchCancelled()
                 self._cond.wait(0.5)  # periodic wake: observe limit raises too
             self._active += 1
 
@@ -1020,7 +1025,7 @@ class _DynamicGate:
 
     def set_limit(self, n: int) -> None:
         with self._cond:
-            self._limit = max(1, min(int(n), self._max))
+            self._limit = max(0, min(int(n), self._max))
             self._cond.notify_all()
 
     def state(self):

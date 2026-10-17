@@ -993,7 +993,8 @@
                                     </svg>
                                     一键刷新全部
                                 </button>
-                                <button x-show="!authorQueueRunning && !batchRunning && !batchDetached" @click="loadAuthors()"
+                                <button @click="loadAuthors()"
+                                        title="从后端重新拉取已提取作者列表（入队的新 UP 会立刻出现）"
                                         class="text-xs text-douyin-gray-400 hover:text-douyin-gray-600">刷新</button>
                             </div>
                         </div>
@@ -1004,9 +1005,13 @@
                                     <div class="flex-1 min-w-0">
                                         <a :href="a.profile_url || '#'" target="_blank" rel="noopener noreferrer"
                                            title="在新标签页打开作者主页"
-                                           class="block text-sm font-medium truncate transition-colors"
+                                           class="inline-block max-w-full align-middle text-sm font-medium truncate transition-colors"
                                            :class="a.name === activeUp && batchActive ? 'text-douyin-red' : 'text-douyin-gray-800 hover:text-douyin-red'"
                                            x-text="a.name"></a>
+                                        <!-- 入队即注册但还没解析出真昵称的占位条目，标记便于识别 -->
+                                        <span x-show="(a.name || '').startsWith('未解析UP-')"
+                                              title="已入队并登记；该 UP 还没解析出抖音昵称，暂用占位名，批量跑到它时会自动改成真实昵称"
+                                              class="inline-block align-middle ml-1.5 text-[10px] px-1.5 py-0.5 rounded bg-amber-50 text-amber-600 border border-amber-200">待解析</span>
                                         <p class="text-xs truncate">
                                             <span x-show="a.name === activeUp && batchActive"
                                                   class="text-douyin-red font-medium">
@@ -1892,6 +1897,8 @@
                         this.pendingLinkMsg = `已加入 ${data.added} 条` +
                             (data.duplicates ? `，${data.duplicates} 条重复已忽略` : '');
                         setTimeout(() => this.pendingLinkMsg = '', 4000);
+                        // 入队即注册：后端把 UP 写进已提取作者列表了，这里立刻刷新
+                        this.loadAuthors();
                     } catch (e) {
                         this.pendingLinkMsg = '加入失败，请重试';
                     } finally { this.pendingLinkBusy = false; }
@@ -2188,6 +2195,8 @@
                             ? `已加入待解析队列 ${data.added} 条${data.duplicates ? `（重复 ${data.duplicates} 条已忽略）` : ''}，当前解析完成后自动开始`
                             : '该链接已在待解析队列中，无需重复添加';
                         this.url = '';
+                        // 入队即注册：新 UP 立刻出现在已提取作者列表
+                        this.loadAuthors();
                     } catch (e) {
                         this.queuedNotice = '加入队列失败，请重试';
                     }
@@ -2203,7 +2212,9 @@
                     // reloads never lose it: the state lives in the service).
                     if (this._queueWatchers) return;
                     this._queueWatchers = true;
-                    setInterval(() => this.loadPendingLinks(), 8000);
+                    // 8s 同时刷新作者列表：入队即注册、批量开始注册的新 UP 都会
+                    // 自动出现，不需要用户手动点「刷新」或重载页面
+                    setInterval(() => { this.loadPendingLinks(); this.loadAuthors(); }, 8000);
                     setInterval(async () => {
                         try {
                             const st = await this._fetchServiceStatus();
