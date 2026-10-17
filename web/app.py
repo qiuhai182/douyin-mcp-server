@@ -1399,13 +1399,10 @@ def _dyn_concurrency_monitor() -> None:
             limit, cap = batch_extractor.dyn_concurrency_state()
             if limit is None:
                 continue
-            if cpu > 90 and limit > 1:
-                # Over 90% CPU as Task Manager shows it: keep at most ONE task.
-                # In-flight videos finish naturally, queued ones wait.
+            if cpu >= 80 and limit > 1:
+                # At/over 80% CPU as Task Manager shows it: keep at most ONE
+                # task. In-flight videos finish naturally, queued ones wait.
                 batch_extractor.set_dynamic_concurrency(1)
-                _calm_streak["n"] = 0
-            elif cpu >= 85 and limit > 1:
-                batch_extractor.set_dynamic_concurrency(limit - 1)
                 _calm_streak["n"] = 0
             elif cpu <= 60 and limit < cap:
                 # Climb back only after two consecutive calm samples, so a
