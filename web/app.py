@@ -1362,9 +1362,12 @@ async def service_restart():
 
 # --- Dynamic concurrency -----------------------------------------------------
 # While a batch runs, a background monitor watches system CPU and throttles
-# the batch losslessly: >90% -> at most ONE concurrent video (in-flight ones
-# finish, queued ones just start later); >=85% -> one fewer (floor of 1);
-# <=60% on two consecutive samples -> one more, up to the run's workers.
+# the batch losslessly: >95% -> pull NO new video at all (gate closed, limit
+# 0; in-flight ones finish), reopen once back at <=85%; >=80% -> at most ONE
+# concurrent video; <=60% on two consecutive samples -> one more, up to the
+# run's workers. The 95/85 pair is deliberately loose because % Processor
+# Utility counts OTHER apps too (Trae/Chromium etc. alone can hold this
+# machine near saturation, which used to starve the batch at limit 0).
 # CPU is read Task-Manager style via PDH "% Processor Utility": plain
 # GetSystemTimes (% Processor Time) under-reports ~2x on turbo-boosted
 # machines, which made a 90% threshold effectively unreachable there.
@@ -1466,10 +1469,10 @@ def _dyn_concurrency_monitor() -> None:
             limit, cap = batch_extractor.dyn_concurrency_state()
             if limit is None:
                 continue
-            if cpu > 90 and limit != 0:
-                # Low-occupancy mode: system is overloaded as Task Manager
-                # shows it — pull NO new videos at all (gate closed, limit 0);
-                # in-flight ones finish naturally. Reopens below 70%.
+            if cpu > 95 and limit != 0:
+                # Low-occupancy mode: the machine is genuinely saturated - pull
+                # NO new videos at all (gate closed, limit 0); in-flight ones
+                # finish naturally. Reopens at <=85%.
                 batch_extractor.set_dynamic_concurrency(0)
                 _calm_streak["n"] = 0
             elif cpu >= 80 and limit > 1:
@@ -1477,7 +1480,7 @@ def _dyn_concurrency_monitor() -> None:
                 # task. In-flight videos finish naturally, queued ones wait.
                 batch_extractor.set_dynamic_concurrency(1)
                 _calm_streak["n"] = 0
-            elif cpu <= 70 and limit == 0:
+            elif cpu <= 85 and limit == 0:
                 # Leave low-occupancy mode: reopen the gate with one task;
                 # the regular climb ladder below takes over from here.
                 batch_extractor.set_dynamic_concurrency(1)

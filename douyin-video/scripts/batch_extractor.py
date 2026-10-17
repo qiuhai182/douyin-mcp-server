@@ -840,7 +840,7 @@ def batch_extract(
                     history.add(aweme_id, title, str(md_path))
                     counters["ok"] += 1
                     counters["resumed"] += 1
-                _log_new_record(author_dir_name, md_path, title)
+                _log_new_record(author_name, md_path, title)
                 _report({"stage": "extract", "index": i + 1, "total": total,
                          "aweme_id": aweme_id, "title": title,
                          "status": "ok", "resumed": True,
@@ -937,7 +937,7 @@ def batch_extract(
                 history.add(aweme_id, title, str(transcript_path))
                 counters["ok"] += 1
 
-            _log_new_record(author_dir_name, transcript_path, title)
+            _log_new_record(author_name, transcript_path, title)
             _report({"stage": "extract", "index": index + 1, "total": total,
                      "aweme_id": aweme_id, "title": title,
                      "status": "ok", "output": str(transcript_path)})
