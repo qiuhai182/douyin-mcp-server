@@ -1187,9 +1187,13 @@ async def pending_links_list():
 @app.post("/api/pending-links")
 async def pending_links_add(req: PendingLinksRequest):
     """Queue links (single video / UP profile, auto-detected). Kicks the
-    runner if nothing is running; otherwise it starts when the lock frees."""
-    if _driver_info():
-        raise HTTPException(status_code=409, detail=_driver_busy_detail())
+    runner if nothing is running; otherwise it starts when the lock frees.
+
+    Queueing is ALWAYS accepted, including while the refresh-all driver runs:
+    _pending_worker_loop already waits for the driver to finish before it
+    claims the batch lock, so a queued item can never overlap the driver on
+    the browser profile. Refusing the write only cost the user the ability to
+    line up work ahead of time."""
     added, dup = _pending_add(req.urls, req.titles)
     if added:
         log_operation("queue.add", count=added, duplicates=dup)

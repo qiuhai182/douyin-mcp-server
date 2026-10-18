@@ -986,21 +986,17 @@
                                     继续上次刷新任务
                                 </button>
                                 <button x-show="authors.length" @click="startBackendRefreshAll()"
-                                        :title="driverTask
-                                            ? '后端全 UP 刷新脚本任务正在运行：它本身已覆盖全部 UP，队列此时不接受新条目；可在进度区终止它，或等它完成后从队列添加'
-                                            : ((backendBusy || authorQueueRunning)
-                                                ? '当前有任务在运行：点击把全部 UP 加入待解析队列，已在队列中的自动去重，当前任务结束后按队列顺序自动执行'
-                                                : '以后台脚本方式静默刷新全部 UP：关闭浏览器不中断，页面实时显示进度，可随时终止')"
-                                        :class="driverTask
-                                            ? 'bg-douyin-gray-100 text-douyin-gray-400 border-douyin-gray-200 cursor-not-allowed'
-                                            : ((backendBusy || authorQueueRunning)
-                                                ? 'bg-amber-50 text-amber-700 hover:bg-amber-100 border-amber-200'
-                                                : 'bg-douyin-red/10 text-douyin-red hover:bg-douyin-red/20 border-douyin-red/30')"
+                                        :title="(backendBusy || authorQueueRunning)
+                                            ? '当前有任务在运行：点击把全部 UP 加入待解析队列，已在队列中的自动去重，当前任务结束后按队列顺序自动执行'
+                                            : '以后台脚本方式静默刷新全部 UP：关闭浏览器不中断，页面实时显示进度，可随时终止'"
+                                        :class="(backendBusy || authorQueueRunning)
+                                            ? 'bg-amber-50 text-amber-700 hover:bg-amber-100 border-amber-200'
+                                            : 'bg-douyin-red/10 text-douyin-red hover:bg-douyin-red/20 border-douyin-red/30'"
                                         class="text-xs px-2.5 py-1 rounded-lg border transition-smooth flex items-center gap-1">
                                     <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
                                         <path d="M8 5v14l11-7z"/>
                                     </svg>
-                                    <span x-text="driverTask ? '刷新全部进行中' : ((backendBusy || authorQueueRunning) ? '全部UP加入队列' : '一键刷新全部')"></span>
+                                    <span x-text="(backendBusy || authorQueueRunning) ? '全部UP加入队列' : '一键刷新全部'"></span>
                                 </button>
                                 <button @click="loadAuthors()"
                                         title="从后端重新拉取已提取作者列表（入队的新 UP 会立刻出现）"
@@ -1889,10 +1885,8 @@
                     const urls = (this.pendingLinkInput || '')
                         .split(/\s+|[,，;；]+/).map(s => s.trim()).filter(Boolean);
                     if (!urls.length || this.pendingLinkBusy) return;
-                    if (this.driverTask) {
-                        this.showToast('后端刷新任务运行中，暂不接受排队');
-                        return;
-                    }
+                    // 入队永远允许：后端队列 runner 自己会等 driver / 手动批量
+                    // 让出浏览器 profile 后才执行，无需在入队阶段拦截。
                     this.pendingLinkBusy = true;
                     try {
                         const res = await fetch('/api/pending-links', {
@@ -2418,15 +2412,10 @@
                     // 不丢任务，前端实时显示进度并可终止。
                     //
                     // 已有任务在运行时按钮仍然保留，改为「把全部 UP 加入待解析
-                    // 队列」：后端队列会自动去重，队列 runner 等当前任务结束后
-                    // 按顺序执行，因此不需要抢占正在跑的批量。
+                    // 队列」：后端队列会自动去重，队列 runner 自己会等 driver /
+                    // 手动批量让出浏览器 profile 后才执行，所以入队永远是安全的，
+                    // 不需要抢占正在跑的任务。
                     if (!this.authors.length) return;
-                    if (this.driverTask) {
-                        // 后端脚本任务独占 Chrome profile，后端对该期间的入队直接
-                        // 返回 409，因此这里先给出明确提示，不做无谓的请求。
-                        this.showToast('后端全 UP 刷新脚本任务正在运行，队列暂不接受新条目；可在进度区终止它，或等它完成后从队列添加');
-                        return;
-                    }
                     if (this.backendBusy || this.authorQueueRunning) {
                         const known = this.authors.filter(a => a.profile_url);
                         if (!known.length) return;
