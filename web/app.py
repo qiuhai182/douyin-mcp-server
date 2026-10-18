@@ -1640,9 +1640,22 @@ async def refresh_all_start(req: RefreshAllRequest):
     if detail:
         raise HTTPException(status_code=409, detail=detail)
     if _batch_state["running"] or _extract_busy:
-        raise HTTPException(
-            status_code=409,
-            detail="WebUI 批量/解析任务正在运行（Chrome profile 独占），请等它结束后再启动全量刷新")
+        # 排队而非等待：WebUI 批量运行时把全部 UP 追加进待解析队列，
+        # 当前任务结束后 runner 自动继续，无需人工等待或反复重试。
+        try:
+            authors = json.loads(
+                (ROOT / "authors.json").read_text(encoding="utf-8"))
+        except Exception:
+            authors = {}
+        urls = [e.get("profile_url", "") for e in authors.values()
+                if e.get("profile_url")]
+        titles = list(authors.keys())[:len(urls)]
+        added, dup = _pending_add(urls, titles)
+        if added:
+            log_operation("refreshall.queued", count=added, duplicates=dup)
+        return {"status": "queued",
+                "notice": (f"批量任务正在运行：已把 {added} 位 UP 追加进"
+                           f"待解析队列（重复 {dup} 条），跑完当前任务后自动继续")}
     ps1 = ROOT / "scripts" / "refresh_guarded.ps1"
     if not ps1.exists():
         raise HTTPException(status_code=500, detail="找不到 scripts/refresh_guarded.ps1")
