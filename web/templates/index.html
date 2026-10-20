@@ -2499,7 +2499,11 @@
                     }
 
                     // 忙时不打断：把链接加入待解析队列（UP/视频自动识别）
-                    if (this.batchActive || this.loading) {
+                    // 注意必须把后端轮询出来的 batchDetached / batchRunning 也算
+                    // 进来：页面刷新或断流后本地 batchActive 为 false，但后端其实
+                    // 还在跑；只看本地状态会去「启动新任务」，被后端 409 拒绝，
+                    // 用户看到的就是「添加排队失败」。
+                    if (this.batchActive || this.loading || this.batchDetached || this.batchRunning) {
                         await this.queueFromMainInput();
                         return;
                     }
@@ -2547,6 +2551,14 @@
                             })
                         });
 
+                        if (res.status === 409) {
+                            // 兜底：前端状态过期（刷新/断流/轮询未及时更新）时后端
+                            // 仍可能已有任务在跑。此时不报错，改为入队，避免用户
+                            // 看到「添加排队失败」但实际上什么都没发生。
+                            this.addBatchLog('后端已有任务在运行，已改为加入待解析队列', 'warn');
+                            await this.queueFromMainInput();
+                            return;
+                        }
                         if (!res.ok) {
                             const err = await res.json().catch(() => ({}));
                             throw new Error(err.detail || '批量任务启动失败');

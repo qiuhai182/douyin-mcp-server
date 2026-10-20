@@ -833,6 +833,42 @@ def _pending_items() -> list:
         return _load_pending()["items"]
 
 
+def _backfill_queue_titles(url: str, name: str) -> None:
+    """Label queued/running UP items with the resolved nickname.
+
+    A queued row is created before the nickname lookup finishes, so its title
+    is empty (or a raw sec_uid when the caller had no name). The queue panel
+    renders that title, which looks exactly like "the link was never added".
+    Best-effort: never let display bookkeeping break the queue.
+    """
+    if not name or name.startswith("未解析UP-"):
+        return
+    try:
+        key = _queue_url_key(url)
+    except Exception:
+        return
+    try:
+        with _pending_lock:
+            data = _load_pending()
+            changed = False
+            for it in data["items"]:
+                if it.get("kind") != "up":
+                    continue
+                try:
+                    if _queue_url_key(it.get("url", "")) != key:
+                        continue
+                except Exception:
+                    continue
+                cur = (it.get("title") or "").strip()
+                if not cur or cur.startswith("未解析UP-") or cur.startswith("MS4wLjAB"):
+                    it["title"] = name
+                    changed = True
+            if changed:
+                _save_pending(data)
+    except Exception:
+        pass
+
+
 def _upgrade_queued_author_name(url: str, title: str = "",
                                 attempts: int = 3) -> None:
     """Background: look up this queued UP's real douyin nickname and replace
@@ -851,10 +887,61 @@ def _upgrade_queued_author_name(url: str, title: str = "",
         if name == "" or not name.startswith("未解析UP-"):
             # "" = already known by its real name; else the nickname arrived
             log_operation("authors.nickname", status="ok", name=name or "-")
+            resolved = name
+            if not resolved:
+                try:
+                    key = _queue_url_key(url)
+                    for n, e in list(author_registry._data.items()):
+                        if _queue_url_key(e.get("profile_url", "")) == key:
+                            resolved = n
+                            break
+                except Exception:
+                    resolved = ""
+            _backfill_queue_titles(url, resolved)
             return
         if i + 1 < attempts:
             time.sleep(30)
     log_operation("authors.nickname", status="giveup", url=str(url)[:90])
+
+
+def _backfill_queue_titles_from_registry() -> None:
+    """Fill blank/raw-sec_uid titles of already-queued UP items from the
+    author registry (local only, no browser). Rows queued before the nickname
+    arrived otherwise stay nameless forever, which reads as "not added"."""
+    try:
+        from batch_extractor import author_registry
+    except Exception:
+        return
+    try:
+        with _pending_lock:
+            data = _load_pending()
+            names = {}
+            for n, e in list(author_registry._data.items()):
+                u = e.get("profile_url", "")
+                if not u or n.startswith("未解析UP-"):
+                    continue
+                try:
+                    names[_queue_url_key(u)] = n
+                except Exception:
+                    continue
+            changed = False
+            for it in data["items"]:
+                if it.get("kind") != "up":
+                    continue
+                cur = (it.get("title") or "").strip()
+                if cur and not cur.startswith("MS4wLjAB"):
+                    continue
+                try:
+                    name = names.get(_queue_url_key(it.get("url", "")))
+                except Exception:
+                    name = None
+                if name:
+                    it["title"] = name
+                    changed = True
+            if changed:
+                _save_pending(data)
+    except Exception:
+        pass
 
 
 def _backfill_placeholder_names() -> None:
@@ -867,6 +954,7 @@ def _backfill_placeholder_names() -> None:
     the real name itself when it reaches those UPs.
     """
     time.sleep(15)  # let startup (queue resume) settle first
+    _backfill_queue_titles_from_registry()
     try:
         from batch_extractor import author_registry
         todo = [e.get("profile_url", "")
