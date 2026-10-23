@@ -9,8 +9,8 @@
     - 自动跳过二进制文件及常见二进制扩展名
     - 已是 UTF-8 的文件不重写（带 BOM 的 UTF-8 默认保留，可用 --strip-bom 去除）
     - 依次尝试识别编码: UTF-8 / UTF-8(BOM) / UTF-16(BOM) / GB18030 / Big5 / Shift-JIS / Latin-1
-    - 换行符统一为 LF（默认；--eol crlf 可改 Windows 风格，--eol none 跳过换行处理）——
-      统一策略：CRLF→目标、孤立 CR→目标；文件内混用（混合换行）一律拉平
+    - 默认只转换编码，不改动换行符；需要统一换行时显式指定 --eol lf 或 --eol crlf
+      （CRLF→目标、孤立 CR→目标；文件内混用（混合换行）一律拉平）
 """
 
 import argparse
@@ -155,8 +155,8 @@ def main() -> None:
     parser.add_argument("--backup", action="store_true", help="转换前生成 <文件名>.bak 备份")
     parser.add_argument("--ext", default="", help="仅处理指定扩展名，逗号分隔，如: .py,.txt")
     parser.add_argument("--strip-bom", action="store_true", help="将带 BOM 的 UTF-8 文件重写为无 BOM UTF-8")
-    parser.add_argument("--eol", choices=["lf", "crlf", "none"], default="lf",
-                        help="换行符统一目标：lf（默认）/ crlf / none（跳过换行处理）")
+    parser.add_argument("--eol", choices=["lf", "crlf", "none"], default="none",
+                        help="换行符统一目标（可选）：lf / crlf / none（默认，不改动换行符）")
     args = parser.parse_args()
 
     root = Path(args.directory)
