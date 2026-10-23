@@ -759,7 +759,7 @@
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
                             </svg>
-                            <span x-text="queuedVideoPending() ? '提前解析' : (canJumpQueue() ? '插队解析' : ((batchActive || loading) ? '排队解析' : (isProfileLink() ? '批量提取文案' : '提取文案')))"></span>
+                            <span x-text="queuedVideoPending() ? '提前解析' : (canJumpQueue() ? '插队解析' : ((backendBusy || loading) ? '排队解析' : (isProfileLink() ? '批量提取文案' : '提取文案')))"></span>
                         </button>
                     </div>
                     <p x-show="queuedNotice" x-transition class="mt-2 text-xs text-green-600" x-text="queuedNotice"></p>
@@ -1539,6 +1539,26 @@
                     const st = await this._fetchServiceStatus();
                     if (!st) return;
                     this.driverTask = st.driver_running ? (st.driver || {}) : null;
+                    const task = await this._fetchLastTask();
+                    // 本轮累计恢复：刷新页面不能清零——无论后端批量是否在跑都先对账。
+                    // 任务文件只在刷新队列/续跑态有 run_*；后端内存为 0（服务重启过）
+                    // 时把文件值 seed 回权威值，否则 6s 对账会把显示拉回 0。
+                    if (task) {
+                        this.runNew = task.run_new || 0;
+                        this.runSkipped = task.run_skipped || 0;
+                        this.runFail = task.run_fail || 0;
+                        this.runFinished = false;
+                        if (typeof st.run_ok === 'number'
+                            && !st.run_ok && !st.run_skip && !st.run_fail) {
+                            this._seedRunStats(this.runNew, this.runSkipped, this.runFail);
+                        }
+                    } else if (typeof st.run_ok === 'number') {
+                        // 无任务文件：直接采用服务端权威累计（进程未重启即为上一轮值）
+                        this.runNew = st.run_ok;
+                        this.runSkipped = st.run_skip;
+                        this.runFail = st.run_fail;
+                        this.runFinished = false;
+                    }
                     if (!st.batch_running) {
                         sessionStorage.removeItem('douyin_author_queue');
                         return;
@@ -1547,7 +1567,6 @@
                     this.batchPaused = !!st.batch_paused;
                     this.backgroundLabel = st.batch_label || '';
                     let saved = this._restoreQueueState();
-                    const task = await this._fetchLastTask();
                     // 服务端批量若是待解析队列任务，则由队列 runner 全权驱动：
                     // 此时复活客户端刷新队列会让两条队列抢锁（409 风暴）
                     const serverQueueOwns = st.batch_label === '待解析队列';
@@ -1577,25 +1596,8 @@
                         this.authorQueueRunning = true;
                         this.authorQueueCurrent = st.batch_label || saved.current || '';
                     }
-                    if (task) {
-                        // 续上本轮新增统计（已完成 UP 的累计），接着累加
-                        this.runNew = task.run_new || 0;
-                        this.runSkipped = task.run_skipped || 0;
-                        this.runFail = task.run_fail || 0;
-                        this.runFinished = false;
-                        // 服务重启后后端内存清零：把文件里的累计灌回权威值，
-                        // 否则 6s 对账会把显示拉回 0
-                        if (typeof st.run_ok === 'number'
-                            && !st.run_ok && !st.run_skip && !st.run_fail) {
-                            this._seedRunStats(this.runNew, this.runSkipped, this.runFail);
-                        }
-                    } else if (typeof st.run_ok === 'number') {
-                        // 后端待解析队列模式：直接采用服务端权威累计，刷新页面不清零
-                        this.runNew = st.run_ok;
-                        this.runSkipped = st.run_skip;
-                        this.runFail = st.run_fail;
-                        this.runFinished = false;
-                    }
+                    // 统计恢复已在函数开头（batch_running 与否都执行）完成，
+                    // 这里不再重复对账，避免同一分支被写两遍。
                 },
 
                 _seedRunStats(ok, skip, fail) {
@@ -2492,9 +2494,11 @@
 
                 async batchExtract() {
                     if (!this.url || !this.url.trim()) return;
-                    // 后端脚本任务独占 Chrome profile：不受理新任务（后端同样拦截）
+                    // 后端脚本任务（全 UP 刷新 driver）独占 Chrome profile：与 WebUI
+                    // 批量忙时同一处理——不打断、改为入队，driver 结束后 runner 自动执行
                     if (this.driverTask) {
-                        this.showToast('后端刷新任务运行中，不能开始新任务');
+                        this.addBatchLog('后端刷新任务运行中：已改为加入待解析队列，当前任务结束后自动执行', 'warn');
+                        await this.queueFromMainInput();
                         return;
                     }
 
@@ -2816,8 +2820,11 @@
                 },
                 queuedVideoPending() {
                     const qi = this.queuedExtractItem();
+                    // 后端 driver 独占 Chrome profile：extract-now 必被后端 409 拒，
+                    // 不走「提前解析」，留在队列等 driver 结束后自动执行
+                    if (!qi || qi.kind !== 'video' || this.driverTask) return null;
                     // 空闲 或 批量已暂停（worker 空闲）时才可插队；批量运行中仍走排队
-                    return (qi && qi.kind === 'video' && (!this.batchActive || this.batchPaused)) ? qi : null;
+                    return (!this.batchActive || this.batchPaused) ? qi : null;
                 },
                 // 主输入框内容是否为 UP 主页链接（sec_uid 或 /user/ 且不带 modal_id）
                 isProfileLink() {
@@ -2933,7 +2940,8 @@
                     }
 
                     // 忙时主输入也可以点：把链接加入待解析队列，当前任务结束后自动执行
-                    if (this.batchActive || this.loading) {
+                    // （WebUI 批量 / 后端刷新 driver / 本页解析中一律入队，不打断）
+                    if (this.backendBusy || this.loading) {
                         // 批量已暂停时，单个视频链接还可以选择插队立即解析
                         if (this.canJumpQueue()) {
                             await this.jumpQueueExtract();
@@ -2983,7 +2991,8 @@
                             this.transcript = data.text;
                             this.showToast('文案提取成功');
                         } else {
-                            this.error = data.error || '提取文案失败';
+                            // 后端 409/400 的原因在 detail（error 字段为空时不留笼统文案）
+                            this.error = data.detail || data.error || '提取文案失败';
                         }
                     } catch (e) {
                         clearInterval(stepInterval);

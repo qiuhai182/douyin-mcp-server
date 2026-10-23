@@ -159,7 +159,13 @@ def main():
                              output=evt.get("output") or "")
             # throttle: only print every 5th or on status change
             if status != "skip" or idx == 1 or idx == tot or (isinstance(idx, int) and idx % 5 == 0):
-                log(f"    [{idx}/{tot}] {marker} {status}  {aweme_id}  {title}")
+                line = f"    [{idx}/{tot}] {marker} {status}  {aweme_id}  {title}"
+                if status in ("fail", "error"):
+                    # 失败必须带原因：只打标题无法区分下载失败/解析失败/风控
+                    reason = " ".join(str(evt.get("error") or "").split())[:160]
+                    if reason:
+                        line += f"  ｜原因: {reason}"
+                log(line)
         elif stage == "error":
             log(f"    ERROR: {evt.get('error', '')[:300]}")
             log_video_result("error", author=_cur["author"],

@@ -27,9 +27,11 @@ git push github main || goto :fail
 
 echo.
 echo ============ UPLOAD OK ============
+pause
 exit /b 0
 
 :fail
 echo.
 echo ============ UPLOAD FAILED ============
+pause
 exit /b 1
