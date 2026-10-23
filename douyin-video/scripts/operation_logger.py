@@ -73,8 +73,39 @@ def log_file_path() -> Path:
 # ---------------------------------------------------------------------------
 VIDEO_LOG_FILE = _LOG_DIR / "video_results.jsonl"
 _VIDEO_LOG_MAX_BYTES = 3 * 1024 * 1024   # trim when exceeded
-_VIDEO_LOG_KEEP_LINES = 10000            # lines kept after a trim
+_VIDEO_LOG_KEEP_LINES = 10000            # total hard cap after a trim
+_VIDEO_LOG_STATUS_QUOTA = 2500           # 按状态配额：每状态各留 N 行（D1＝A）
 _vlog_lock = threading.Lock()
+
+
+def _trim_video_log() -> None:
+    """按状态配额截断视频执行日志（D1 拍板 A·F-014 根治）。
+
+    老实现只留「最新 10000 行」：跳过日志刷屏时，成功/失败行会被挤出保留
+    窗口（实测状态分布 skip 10811／fail 48／error 11／ok 0＝「成功」分类
+    一度恒空）。改为每状态各留最近 N 行（配额内按时间取最新），并保留
+    总行数硬上限兜底；只在文件超字节上限时触发（调用方判断）。
+    """
+    text = VIDEO_LOG_FILE.read_text(encoding="utf-8")
+    lines = [l for l in text.splitlines() if l.strip()]
+    # 从新往旧按状态配额入选，再倒回原时序写回（读取侧依赖时序）
+    kept_rev, per, total = [], {}, 0
+    for line in reversed(lines):
+        try:
+            st = str(json.loads(line).get("status") or "")
+        except Exception:
+            st = "__unknown__"          # 坏行也按配额保留，不当场丢证
+        n = per.get(st, 0)
+        if n >= _VIDEO_LOG_STATUS_QUOTA:
+            continue
+        per[st] = n + 1
+        kept_rev.append(line)
+        total += 1
+        if total >= _VIDEO_LOG_KEEP_LINES:
+            break
+    kept = list(reversed(kept_rev))
+    with open(VIDEO_LOG_FILE, "w", encoding="utf-8") as f:
+        f.write("\n".join(kept) + "\n")
 
 
 def log_video_result(status: str, author: str = "", title: str = "",
@@ -85,7 +116,7 @@ def log_video_result(status: str, author: str = "", title: str = "",
         "status": status or "",
         "author": author or "",
         "video_id": str(video_id or ""),
-        "title": str(title or "")[:200],
+        "title": (title or "")[:200],
         "trigger": trigger or "",
     }
     for k, v in fields.items():
@@ -97,14 +128,10 @@ def log_video_result(status: str, author: str = "", title: str = "",
         with _vlog_lock:
             with open(VIDEO_LOG_FILE, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            # Cap file size: keep only the most recent lines.
+            # Cap file size: 按状态配额截断（不再按总行数一刀切）
             try:
                 if VIDEO_LOG_FILE.stat().st_size > _VIDEO_LOG_MAX_BYTES:
-                    lines = VIDEO_LOG_FILE.read_text(
-                        encoding="utf-8").splitlines()
-                    keep = lines[-_VIDEO_LOG_KEEP_LINES:]
-                    with open(VIDEO_LOG_FILE, "w", encoding="utf-8") as f:
-                        f.write("\n".join(keep) + "\n")
+                    _trim_video_log()
             except Exception:
                 pass
     except Exception:
@@ -187,11 +214,19 @@ def _parse_runtime_web_line(line: str) -> Optional[dict]:
     action = str(rec.get("action") or "")
     if action in _RUNTIME_NOISE_ACTIONS:
         return None
-    parts = [f"{k}={v}" for k, v in rec.items()
-             if k not in ("ts", "action", "status")]
+    status = str(rec.get("status") or "")
+    # 动作日志展示位：msg/动作 字段直接当正文（不打 key= 前缀），其余字段仍
+    # key=value；全空则回落成「动作｜状态」——保证每一行都带可读的动作信息，
+    # 源侧无信息日志已统一补 msg，此处为历史行兜底。
+    parts = []
+    for k, v in rec.items():
+        if k in ("ts", "action", "status"):
+            continue
+        parts.append(str(v) if k in ("msg", "动作") else f"{k}={v}")
+    body = " ".join(parts) or f"{action or '-'}｜{status or '-'}"
     return {"ts": str(rec.get("ts") or ""), "kind": "web",
-            "action": action or "-", "status": str(rec.get("status") or ""),
-            "msg": " ".join(parts)[:400]}
+            "action": action or "-", "status": status,
+            "msg": body[:400]}
 
 
 def _parse_runtime_driver_line(line: str) -> Optional[dict]:
@@ -270,16 +305,24 @@ def read_runtime_logs(limit: int = 200, before: str = "",
     """Unified runtime stream (driver live log + WebUI operation log +
     per-video results), newest first. `before` ("YYYY-MM-DD HH:MM:SS")
     pages older history: only entries strictly older than the anchor are
-    returned. `status` keeps only entries whose status matches exactly
-    (video entries carry ok/skip/fail/error; web entries ok/error/...).
+    returned.
+
+    `status`（成功/跳过/失败/错误 分类）只作用于「任务/文案」的每视频执行
+    结果：状态分类下不合并 driver 实时输出与 WebUI 动作日志——它们是程序
+    运行日志，只在【全部】里看（status 为空时三源照常合并）。
 
     Returns {"logs": [...], "has_more": bool} - has_more tells the UI
     whether an even older「加载更多」page may exist.
     """
-    web, web_done = _scan_runtime_file(
-        LOG_FILE, _parse_runtime_web_line, before, limit, status)
-    drv, drv_done = _scan_runtime_file(
-        DRIVER_LOG_FILE, _parse_runtime_driver_line, before, limit, status)
+    if status:
+        # 状态分类＝任务/文案结果面：只扫视频结果文件（动作日志不参与分类）
+        web, web_done = [], True
+        drv, drv_done = [], True
+    else:
+        web, web_done = _scan_runtime_file(
+            LOG_FILE, _parse_runtime_web_line, before, limit, status)
+        drv, drv_done = _scan_runtime_file(
+            DRIVER_LOG_FILE, _parse_runtime_driver_line, before, limit, status)
     vid, vid_done = _scan_runtime_file(
         VIDEO_LOG_FILE, _parse_runtime_video_line, before, limit, status)
     merged = sorted(web + drv + vid, key=lambda e: e["ts"], reverse=True)

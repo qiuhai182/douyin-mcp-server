@@ -426,6 +426,11 @@ def _batch_publish(event: dict) -> None:
         event["run_ok"] = _run_stats["ok"]
         event["run_skip"] = _run_stats["skip"]
         event["run_fail"] = _run_stats["fail"]
+    if event.get("stage") == "billing_shortage":
+        # 欠费自动暂停：持久化告警旗标（页面刷新/服务重启都不丢）并置暂停位，
+        # 让队列接续的下一项也保持暂停，充值后点「继续」才恢复。
+        _set_billing_flag(str(event.get("error") or "ASR 账户余额不足"))
+        _set_batch_pause_flag(True)
     if len(history) > _BATCH_HISTORY_MAX:
         del history[: len(history) - _BATCH_HISTORY_MAX]
     for sub in list(_batch_job["subs"]):
@@ -456,6 +461,40 @@ _run_ctx: dict = {}
 #   - 提供终止按钮（taskkill 进程树，连带 Chrome 子进程）
 # ---------------------------------------------------------------------------
 DRIVER_STATE_FILE = REFRESH_LOG_DIR / "driver_state.json"
+# 余额不足告警旗标（与 scripts/refresh_all.py 共用同一文件）。
+# 命中 HTTP 402 时写入，WebUI 据此常驻横幅提醒充值；新任务开始/用户点
+# 「继续」时清除。放文件而不是内存，浏览器关了、服务重启了提醒都还在。
+BILLING_FLAG_FILE = REFRESH_LOG_DIR / "billing_shortage.json"
+
+
+def _billing_flag_info() -> dict:
+    try:
+        data = json.loads(BILLING_FLAG_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _set_billing_flag(message: str, author: str = "", source: str = "") -> None:
+    try:
+        REFRESH_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = BILLING_FLAG_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps({
+            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "message": (message or "ASR 账户余额不足")[:300],
+            "author": author or "",
+            "source": source or "WebUI",
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, BILLING_FLAG_FILE)
+    except Exception:
+        pass
+
+
+def _clear_billing_flag() -> None:
+    try:
+        BILLING_FLAG_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def _pid_alive(pid: int) -> bool:
@@ -584,6 +623,12 @@ def _write_refresh_log() -> None:
         ]
         if ctx.get("note"):
             lines.append(f"备注：{ctx['note']}")
+        billing_evt = next((e for e in events
+                            if e.get("stage") == "billing_shortage"), None)
+        if billing_evt:
+            lines.append(
+                "暂停原因：ASR 账户余额不足（HTTP 402）——已自动暂停解析，"
+                f"请充值后重跑。详情：{str(billing_evt.get('error', ''))[:200]}")
         # Failures & run errors, if any.
         for e in extracts:
             if e.get("status") == "fail":
@@ -706,7 +751,8 @@ def _restart_when_settled(status: str) -> None:
                 pass
         while _batch_state["running"]:
             time.sleep(2.0)
-        log_operation("service.restart", status=status)
+        log_operation("service.restart", status=status,
+                      msg=f"服务重启：等待任务收尾后执行（调度态 {status}）")
         _restart_now(delay=1.0)
 
     threading.Thread(target=_run, daemon=True).start()
@@ -1123,12 +1169,20 @@ def _pending_worker_loop() -> None:
     _pending_timer = None
     _pending_worker_alive = True
     first_item = True
-    log_operation("queue.runner", status="start")
+    log_operation("queue.runner", status="start",
+                  msg="队列 runner 启动：开始处理待解析队列")
     try:
         while not (_restart_state["pending"] or _restart_state["restarting"]):
+            if _billing_flag_info():
+                # ASR 余额不足：队列自动停摆，剩余条目保持 pending；
+                # 充值后点「继续」会清旗标并重新拉起 runner。
+                log_operation("queue.runner", status="paused_billing",
+                              msg="ASR 余额不足：待解析队列已自动暂停，充值后点「继续」恢复")
+                break
             if _queue_halt_requested:
                 _queue_halt_requested = False
-                log_operation("queue.runner", status="halted_by_abort")
+                log_operation("queue.runner", status="halted_by_abort",
+                              msg="队列 runner 因用户中止而停下（不再开新条目）")
                 break
             if not any(it["status"] == "pending" for it in _pending_items()):
                 break
@@ -1168,7 +1222,8 @@ def _pending_worker_loop() -> None:
         with _pending_lock:
             _pending_worker_alive = False
             _pending_timer = None
-    log_operation("queue.runner", status="stop")
+    log_operation("queue.runner", status="stop",
+                  msg="队列 runner 结束退出（队列已空或被接管）")
 
 
 def _pending_api_key() -> str:
@@ -1239,6 +1294,15 @@ def _pending_run_up(item: dict) -> None:
             _pending_mark(item["id"], "pending",
                           result="批量任务被终止，重新排队")
             return
+        if summary.get("billing_paused"):
+            _batch_publish({"stage": "billing_paused",
+                            "ok": summary.get("ok", 0),
+                            "skip": summary.get("skip", 0),
+                            "fail": summary.get("fail", 0),
+                            "error": summary.get("billing_message", "")})
+            _pending_mark(item["id"], "pending",
+                          result="ASR 余额不足已自动暂停，充值后重试")
+            return
     except BatchCancelled:
         _batch_publish({"stage": "aborted"})
         _pending_mark(item["id"], "pending", result="批量任务被终止，重新排队")
@@ -1293,6 +1357,24 @@ async def pending_links_add(req: PendingLinksRequest):
 async def pending_links_clear_finished():
     removed = _pending_clear_finished()
     return {"removed": removed, "items": _pending_items()}
+
+
+@app.post("/api/pending-links/clear-all")
+async def pending_links_clear_all():
+    """一键清空任务队列：删除全部待处理与已完成/失败/忽略条目。
+
+    正在处理的那一条保留（不能半途拔掉，等它跑完队列自然收尾）；
+    只动队列，已提取的文案文件不受影响。
+    """
+    with _pending_lock:
+        data = _load_pending()
+        keep = [it for it in data["items"] if it["status"] == "running"]
+        removed = len(data["items"]) - len(keep)
+        data["items"] = keep
+        _save_pending(data)
+    if removed:
+        log_operation("queue.clear_all", removed=removed, kept=len(keep))
+    return {"removed": removed, "kept": len(keep), "items": _pending_items()}
 
 
 @app.post("/api/pending-links/{item_id}/extract-now", response_model=ExtractResponse)
@@ -1441,13 +1523,14 @@ async def service_restart():
     it, but the restart no longer waits for the whole batch to drain.
     """
     if _batch_state["running"]:
-        log_operation("service.restart", status="winddown")
+        log_operation("service.restart", status="winddown",
+                      msg="服务重启：有批量在跑，先优雅收尾（在跑视频完成后重启）")
         _restart_when_settled("exec_winddown")
         return JSONResponse(
             {"status": "deferred", "restart_pending": True},
             status_code=202,
         )
-    log_operation("service.restart", status="now")
+    log_operation("service.restart", status="now", msg="服务重启：无任务在跑，立即重启")
     _restart_when_settled("exec_now")
     return {"status": "restarting"}
 
@@ -1611,10 +1694,15 @@ async def service_status():
         except Exception:
             paused = False
     driver = _driver_info()
+    billing = _billing_flag_info()
     payload = {
         "batch_running": running,
         "batch_paused": paused,
         "batch_label": _batch_job["label"] if running else "",
+        # ASR 余额不足：解析已自动暂停，前端常驻横幅提醒充值
+        "billing_shortage": bool(billing),
+        "billing_message": billing.get("message", ""),
+        "billing_at": billing.get("at", ""),
         "restart_pending": bool(_restart_state["pending"] or _restart_state["restarting"]),
         "driver_running": bool(driver),
         "driver": driver,
@@ -1708,7 +1796,8 @@ async def profile_batch_abort():
         # so the auto-resume monitor does not resurrect this batch right
         # after it winds down (that made the task feel unstoppable).
         _clear_batch_intent()
-        log_operation("batch.abort", status="requested")
+        log_operation("batch.abort", status="requested",
+                      msg="中止请求：当前视频跑完后停止，已完成结果保留")
         return {"status": "terminating", "target": "batch",
                 "notice": "已请求终止：当前视频完成后停止（已完成的文案会保留）"}
     raise HTTPException(status_code=409, detail="当前没有正在运行的任务")
@@ -1756,6 +1845,7 @@ async def refresh_all_start(req: RefreshAllRequest):
             "-Workers", str(max(1, min(req.workers, 8)))]
     if req.force:
         args.append("-Force")
+    _clear_billing_flag()  # 新一次全 UP 刷新：撤下旧的欠费横幅
     try:
         subprocess.Popen(
             args, cwd=str(ROOT), close_fds=True,
@@ -1845,6 +1935,7 @@ async def profile_batch(req: BatchRequest):
         or os.getenv("DASHSCOPE_API_KEY", "") or os.getenv("ARK_API_KEY", "")
     if not api_key:
         raise HTTPException(status_code=400, detail="Please configure API Key first")
+    _clear_billing_flag()  # 新一轮批量开始：旧欠费横幅撤下，若仍欠费会再次触发
 
     # Claim the global single-job lock here, and let the WORKER thread release
     # it in its own finally. Releasing it from the SSE generator would be wrong:
@@ -2010,7 +2101,7 @@ async def profile_batch_pause():
     from batch_extractor import run_gate
     run_gate.clear()
     _set_batch_pause_flag(True)
-    log_operation("batch.pause", status="ok")
+    log_operation("batch.pause", status="ok", msg="批量已暂停（当前视频完成后停）")
     return {"status": "paused", "notice": "当前视频完成后暂停"}
 
 
@@ -2040,7 +2131,9 @@ async def profile_batch_resume():
                 "notice": "插队解析进行中：完成后批量将自动继续（插队任务优先）"}
     run_gate.set()
     _set_batch_pause_flag(False)
-    log_operation("batch.resume", status="ok")
+    _clear_billing_flag()  # 用户已点「继续」= 视作已充值/换 Key，撤下欠费横幅
+    log_operation("batch.resume", status="ok", msg="批量已继续（解除暂停）")
+    _maybe_start_pending(delay=2.0)  # 欠费暂停的队列在这里续跑
     return {"status": "resumed"}
 
 
@@ -2067,7 +2160,9 @@ def _deferred_resume_when_extract_done():
             if not busy:
                 run_gate.set()
                 _set_batch_pause_flag(False)
-                log_operation("batch.resume", status="ok", deferred=True)
+                _clear_billing_flag()
+                log_operation("batch.resume", status="ok", deferred=True,
+                              msg="继续指令已登记：当前视频结束后解除暂停")
                 _batch_publish({"stage": "notice",
                                 "message": "插队解析完成，批量已自动继续"})
                 return
@@ -2190,7 +2285,8 @@ async def douyin_login():
 
             # Run in executor; stream status + notices via SSE
             yield f"data: {json.dumps({'stage': 'opening'}, ensure_ascii=False)}\n\n"
-            log_operation("douyin.login", status="opening")
+            log_operation("douyin.login", status="opening",
+                          msg="打开浏览器登录抖音（会话存入浏览器缓存）")
             task = loop.run_in_executor(None, _worker)
             while not task.done() or not notices.empty():
                 try:

@@ -518,6 +518,10 @@
                     · 处理中 <span class="font-medium text-douyin-gray-600" x-text="pendingLinks.filter(i => i.status === 'running').length"></span>
                     · 已完成/失败 <span class="font-medium text-douyin-gray-600" x-text="pendingLinks.filter(i => i.status === 'done' || i.status === 'fail' || i.status === 'skip').length"></span>
                 </span>
+                <button x-show="pendingLinks.length"
+                        @click="clearAllQueue()"
+                        title="一键清空整个任务队列（待执行与已完成全部删除；正在处理的一条会保留）"
+                        class="text-xs text-douyin-red/70 hover:text-douyin-red mr-3">清空队列</button>
                 <button x-show="pendingLinks.some(i => i.status === 'done' || i.status === 'fail' || i.status === 'skip')"
                         @click="clearFinishedLinks()"
                         class="text-xs text-douyin-gray-400 hover:text-douyin-gray-600">清除已完成</button>
@@ -610,7 +614,7 @@
                         </span>
                         <span x-show="!runLogsLive" class="px-1.5 py-0.5 rounded-full bg-douyin-gray-100 text-douyin-gray-400 text-[10px] font-medium">已暂停</span>
                     </h3>
-                    <p class="text-xs text-douyin-gray-400 mt-0.5">视频执行结果 · 驱动实时输出 · WebUI 操作 · 最新在前，可下翻历史</p>
+                    <p class="text-xs text-douyin-gray-400 mt-0.5">分类（成功/跳过/失败/错误）只显示任务与文案结果；驱动输出与 Web 动作日志只在【全部】里出现 · 最新在前，可下翻历史</p>
                 </div>
                 <button @click="closeRunLogModal()"
                         class="flex-shrink-0 w-8 h-8 rounded-lg bg-douyin-gray-100 hover:bg-douyin-gray-200 flex items-center justify-center transition-smooth">
@@ -799,6 +803,30 @@
                            x-text="douyinLoginStatusText"></p>
                     </div>
 
+                    <!-- 余额不足自动暂停横幅：充值前常驻（刷新页面也不丢） -->
+                    <div x-show="billingShortage" x-transition
+                         class="mt-4 rounded-xl border border-red-200 bg-red-50 p-4">
+                        <div class="flex items-start gap-3">
+                            <div class="flex-shrink-0 w-8 h-8 rounded-full bg-red-100 text-red-500 flex items-center justify-center font-bold">!</div>
+                            <div class="flex-1 min-w-0">
+                                <p class="text-sm font-semibold text-red-600">语音转写余额不足，解析已自动暂停</p>
+                                <p class="mt-1 text-xs text-red-500/90 break-all" x-text="billingMessage || 'ASR 服务返回余额不足（HTTP 402）'"></p>
+                                <p class="mt-1 text-xs text-douyin-gray-500">已完成的文案全部保留，剩余视频未拉取；充值后点「继续」或重新发起任务即可续传，已提取的视频会自动跳过。</p>
+                                <div class="mt-2 flex flex-wrap gap-2">
+                                    <a href="https://cloud.siliconflow.cn/account/charge" target="_blank"
+                                       class="h-8 px-3 rounded-lg bg-red-500 hover:bg-red-600 text-white text-xs font-medium flex items-center gap-1">
+                                        去充值（硅基流动）
+                                    </a>
+                                    <button @click="batchResume()"
+                                            class="h-8 px-3 rounded-lg border border-red-300 hover:bg-red-100 text-red-600 text-xs font-medium">
+                                        继续
+                                    </button>
+                                </div>
+                                <p class="mt-1 text-[11px] text-douyin-gray-400">若使用阿里百炼 / 火山 Ark，请到对应控制台充值或换 Key。</p>
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- Batch Progress Panel -->
                     <div x-show="batchRunning || batchDetached || driverTask || batchLogs.length" x-transition
                          class="mt-4 bg-douyin-gray-50 rounded-xl p-4">
@@ -840,14 +868,9 @@
                                 </span>
                             </p>
                             <div class="flex items-center gap-2">
-                            <button x-show="batchDetached" @click="resumeBatch()"
-                                    title="接上仍在后台运行的批量任务"
-                                    class="text-xs px-2.5 py-1 rounded-lg bg-green-50 text-green-700 hover:bg-green-100 border border-green-200 transition-smooth flex items-center gap-1 animate-pulse-soft">
-                                <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
-                                    <path d="M8 5v14l11-7z"/>
-                                </svg>
-                                继续
-                            </button>
+                            <!-- 「接上后台任务」的继续按钮已移除：页面刷新/重开后自动接上运行中的任务
+                                 （checkBackgroundBatch 与 6s 轮询双路自动 resumeBatch），未接上的瞬态
+                                 只显示提示文字，不再出现歧义按钮 -->
                             <button x-show="batchRunning && !batchPaused" @click="batchPause()"
                                     class="text-xs px-2.5 py-1 rounded-lg bg-amber-50 text-amber-700 hover:bg-amber-100 border border-amber-200 transition-smooth flex items-center gap-1">
                                 <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
@@ -862,7 +885,7 @@
                                 </svg>
                                 继续
                             </button>
-                            <button x-show="batchRunning || batchDetached" @click="batchAbort()"
+                            <button x-show="batchRunning" @click="batchAbort()"
                                     :disabled="driverTerminating"
                                     title="终止任务：当前视频完成后停止，已完成的文案保留"
                                     class="text-xs px-2.5 py-1 rounded-lg bg-red-50 text-red-600 hover:bg-red-100 border border-red-200 transition-smooth flex items-center gap-1 disabled:opacity-50">
@@ -871,7 +894,7 @@
                                 </svg>
                                 <span x-text="driverTerminating ? '终止中...' : '终止'"></span>
                             </button>
-                            <span x-show="batchDetached" class="text-xs text-amber-600">任务仍在后台运行，点「继续」接上</span>
+                            <span x-show="batchDetached" class="text-xs text-amber-600">任务仍在后台运行，正在自动接上…</span>
                             <span x-show="batchRunning && batchPaused" class="text-xs text-amber-600">已暂停（当前视频完成后生效）</span>
                             <button x-show="!batchRunning && !batchDetached && batchLogs.length" @click="clearProgress()"
                                     class="text-xs text-douyin-gray-400 hover:text-douyin-gray-600">清空</button>
@@ -913,6 +936,10 @@
                             <div class="flex items-center gap-3">
                                 <button @click="openPendingModal()"
                                         class="text-xs font-medium text-douyin-red hover:opacity-80">管理</button>
+                                <button x-show="pendingLinks.length"
+                                        @click="clearAllQueue()"
+                                        title="一键清空整个任务队列（待执行与已完成全部删除；正在处理的一条会保留）"
+                                        class="text-xs text-douyin-red/70 hover:text-douyin-red">清空队列</button>
                                 <button x-show="pendingLinks.some(i => i.status === 'done' || i.status === 'fail' || i.status === 'skip')"
                                         @click="clearFinishedLinks()"
                                         class="text-xs text-douyin-gray-400 hover:text-douyin-gray-600">清除已完成</button>
@@ -997,6 +1024,19 @@
                                         <path d="M8 5v14l11-7z"/>
                                     </svg>
                                     <span x-text="(backendBusy || authorQueueRunning) ? '全部UP加入队列' : '一键刷新全部'"></span>
+                                </button>
+                                <button x-show="authors.length" @click="batchTodayLeft()"
+                                        :title="(backendBusy || authorQueueRunning)
+                                            ? '当前有任务在运行：点击把今天还没批量过的 UP 加入待解析队列（已在队列中的自动去重），当前任务结束后自动执行'
+                                            : '只批量今天没跑过的 UP：按「最近批量」日期判定，已提取的视频自动跳过；可用「停止队列」中断，中断后可「继续上次刷新任务」'"
+                                        :class="(backendBusy || authorQueueRunning)
+                                            ? 'bg-amber-50 text-amber-700 hover:bg-amber-100 border-amber-200'
+                                            : 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border-emerald-200'"
+                                        class="text-xs px-2.5 py-1 rounded-lg border transition-smooth flex items-center gap-1">
+                                    <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
+                                        <path d="M12 2a10 10 0 1 0 10 10h-2a8 8 0 1 1-8-8V2zm1 4v6l5 3-.9 1.6L11 12V6h2z"/>
+                                    </svg>
+                                    <span x-text="(backendBusy || authorQueueRunning) ? '今日未跑UP入队' : '批量今日未跑UP'"></span>
                                 </button>
                                 <button @click="loadAuthors()"
                                         title="从后端重新拉取已提取作者列表（入队的新 UP 会立刻出现）"
@@ -1350,6 +1390,8 @@
                 batchEpoch: 0,             // server-side job generation (queue items / new batches bump it)
                 driverTask: null,          // backend script task (全UP刷新 driver) heartbeat info
                 driverTerminating: false,  // 终止按钮已点击，防止重复请求
+                billingShortage: false,    // ASR 账户余额不足：解析已自动暂停，需充值
+                billingMessage: '',        // 欠费提醒详情（后端返回的原始错误）
                 batchLogs: [],
                 batchTotal: 0,
                 batchDone: 0,
@@ -1539,6 +1581,8 @@
                     const st = await this._fetchServiceStatus();
                     if (!st) return;
                     this.driverTask = st.driver_running ? (st.driver || {}) : null;
+                    this.billingShortage = !!st.billing_shortage;
+                    this.billingMessage = st.billing_message || '';
                     const task = await this._fetchLastTask();
                     // 本轮累计恢复：刷新页面不能清零——无论后端批量是否在跑都先对账。
                     // 任务文件只在刷新队列/续跑态有 run_*；后端内存为 0（服务重启过）
@@ -1598,6 +1642,11 @@
                     }
                     // 统计恢复已在函数开头（batch_running 与否都执行）完成，
                     // 这里不再重复对账，避免同一分支被写两遍。
+                    if (st.batch_running && !this.batchRunning) {
+                        // 一律默认显示：页面刷新/重开后自动接上运行中的任务，
+                        // 不再要求用户手动点「继续」（resumeBatch 内部自带防重入）
+                        this.resumeBatch();
+                    }
                 },
 
                 _seedRunStats(ok, skip, fail) {
@@ -1927,6 +1976,85 @@
                     } catch (e) { /* ignore */ }
                 },
 
+                async clearAllQueue() {
+                    // 一键清空任务队列：待执行与已完成/失败/忽略全部删除；
+                    // 正在处理的一条由后端保留（不能半途拔掉）
+                    if (!this.pendingLinks.length) { this.showToast('队列已空'); return; }
+                    const pend = this.pendingLinks.filter(i => i.status === 'pending').length;
+                    const run = this.pendingLinks.filter(i => i.status === 'running').length;
+                    if (!confirm(`一键清空整个任务队列？\n\n将删除 ${this.pendingLinks.length} 条（其中待执行 ${pend} 条）` +
+                                 (run ? `，正在处理的 ${run} 条会保留` : '') +
+                                 `。\n\n只清队列：已提取的文案文件不受影响。`)) return;
+                    try {
+                        const res = await fetch('/api/pending-links/clear-all', { method: 'POST' });
+                        if (!res.ok) throw new Error('清空失败');
+                        const data = await res.json();
+                        this.pendingLinks = data.items || [];
+                        this.showToast(`已清空 ${data.removed} 条` +
+                            (data.kept ? `（正在处理的 ${data.kept} 条保留）` : ''));
+                        this.loadAuthors();
+                    } catch (e) {
+                        this.showToast('清空失败，请重试');
+                    }
+                },
+
+                _notBatchedToday() {
+                    // 今天还没批量过的 UP：按「最近批量」时间戳的日期段判定（未批量过＝空值也算）
+                    const d = new Date();
+                    const ds = d.getFullYear() + '-'
+                        + String(d.getMonth() + 1).padStart(2, '0') + '-'
+                        + String(d.getDate()).padStart(2, '0');
+                    return this.authors.filter(a => a.profile_url
+                        && !(a.last_batch_at || '').startsWith(ds));
+                },
+
+                async batchTodayLeft() {
+                    // 一键批量今日未批量过的 UP：忙时入队、空闲走逐个刷新链
+                    const list = this._notBatchedToday();
+                    if (!list.length) { this.showToast('今天所有 UP 都已批量过'); return; }
+                    const videos = list.reduce((s, a) => s + (a.video_count || 0), 0);
+                    if (this.backendBusy || this.authorQueueRunning) {
+                        // 忙时不打断：与「全部UP加入队列」同一路径（后端去重＋runner 等锁）
+                        if (!confirm(`当前有任务在运行。\n\n把今天未批量的 ${list.length} 位 UP 加入待解析队列？（已在队列中的自动去重）\n\n当前任务结束后会按队列顺序自动执行。`)) return;
+                        try {
+                            const res = await fetch('/api/pending-links', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({
+                                    urls: list.map(a => a.profile_url),
+                                    titles: list.map(a => a.name || '')
+                                })
+                            });
+                            if (!res.ok) {
+                                const err = await res.json().catch(() => ({}));
+                                throw new Error(err.detail || '加入失败');
+                            }
+                            const data = await res.json();
+                            this.pendingLinks = data.items || [];
+                            this.showToast(`已把 ${data.added} 位今日未跑 UP 加入队列` +
+                                (data.duplicates ? `，${data.duplicates} 位重复已忽略` : ''));
+                            this.loadAuthors();
+                        } catch (e) {
+                            this.showToast(e.message || '加入队列失败');
+                        }
+                        return;
+                    }
+                    if (!this.apiKeyConfigured) { this.showSettings = true; return; }
+                    if (!confirm(`批量今天还没跑过的 ${list.length} 位 UP（共约 ${videos} 个视频，已提取的自动跳过）。\n\n逐个执行：可用「停止队列」中断，中断后「继续上次刷新任务」接着跑。开始？`)) return;
+                    this.batchLogs = [];
+                    this.batchTotal = 0;
+                    this.batchDone = 0;
+                    this._resetRunStats();
+                    this.authorQueueDone = [];
+                    this.authorQueue = list.slice(1);
+                    this.authorQueueCurrent = list[0].name;
+                    this.authorQueueRunning = true;
+                    this._saveQueueState();
+                    this._persistTask();
+                    this.addBatchLog(`—— 批量今日未跑 UP：共 ${list.length} 位（首位「${list[0].name}」，其余 ${list.length - 1} 位排队中）——`, 'warn');
+                    this._startBatchAuthor(list[0]);
+                },
+
                 pendingKindLabel(it) { return it.kind === 'up' ? 'UP主页' : '单个视频'; },
                 pendingStatusLabel(st) {
                     return st === 'running' ? '处理中' : st === 'done' ? '已完成'
@@ -2015,6 +2143,12 @@
                         this.runLogsTimer = null;
                     }
                 },
+                // 状态分类＝任务/文案结果面：成功/跳过/失败/错误 只留视频执行结果；
+                // 程序运行类（驱动输出、Web 动作日志）只在【全部】里出现
+                _runLogsForFilter(logs) {
+                    if (this.runLogFilter === 'all') return logs || [];
+                    return (logs || []).filter(it => it.kind === 'video');
+                },
                 async loadRunLogs() {
                     this.runLogsLoading = true;
                     try {
@@ -2022,7 +2156,7 @@
                             + (this.runLogFilter !== 'all'
                                ? '&status=' + encodeURIComponent(this.runLogFilter) : ''));
                         const data = await res.json();
-                        this.runLogs = data.logs || [];
+                        this.runLogs = this._runLogsForFilter(data.logs || []);
                         this.runLogsHasMore = !!data.has_more;
                         this.runLogsOldest = this.runLogs.length
                             ? this.runLogs[this.runLogs.length - 1].ts : '';
@@ -2039,7 +2173,7 @@
                             + (this.runLogFilter !== 'all'
                                ? '&status=' + encodeURIComponent(this.runLogFilter) : ''));
                         const data = await res.json();
-                        const fresh = data.logs || [];
+                        const fresh = this._runLogsForFilter(data.logs || []);
                         if (!fresh.length) return;
                         const seen = new Set(this.runLogs.map(it => this.runLogKey(it)));
                         const add = fresh.filter(it => !seen.has(this.runLogKey(it)));
@@ -2050,11 +2184,14 @@
                     if (!this.runLogsHasMore || this.runLogsLoadingMore) return;
                     this.runLogsLoadingMore = true;
                     try {
+                        // 下翻历史同样带分类（此前漏传 status：成功页下翻会混入动作日志）
                         const url = '/api/logs/runtime?limit=200&before='
-                            + encodeURIComponent(this.runLogsOldest);
+                            + encodeURIComponent(this.runLogsOldest)
+                            + (this.runLogFilter !== 'all'
+                               ? '&status=' + encodeURIComponent(this.runLogFilter) : '');
                         const res = await fetch(url);
                         const data = await res.json();
-                        const older = data.logs || [];
+                        const older = this._runLogsForFilter(data.logs || []);
                         this.runLogs = [...this.runLogs, ...older];
                         this.runLogsHasMore = !!data.has_more;
                         if (older.length) {
@@ -2225,6 +2362,9 @@
                             const st = await this._fetchServiceStatus();
                             if (!st) return;
                             this.driverTask = st.driver_running ? (st.driver || {}) : null;
+                            // 余额不足自动暂停：以后端持久旗标为准，刷新页面不丢
+                            this.billingShortage = !!st.billing_shortage;
+                            this.billingMessage = st.billing_message || '';
                             // 用后端权威累计对账显示（断流/漏事件时纠偏；
                             // 赋值而非累加，SSE 事件同样采用权威值，二者不冲突）
                             if (typeof st.run_ok === 'number' && !this.runFinished) {
@@ -2239,8 +2379,15 @@
                             this.restartPending = !!st.restart_pending;
                             // 服务中断遗留的未完成手动批量：一键续跑横幅
                             this.interruptedBatch = st.batch_running ? null : (st.interrupted_batch || null);
-                            if (st.batch_running && !this.batchActive && !this.authorQueueRunning) {
+                            if (st.batch_running && !this.batchRunning && !this.batchDetached
+                                && !this.authorQueueRunning) {
+                                // 后台在跑而本页完全没接上（别的入口发起的批量）：
+                                // 一律自动接上并显示，不再有「未显示的后台任务」
+                                this.backgroundLabel = st.batch_label || '';
                                 this.batchDetached = true;
+                                this.resumeBatch();
+                            } else if (st.batch_running && this.batchDetached && !this.batchRunning) {
+                                // 已标记断开但还没接回（加载时自动接上被打断/断流重连中）：补一次
                                 this.resumeBatch();
                             }
                         } catch (e) { /* ignore */ }
@@ -2696,7 +2843,7 @@
                             this.batchDetached = true;
                             this.batchPaused = !!st.batch_paused;
                             this.backgroundLabel = st.batch_label || this.authorQueueCurrent || '';
-                            this.addBatchLog('进度连接中断，但后台任务仍在运行，点「继续」可接上', 'warn');
+                            this.addBatchLog('进度连接中断，但后台任务仍在运行，正在自动接上…', 'warn');
                             return;
                         }
                     }
@@ -2748,6 +2895,15 @@
                         this.addBatchLog(evt.kind === 'up'
                             ? '—— 队列任务：开始解析 UP 主页 ——'
                             : '—— 队列任务：开始解析单个视频 ——', 'warn');
+                    } else if (stage === 'billing_shortage') {
+                        // ASR 余额不足：后端已停止拉取新视频，这里亮常驻横幅
+                        this.billingShortage = true;
+                        this.billingMessage = evt.error || 'ASR 账户余额不足（HTTP 402）';
+                        this.batchPaused = true;
+                        this.addBatchLog('余额不足：已自动暂停解析（已完成的文案保留），请充值后点「继续」恢复', 'error');
+                        this.showToast('余额不足：解析已自动暂停，请充值');
+                    } else if (stage === 'billing_paused') {
+                        this.addBatchLog(`已自动暂停：成功 ${evt.ok ?? 0}，跳过 ${evt.skip ?? 0}，失败 ${evt.fail ?? 0}（充值后重跑可续传）`, 'warn');
                     } else if (stage === 'done') {
                         this.addBatchLog(`完成：成功 ${evt.ok}，跳过 ${evt.skip}，失败 ${evt.fail}。输出目录: ${evt.output_dir}`, 'ok');
                         this.showToast(`批量完成：成功 ${evt.ok}，跳过 ${evt.skip}，失败 ${evt.fail}`);

@@ -36,6 +36,9 @@ LIVE_LOG.parent.mkdir(exist_ok=True)
 # script task, show its progress and offer a terminate button. Atomic
 # writes (tmp + replace) so a concurrent read never sees partial JSON.
 STATE_FILE = LOG_DIR / "driver_state.json"
+# 余额不足告警旗标：driver 与 WebUI 共用一份（WebUI 启动新任务/续跑时清除），
+# 让「浏览器关了/进程退了」时欠费提醒也不会消失。
+BILLING_FLAG = LOG_DIR / "billing_shortage.json"
 try:
     if LIVE_LOG.exists() and LIVE_LOG.stat().st_size > 10 * 1024 * 1024:
         LIVE_LOG.unlink()
@@ -46,7 +49,7 @@ _LIVE_F = open(LIVE_LOG, "a", encoding="utf-8", buffering=1)
 # 让 douyin-video/scripts 下的模块能被 import
 sys.path.insert(0, str(ROOT / "douyin-video" / "scripts"))
 
-from operation_logger import log_video_result  # noqa: E402  (path set above)
+from operation_logger import log_video_result, log_operation  # noqa: E402  (path set above)
 
 
 def now():
@@ -90,6 +93,17 @@ def write_state(**fields):
             pass
 
 
+def write_billing_flag(message: str, author: str = "") -> None:
+    """Persist the balance-shortage banner for the WebUI (survives process exit)."""
+    try:
+        BILLING_FLAG.write_text(json.dumps({
+            "at": now(), "message": message[:300], "author": author,
+            "source": "全UP刷新",
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def main():
     force = False
     workers = 3
@@ -105,6 +119,10 @@ def main():
     log("=== 全 UP 刷新 driver 启动 ===")
     log(f"workers={workers}  force={force}  output={OUTPUT}")
     log("增量刷新 = force=False，已完整解析的视频自动跳过")
+    try:
+        BILLING_FLAG.unlink(missing_ok=True)  # 新一轮开始：清掉上一轮的欠费横幅
+    except Exception:
+        pass
 
     authors_path = ROOT / "authors.json"
     if not authors_path.exists():
@@ -166,6 +184,20 @@ def main():
                     if reason:
                         line += f"  ｜原因: {reason}"
                 log(line)
+        elif stage == "billing_shortage":
+            # 余额不足：页面横幅＋运行日志＋刷新月报三处同时留痕
+            msg = str(evt.get("error") or "ASR 账户余额不足")
+            log(f"    ⛔ 余额不足，自动暂停解析：{msg[:200]}")
+            log(f"    ⛔ 剩余视频不再拉取；请充值后重跑（已完成的文案保留）")
+            write_state(billing_shortage=True, billing_message=msg[:300],
+                        billing_author=_cur["author"])
+            write_billing_flag(msg, _cur["author"])
+            try:
+                log_operation("asr.billing_shortage", status="paused",
+                              author=_cur["author"], error=msg[:300],
+                              action_taken="已自动暂停：停止后续视频与后续 UP")
+            except Exception:
+                pass
         elif stage == "error":
             log(f"    ERROR: {evt.get('error', '')[:300]}")
             log_video_result("error", author=_cur["author"],
@@ -181,6 +213,7 @@ def main():
                 totals={"ok": 0, "skip": 0, "fail": 0})
 
     aborted = False
+    billing_stop = False
     try:
         for i, name in enumerate(names, 1):
             entry = authors[name]
@@ -211,6 +244,14 @@ def main():
                     aborted = True
                     log(f"  ■ {name}: 任务已被用户终止，停止后续 UP")
                     summaries.append({**summary, "author": name, "aborted": True,
+                                      "duration_s": int(time.time() - t0)})
+                    break
+                if summary.get("billing_paused"):
+                    # 余额不足：本条留在待解析队列重试，后续 UP 全部不启动
+                    billing_stop = True
+                    log(f"  ⛔ {name}: ASR 余额不足已自动暂停，停止后续 UP（充值后重跑即可续传）")
+                    summaries.append({**summary, "author": name,
+                                      "billing_paused": True,
                                       "duration_s": int(time.time() - t0)})
                     break
                 log(f"  batch_extract returned, keys={list(summary.keys())}")
@@ -249,7 +290,11 @@ def main():
         fail_total = sum(int(s.get("fail") or 0) for s in summaries)
         resumed_total = sum(int(s.get("resumed") or 0) for s in summaries)
 
-        if aborted:
+        if billing_stop:
+            log(f"\n=== 全 UP 刷新已自动暂停：ASR 账户余额不足，请充值后重跑 ===")
+            write_state(stage="billing_paused",
+                        billing_shortage=True)
+        elif aborted:
             log(f"\n=== 全 UP 刷新已终止（用户操作） ===")
         else:
             log(f"\n=== 全 UP 刷新完成 ===")
@@ -258,7 +303,7 @@ def main():
         log(f"UP 数 {len([s for s in summaries if 'error' not in s and 'aborted' not in s])}/{len(summaries)}")
 
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        tag = "已终止" if aborted else "全UP刷新"
+        tag = "已自动暂停（余额不足）" if billing_stop else ("已终止" if aborted else "全UP刷新")
         # Append one compact section to the MONTHLY refresh log instead of
         # dropping another standalone file into the directory.
         month_file = LOG_DIR / ("刷新日志_" + stamp[:6] + ".md")
@@ -274,6 +319,9 @@ def main():
             "新增 %d（续传 %d）｜跳过 %d｜失败 %d" % (
                 ok_total, resumed_total, skip_total, fail_total),
         ]
+        if billing_stop:
+            lines.append("暂停原因：ASR 账户余额不足（HTTP 402）——已自动暂停，"
+                         "剩余视频与后续 UP 未拉取；充值后重跑即可续传")
         for s in summaries:
             if s.get("error"):
                 lines.append("- 失败：%s — %s" % (s.get("author", ""), str(s["error"])[:150]))
@@ -281,7 +329,8 @@ def main():
             f.write("\n".join(lines) + "\n\n")
         log(f"汇总已追加: {month_file}")
     finally:
-        write_state(stage="finished" if not aborted else "aborted",
+        write_state(stage=("billing_paused" if billing_stop else
+                           ("finished" if not aborted else "aborted")),
                     finished_at=now())
         time.sleep(2)  # let the WebUI observe the final state once
         try:

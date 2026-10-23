@@ -93,6 +93,31 @@ class BatchCancelled(Exception):
     """Raised inside worker threads when cancel_flag is seen."""
 
 
+# 余额不足（HTTP 402）自动暂停：命中后不再启动任何新视频，剩余待解析
+# 视频留到充值后的下一轮（历史里标记 fail，下轮自动重试）。
+billing_shortage = threading.Event()
+billing_message = ""  # 最近一次欠费原因（WebUI／driver 直接展示）
+
+
+class BatchPausedByBilling(Exception):
+    """Raised inside worker threads when billing_shortage is set."""
+
+
+def _is_billing_error(exc: Exception) -> bool:
+    """普通转写失败 vs 账户余额不足：类型优先，文本兜底（分段路径会包一层）。"""
+    if type(exc).__name__ == "AsrBalanceError":
+        return True
+    text = str(exc or "").lower()
+    return (
+        "http 402" in text
+        or "insufficient balance" in text
+        or "balance is insufficient" in text
+        or "insufficient_quota" in text
+        or "余额不足" in text
+        or "欠费" in text
+    )
+
+
 class TranscriptHistory:
     """Persistent record of extracted videos for dedup across runs.
 
@@ -655,6 +680,9 @@ def batch_extract(
     # restore) passes True so a user pause is sticky - nothing processes
     # until an explicit resume.
     cancel_flag.clear()
+    billing_shortage.clear()  # 新一轮开始：上一轮的欠费暂停状态作废
+    global billing_message
+    billing_message = ""
     if start_paused:
         run_gate.clear()
     else:
@@ -678,8 +706,18 @@ def batch_extract(
         # Persist every progress/feedback event to the runtime operation log
         try:
             from operation_logger import log_operation
+            extra = {k: v for k, v in payload.items() if k != "stage"}
+            if not extra:
+                # 无明细的阶段事件（只带 stage）补成有效动作描述，
+                # 避免日志流里出现「只有状态、没有内容」的空行
+                extra = {"msg": {
+                    "list": "开始采集视频列表（此阶段无逐条明细）",
+                    "done": "本 UP 批量结束",
+                    "aborted": "批量已中止",
+                }.get(payload.get("stage", ""),
+                      "阶段事件：" + str(payload.get("stage") or "-"))}
             log_operation("batch.progress", status=payload.get("stage", ""),
-                          **{k: v for k, v in payload.items() if k != "stage"})
+                          **extra)
         except Exception:
             pass
         if on_progress:
@@ -869,8 +907,12 @@ def batch_extract(
         while not run_gate.wait(0.5):
             if cancel_flag.is_set():
                 raise BatchCancelled()
+            if billing_shortage.is_set():
+                raise BatchPausedByBilling()
         if cancel_flag.is_set():
             raise BatchCancelled()
+        if billing_shortage.is_set():
+            raise BatchPausedByBilling()
         with start_lock:
             wait = delay_seconds - (time.time() - last_start[0])
             if wait > 0:
@@ -941,6 +983,8 @@ def batch_extract(
             _report({"stage": "extract", "index": index + 1, "total": total,
                      "aweme_id": aweme_id, "title": title,
                      "status": "ok", "output": str(transcript_path)})
+        except BatchPausedByBilling:
+            raise  # 欠费自动暂停：该视频未启动，不计失败
         except BatchCancelled:
             raise  # never record a user-cancelled video as failed
         except NonVideoContent as e:
@@ -956,15 +1000,27 @@ def batch_extract(
                      "aweme_id": aweme_id, "title": title,
                      "status": "skip", "output": "", "error": str(e)[:300]})
         except Exception as e:
+            billing = _is_billing_error(e)
             with state_lock:
                 counters["fail"] += 1
                 try:
                     history.mark_fail(aweme_id, title, str(e))
                 except Exception:
                     pass
+                if billing:
+                    billing_shortage.set()
+                    global billing_message
+                    billing_message = str(e)[:300]
             _report({"stage": "extract", "index": index + 1, "total": total,
                      "aweme_id": aweme_id, "title": title,
                      "status": "fail", "error": str(e)[:300]})
+            if billing:
+                # 余额不足：立即停止拉取新视频，并单独上报一条醒目事件
+                # （WebUI 横幅＋刷新月报＋driver 心跳都消费这条事件）。
+                _report({"stage": "billing_shortage",
+                         "error": str(e)[:300],
+                         "aweme_id": aweme_id,
+                         "title": title})
         finally:
             _dyn_gate_release()
 
@@ -974,7 +1030,7 @@ def batch_extract(
         for index, aweme_id, title in pending:
             try:
                 _process_one(index, aweme_id, title)
-            except BatchCancelled:
+            except (BatchCancelled, BatchPausedByBilling):
                 cancelled = True
                 break
     else:
@@ -986,14 +1042,14 @@ def batch_extract(
             for f in futures:
                 try:
                     f.result()  # errors are reported inside _process_one
-                except BatchCancelled:
+                except (BatchCancelled, BatchPausedByBilling):
                     cancelled = True  # still wait for the in-flight ones
 
     ok += counters["ok"]
     fail += counters["fail"]
     skip += counters["skip"]
     # Refresh the per-author catalog (filename <-> title/desc index)
-    if not cancelled:
+    if not cancelled or not billing_shortage.is_set():
         try:
             update_catalog(author_dir, profile.get("nickname", ""))
         except Exception:
@@ -1005,6 +1061,14 @@ def batch_extract(
         "resumed": counters["resumed"],
         "output_dir": str(author_dir),
     }
+    if billing_shortage.is_set():
+        # 与用户主动终止区分：余额不足是「自动暂停」，剩余视频留待充值后重跑
+        summary["billing_paused"] = True
+        summary["billing_message"] = billing_message
+        _report({"stage": "billing_paused", "ok": ok, "skip": skip,
+                 "fail": fail, "error": billing_message[:300]})
+        _dyn_gate = None
+        return summary
     if cancelled:
         summary["aborted"] = True
         _report({"stage": "aborted", "ok": ok, "skip": skip, "fail": fail})

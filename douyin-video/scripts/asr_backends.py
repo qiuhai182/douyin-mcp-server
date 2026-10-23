@@ -91,6 +91,37 @@ class TranscriptionError(Exception):
     """Raised when a speech-to-text backend fails."""
 
 
+class AsrBalanceError(TranscriptionError):
+    """ASR 账户余额不足（HTTP 402 / insufficient balance）。
+
+    单独成类，让上层（批量／刷新 driver／WebUI）能与普通转写失败区分：
+    命中即停止新任务、页面告警并提示充值，而不是把剩余视频逐条撞墙。
+    """
+
+
+# 402 之外，部分兼容端点把欠费包在 400/403 的响应体里
+_BALANCE_HINTS = (
+    "insufficient balance",
+    "balance is insufficient",
+    "insufficient_quota",
+    "insufficient quota",
+    "余额不足",
+    "欠费",
+    "arrearage",
+)
+
+
+def _raise_http_error(prefix: str, response) -> None:
+    """HTTP 非 200：识别余额不足并抛专用异常，其余保持 TranscriptionError。"""
+    body = (response.text or "")[:200]
+    lowered = body.lower()
+    if response.status_code == 402 or any(h in lowered for h in _BALANCE_HINTS):
+        raise AsrBalanceError(
+            f"ASR 账户余额不足（HTTP {response.status_code}）：{body}"
+        )
+    raise TranscriptionError(f"{prefix} (HTTP {response.status_code}): {body}")
+
+
 def resolve_backend(
     api_key: Optional[str] = None,
     provider: Optional[str] = None,
@@ -194,9 +225,7 @@ def _transcribe_openai_compatible(
             response = requests.post(api_base_url, files=files, headers=headers, timeout=300)
 
         if response.status_code != 200:
-            raise TranscriptionError(
-                f"Transcription request failed (HTTP {response.status_code}): {response.text[:200]}"
-            )
+            _raise_http_error("Transcription request failed", response)
         result = response.json()
         if 'text' not in result:
             raise TranscriptionError(f"Unexpected transcription response: {response.text[:200]}")
@@ -293,9 +322,7 @@ def _transcribe_ark(
             timeout=300,
         )
         if response.status_code != 200:
-            raise TranscriptionError(
-                f"Ark API request failed (HTTP {response.status_code}): {response.text[:200]}"
-            )
+            _raise_http_error("Ark API request failed", response)
         result = response.json()
         text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
         return (text or "No text recognized").strip()
