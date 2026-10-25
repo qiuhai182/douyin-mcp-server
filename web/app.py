@@ -144,6 +144,8 @@ class ExtractResponse(BaseModel):
     text: str = ""
     download_url: str = ""
     error: str = ""
+    queued: bool = False      # 忙碌时自动转入待解析队列（success=True）
+    message: str = ""         # queued 时的提示文案
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1064,6 +1066,54 @@ def _pending_add(urls: list, titles: list = None) -> tuple:
     return added, dup
 
 
+# ---------------------------------------------------------------------------
+# 统一任务队列等待面（2026-10-25 用户定：不论何时点击解析一律入队，
+# 队列有任务就依次解析、解析完没任务就空闲）。
+# 主页「提取文案」的 HTTP 请求入队后等自己那条跑完，再把文案回给页面；
+# 等超时则先回「已入队」，页面可在「待解析队列」看进度。
+# ---------------------------------------------------------------------------
+_pending_waiters: dict = {}   # item_id -> [threading.Event, ...]
+_pending_texts: dict = {}     # item_id -> {"video_id","title","url","text"}
+
+
+def _pending_live_id(url: str):
+    """同 URL 仍在排队／运行中的条目 id（并入既有任务，避免重复入队）。"""
+    key = _queue_url_key(url)
+    with _pending_lock:
+        for it in reversed(_load_pending()["items"]):
+            if it["status"] in ("pending", "running") and _queue_url_key(it["url"]) == key:
+                return it["id"]
+    return None
+
+
+def _pending_get(item_id: int):
+    with _pending_lock:
+        for it in _load_pending()["items"]:
+            if it["id"] == item_id:
+                return dict(it)
+    return None
+
+
+def _pending_wait(item_id: int):
+    ev = threading.Event()
+    with _pending_lock:
+        _pending_waiters.setdefault(item_id, []).append(ev)
+    return ev
+
+
+def _pending_notify(item_id: int, payload: dict = None) -> None:
+    """唤醒等待该条目的 HTTP 请求；payload＝单条视频解析结果。"""
+    with _pending_lock:
+        if payload:
+            _pending_texts[item_id] = payload
+            # 只保留最近 200 条，避免长跑后内存无界增长
+            while len(_pending_texts) > 200:
+                _pending_texts.pop(next(iter(_pending_texts)))
+        evs = _pending_waiters.pop(item_id, [])
+    for ev in evs:
+        ev.set()
+
+
 def _pending_remove(item_id: int) -> bool:
     with _pending_lock:
         data = _load_pending()
@@ -1262,6 +1312,9 @@ def _pending_run_item(item: dict) -> None:
     except Exception as e:
         _pending_mark(item["id"], "fail", result=str(e))
         _batch_publish({"stage": "error", "error": str(e)[:400]})
+    finally:
+        # 条目已终态或回到 pending：唤醒等它的主页请求，避免空等到超时
+        _pending_notify(item["id"])
 
 
 def _pending_run_up(item: dict) -> None:
@@ -1321,6 +1374,15 @@ def _pending_run_video(item: dict) -> None:
                     "author": video_info.get("author") or "",
                     "status": "ok"})
     _pending_mark(item["id"], "done", result=video_info.get("title", ""))
+    log_video_result("ok", author=video_info.get("author") or "",
+                     video_id=video_info["video_id"],
+                     title=video_info.get("title") or "",
+                     trigger="待解析队列")
+    # 主页「提取文案」的HTTP请求在等这一条：把文案与视频信息交还给它
+    _pending_notify(item["id"], {"video_id": video_info["video_id"],
+                                 "title": video_info.get("title") or "",
+                                 "url": video_info.get("url", ""),
+                                 "text": _text})
     _batch_publish({"stage": "done", "ok": 1, "skip": 0, "fail": 0,
                     "resumed": 0, "output_dir": ""})
 
@@ -2377,7 +2439,11 @@ def _extract_single_video(url: str, api_key: str, provider: str = None,
 
 @app.post("/api/video/extract", response_model=ExtractResponse)
 async def extract_transcript(req: VideoRequest):
-    """Extract video transcript (API_KEY required)"""
+    """Extract transcript through the single task queue.
+
+    用户定（2026-10-25）：不论何时点击解析一律入队，队列有任务就依次解析、
+    解析完没任务就空闲；不再有「空闲直提、忙时 409」的双模旁路。
+    """
     # Resolve key from config file first, then env vars
     file_cfg = load_config_file()
     provider_id = (req.provider or file_cfg.get("active_provider") or "siliconflow").lower()
@@ -2390,45 +2456,45 @@ async def extract_transcript(req: VideoRequest):
             error="Please configure API Key first"
         )
 
-    if _driver_info():
-        raise HTTPException(status_code=409, detail=_driver_busy_detail())
-    if not _claim_extract_slot():
-        raise HTTPException(
-            status_code=409,
-            detail="已有解析任务在运行；请等它结束后再试，或使用「排队解析」加入待解析队列")
-
+    log_operation("video.extract", status="queued", url=req.url,
+                  reason="single_queue")
     try:
-        # Resolve backend (provider/model from request or config/env), then
-        # run download -> extract audio -> transcribe in a worker thread.
-        from douyin_downloader import NonVideoContent
-        video_info, text = await asyncio.to_thread(
-            _extract_single_video, req.url, api_key,
-            req.provider or None, req.model or None)
-        log_operation("video.extract", video_id=video_info["video_id"],
-                      title=video_info["title"], text_length=len(text),
-                      download_url=video_info["url"])
-        log_video_result("ok", author=video_info.get("author") or "",
-                         video_id=video_info["video_id"],
-                         title=video_info.get("title") or "",
-                         trigger="单个提取")
+        added, _dup = _pending_add([req.url], [])
+    except Exception as e:
+        return ExtractResponse(success=False, error=f"入队失败：{e}")
+    item_id = _pending_live_id(req.url)
+    if item_id is None:
+        return ExtractResponse(success=False, error="链接无效或无法入队")
+
+    ev = _pending_wait(item_id)
+    _maybe_start_pending(delay=0.3 if added else 2.0)
+    finished = await asyncio.to_thread(ev.wait, 600)
+    payload = _pending_texts.get(item_id) or {}
+    item = _pending_get(item_id) or {}
+
+    if finished and payload.get("text"):
+        log_operation("video.extract", video_id=payload.get("video_id", ""),
+                      title=payload.get("title", ""),
+                      text_length=len(payload["text"]),
+                      download_url=payload.get("url", ""))
         return ExtractResponse(
             success=True,
-            video_id=video_info["video_id"],
-            title=video_info["title"],
-            text=text,
-            download_url=video_info["url"]
+            video_id=payload.get("video_id", ""),
+            title=payload.get("title", ""),
+            text=payload["text"],
+            download_url=payload.get("url", "")
         )
-    except NonVideoContent as e:
-        # Image/text post: report as ignored (skip), not a failure.
-        log_operation("video.extract", status="skip", url=req.url, error=str(e))
-        log_video_result("skip", trigger="单个提取", url=req.url, error=str(e))
-        return ExtractResponse(success=False, error=str(e))
-    except Exception as e:
-        log_operation("video.extract", status="error", url=req.url, error=str(e))
-        log_video_result("error", trigger="单个提取", url=req.url, error=str(e))
-        return ExtractResponse(success=False, error=str(e))
-    finally:
-        _release_extract_slot()
+    if finished and item.get("status") == "pending":
+        # 余额不足自动暂停／被中止等，条目回到排队态
+        return ExtractResponse(success=True, queued=True,
+                               message="任务已暂停，链接留在待解析队列，恢复后会继续解析")
+    if finished:
+        return ExtractResponse(
+            success=False,
+            error=f"解析未成功：{item.get('result') or item.get('status') or '未知原因'}")
+    return ExtractResponse(
+        success=True, queued=True,
+        message="已加入待解析队列（前面还有任务），完成后可在「待解析队列」查看")
 
 
 @app.get("/api/logs")

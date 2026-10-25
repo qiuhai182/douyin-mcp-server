@@ -3139,6 +3139,12 @@
                         this.step = 5;
 
                         if (data.success) {
+                            if (data.queued) {
+                                // 忙碌时后端自动转入待解析队列：提示并刷新队列，不当失败
+                                this.showToast(data.message || '当前有任务在运行，已自动加入待解析队列');
+                                await this.loadPendingLinks();
+                                return;
+                            }
                             this.videoInfo = {
                                 video_id: data.video_id,
                                 title: data.title,
