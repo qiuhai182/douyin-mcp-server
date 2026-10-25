@@ -3,11 +3,13 @@
 """批量将目录内文本文件转换为 UTF-8 编码并统一换行符为 LF。
 
 用法:
-    python convert_to_utf8.py [目录] [--dry-run] [--backup] [--ext .py,.txt] [--strip-bom] [--eol lf|crlf|none]
+    python convert_to_utf8.py [目录] [--dry-run] [--backup] [--ext .py,.txt] [--strip-bom] [--eol lf|crlf|none] [--verbose]
 
 说明:
     - 自动跳过二进制文件及常见二进制扩展名
     - 已是 UTF-8 的文件不重写（带 BOM 的 UTF-8 默认保留，可用 --strip-bom 去除）
+    - 默认只打印实际转换与未识别的文件，无需转换的（已 UTF-8 / UTF-8 BOM）不逐条列出，仅计入汇总
+    - --verbose 逐条列出带 BOM 的 UTF-8 文件（排查用）
     - 依次尝试识别编码: UTF-8 / UTF-8(BOM) / UTF-16(BOM) / GB18030 / Big5 / Shift-JIS / Latin-1
     - 默认只转换编码，不改动换行符；需要统一换行时显式指定 --eol lf 或 --eol crlf
       （CRLF→目标、孤立 CR→目标；文件内混用（混合换行）一律拉平）
@@ -157,6 +159,8 @@ def main() -> None:
     parser.add_argument("--strip-bom", action="store_true", help="将带 BOM 的 UTF-8 文件重写为无 BOM UTF-8")
     parser.add_argument("--eol", choices=["lf", "crlf", "none"], default="none",
                         help="换行符统一目标（可选）：lf / crlf / none（默认，不改动换行符）")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="逐条列出带 BOM 的 UTF-8 文件（默认不列出，仅计入汇总）")
     args = parser.parse_args()
 
     root = Path(args.directory)
@@ -198,7 +202,7 @@ def main() -> None:
             print(f"[已转换] {path}  ({detail})")
         elif status == "unknown":
             print(f"[未识别] {path}  ({detail})")
-        elif status == "bom":
+        elif status == "bom" and args.verbose:
             print(f"[UTF-8 BOM] {path}  (可用 --strip-bom 去除)")
 
     print("\n===== 汇总 =====")
