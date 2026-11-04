@@ -939,10 +939,22 @@ def batch_extract(
             video_info = processor.parse_share_url(share_url)
             video_path = processor.download_video(video_info, show_progress=False)
             audio_path = processor.extract_audio(video_path, show_progress=False)
+            audio_info = processor.get_audio_info(audio_path)
             try:
                 text = processor.extract_text_from_audio(audio_path, show_progress=False)
             finally:
                 processor.cleanup_files(audio_path)
+
+            # Hard quality gate before any success write (2026-11-03):
+            # empty / foreign lyrics / repetitive filler / too-short text
+            # never reaches the transcript file or the global library.
+            from asr_backends import assess_transcript, TranscriptionError
+            verdict = assess_transcript(text)
+            if not verdict["ok"]:
+                raise TranscriptionError(
+                    "asr_suspect: %s (cjk=%.2f repeat=%.2f len=%d)" % (
+                        verdict["quality"], verdict["cjk_ratio"],
+                        verdict["repeat_ratio"], verdict["length"]))
 
             # Optional LLM polish (fixes homophones/punctuation)
             if polish_cfg.get("enabled"):
@@ -975,6 +987,11 @@ def batch_extract(
                     output=str(transcript_path),
                     provider=backend_cfg['provider'],
                     model=backend_cfg['model'],
+                    duration=audio_info.get('duration'),
+                    language='zh',
+                    cjk_ratio=verdict['cjk_ratio'],
+                    retry_count=0,
+                    quality=verdict['quality'],
                 )
                 history.add(aweme_id, title, str(transcript_path))
                 counters["ok"] += 1

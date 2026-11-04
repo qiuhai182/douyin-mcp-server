@@ -36,6 +36,11 @@ def append_record(
     output: str = "",
     provider: str = "",
     model: str = "",
+    language: str = "",
+    duration: Optional[float] = None,
+    cjk_ratio: Optional[float] = None,
+    retry_count: int = 0,
+    quality: str = "",
     library_path: Optional[Path] = None,
 ):
     """Append one extraction record to the global library file."""
@@ -48,6 +53,11 @@ def append_record(
         "output": output,
         "provider": provider,
         "model": model,
+        "language": language,
+        "duration": duration,
+        "cjk_ratio": cjk_ratio,
+        "retry_count": retry_count,
+        "quality": quality,
         "extracted_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
     path = Path(library_path) if library_path else LIBRARY_FILE

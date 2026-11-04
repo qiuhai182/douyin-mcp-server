@@ -147,6 +147,16 @@ output/
 
 ---
 
+## 🛡️ ASR 质量规则（2026-11-03）
+
+采集/转写链路固定三条判据，防止“噪声当成功”复发：
+
+1. **无文本＝失败**：后端返回空文本或 `No text recognized` 一律抛 `TranscriptionError`，不写转录件、不进 `transcripts_library.jsonl`。
+2. **短音频＝跳过**：音频 `<2 秒` 或 `<20KB` 标 `too_short`，不送 ASR；长音频按 20–60 秒语音段（`silencedetect` VAD）切分。
+3. **中文批必传语言**：中文批固定 `language=zh`、`enable_lid=False`、`enable_itn=True`；SiliconFlow 兼容分支同步传 `language`；失败按 DashScope→Ark→SiliconFlow 回落。
+
+落盘前质量闸 `assess_transcript`：CJK 占比 ≥0.5、重复 4-gram <0.3、长度 ≥30 字；失败标 `asr_suspect` 并重试，仍失败记 `fail`，不写“成功”件。转写库记录 `duration/language/cjk_ratio/retry_count/quality` 五个字段，供后续诊断。
+
 ## 🧩 VS Code / Trae 插件
 
 侧边栏控制服务，无需离开编辑器。安装方式：VS Code 扩展面板 → `⋯` → 「从 VSIX 安装」，选择 `vscode-extension` 目录打包出的 `*.vsix`。

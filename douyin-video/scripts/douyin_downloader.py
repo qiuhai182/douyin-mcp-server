@@ -62,7 +62,7 @@ check_dependencies()
 import requests
 import ffmpeg
 
-from asr_backends import transcribe_audio_file, resolve_backend
+from asr_backends import transcribe_audio_file, resolve_backend, TranscriptionError, AudioTooShort
 
 # Ensure bundled ffmpeg is visible even if PATH was not refreshed
 # (the web server process inherits PATH from its parent shell).
@@ -396,7 +396,70 @@ class DouyinProcessor:
 
         return segments
 
-    def transcribe_single_audio(self, audio_path: Path) -> str:
+    def split_audio_on_silence(self, audio_path: Path, max_segment: float = 60.0,
+                               min_silence: float = 0.8, threshold_db: float = -35.0) -> list:
+        """Split audio at silence boundaries; cap each speech segment.
+
+        Falls back to the whole file when silence detection finds nothing.
+        Returns a list of Paths (first may be the original file).
+        """
+        audio_path = Path(audio_path)
+        info = self.get_audio_info(audio_path)
+        duration = float(info.get('duration') or 0)
+        if duration <= 0:
+            return [audio_path]
+        try:
+            probe = (
+                ffmpeg
+                .input(str(audio_path))
+                .output('null', f='null', af=f'silencedetect=noise={threshold_db}dB:d={min_silence}')
+                .run(capture_stdout=True, capture_stderr=True)
+            )
+            log = probe[1].decode('utf-8', errors='ignore')
+        except Exception:
+            return [audio_path]
+
+        starts = [float(x) for x in re.findall(r'silence_start: ([0-9.]+)', log)]
+        ends = [float(x) for x in re.findall(r'silence_end: ([0-9.]+)', log)]
+        silences = list(zip(starts, ends))
+        speech = []
+        cursor = 0.0
+        for s, e in silences:
+            if s > cursor:
+                speech.append((cursor, min(s, duration)))
+            cursor = max(cursor, e)
+        if cursor < duration:
+            speech.append((cursor, duration))
+        speech = [(a, b) for a, b in speech if b - a >= 1.0]
+        if not speech:
+            return [audio_path]
+
+        # Cap long speech spans into <= max_segment chunks
+        capped = []
+        for a, b in speech:
+            while b - a > max_segment:
+                capped.append((a, a + max_segment))
+                a += max_segment
+            if b - a >= 1.0:
+                capped.append((a, b))
+
+        segments = []
+        for idx, (a, b) in enumerate(capped):
+            seg = audio_path.with_name(f"{audio_path.stem}_vad{idx:02d}.mp3")
+            try:
+                (
+                    ffmpeg
+                    .input(str(audio_path), ss=f"{a:.3f}")
+                    .output(str(seg), t=f"{b - a:.3f}", acodec='libmp3lame', q=0)
+                    .run(capture_stdout=True, capture_stderr=True, overwrite_output=True)
+                )
+                if seg.exists() and seg.stat().st_size > 0:
+                    segments.append(seg)
+            except Exception:
+                continue
+        return segments or [audio_path]
+
+    def transcribe_single_audio(self, audio_path: Path, language: Optional[str] = None) -> str:
         """Transcribe a single audio file via the configured backend"""
         return transcribe_audio_file(
             audio_path,
@@ -404,54 +467,56 @@ class DouyinProcessor:
             provider=self.provider or None,
             model=self.model or None,
             api_base_url=self.api_base_url or None,
+            language=language,
         )
 
     def extract_text_from_audio(self, audio_path: Path, show_progress: bool = True) -> str:
-        """Extract text from audio file (auto-split large files)"""
+        """Extract text from audio file (short-audio guard + VAD + auto-split)"""
         if not self.api_key:
             raise ValueError("API key not set, please set API_KEY environment variable")
 
-        # Check file size and duration
         audio_info = self.get_audio_info(audio_path)
+        if float(audio_info.get('duration') or 0) < 2.0 or int(audio_info.get('size') or 0) < 20 * 1024:
+            raise AudioTooShort(
+                "too_short: duration=%.2fs size=%dB (skip ASR)" % (
+                    float(audio_info.get('duration') or 0), int(audio_info.get('size') or 0)))
+
         max_duration = 3600  # 1 hour
         max_size = 50 * 1024 * 1024  # 50MB
-
-        # Determine if splitting is needed
         need_split = audio_info['duration'] > max_duration or audio_info['size'] > max_size
 
-        if not need_split:
-            # File within limits, process directly
+        # VAD segmentation for long audio (20-60s speech spans)
+        if os.getenv("ASR_VAD_ENABLED", "1") != "0" and audio_info['duration'] > 60:
+            segments = self.split_audio_on_silence(audio_path, max_segment=60)
+        elif need_split:
+            if show_progress:
+                print(f"Audio file is large (duration: {audio_info['duration']:.0f}s, size: {audio_info['size'] / 1024 / 1024:.1f}MB)")
+                print("Will auto-split...")
+            segments = self.split_audio(audio_path, segment_duration=540, show_progress=show_progress)
+        else:
             if show_progress:
                 print("Recognizing speech...")
             return self.transcribe_single_audio(audio_path)
 
-        # Need to split
-        if show_progress:
-            print(f"Audio file is large (duration: {audio_info['duration']:.0f}s, size: {audio_info['size'] / 1024 / 1024:.1f}MB)")
-            print("Will auto-split...")
-
-        # Split audio
-        segments = self.split_audio(audio_path, segment_duration=540, show_progress=show_progress)  # 9 min per segment
-
-        # Transcribe each segment
-        all_texts = []
+        all_texts, errors = [], []
         for i, segment_path in enumerate(segments):
             if show_progress:
                 print(f"Recognizing segment {i + 1}/{len(segments)}...")
+            try:
+                text = self.transcribe_single_audio(segment_path)
+                if text.strip():
+                    all_texts.append(text.strip())
+            except Exception as e:
+                errors.append(str(e)[:160])
+            finally:
+                if segment_path != audio_path:
+                    self.cleanup_files(segment_path)
 
-            text = self.transcribe_single_audio(segment_path)
-            all_texts.append(text)
-
-            # Clean up segment file
-            if segment_path != audio_path:
-                self.cleanup_files(segment_path)
-
-        # Merge texts
-        merged_text = ''.join(all_texts)
-
+        if not all_texts:
+            raise TranscriptionError("all_segments_suspect: " + " | ".join(errors[:3]))
+        merged_text = "\n".join(all_texts)
         if show_progress:
             print(f"Speech recognition done, processed {len(segments)} segments")
-
         return merged_text
 
     def cleanup_files(self, *file_paths: Path):
