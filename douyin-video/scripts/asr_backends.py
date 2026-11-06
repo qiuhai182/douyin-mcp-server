@@ -26,6 +26,7 @@ import re
 import json
 import base64
 import requests
+from collections import Counter
 from pathlib import Path
 from typing import Optional, List
 
@@ -40,8 +41,32 @@ ARK_MODEL = "doubao-seed-1-6-250615"
 DEFAULT_LANGUAGE = os.getenv("ASR_LANGUAGE", "zh")
 QUALITY_MIN_CJK_RATIO = float(os.getenv("ASR_MIN_CJK_RATIO", "0.5"))
 QUALITY_MAX_REPEAT_RATIO = float(os.getenv("ASR_MAX_REPEAT_RATIO", "0.3"))
+# 30：2026-11-06 小样本实测，12-29 字档几乎全是音乐/幻听文本，
+# 下限放到 12 会把歌词当成功稿收进来（5/5 误收），故维持 30。
 QUALITY_MIN_LENGTH = int(os.getenv("ASR_MIN_TEXT_LENGTH", "30"))
 NO_TEXT_MARK = "No text recognized"
+
+# 音乐/幻听过滤（2026-11-06）
+# SenseVoice 的富文本会插入事件 emoji：🎼 表示 BGM/音乐段，🎵🎶 为音符。
+# 实测存量 10857 条转写里 89% 含 🎼（带 BGM 的正常口播也会标），
+# 因此不能「见标签即拒」；情绪 emoji（😊😡 等）与正常口播同现率更高，不参与判死。
+# 分两档：
+#   1) 文本 < ASR_MUSIC_SHORT_LEN：命中任一音乐标签即拒。这类样本本就过不了
+#      30 字长度闸，此档只是把原因码从 too_short_text 换成独立的 music_lyric，
+#      不新增任何拒绝（存量 <30 字带标签 89 条，全是音乐/幻听）。
+#   2) 文本 >= ASR_MUSIC_SHORT_LEN：仅当「音乐标签数 / 非空白字数 >= 0.08」
+#      才判纯音乐/幻听循环（存量 >=60 字 9683 条里仅 28 条命中，均为纯音乐）。
+# 想改回见标签即拒，设 ASR_MUSIC_TAG_RATIO=0 即可。
+MUSIC_EVENT_TAGS = "🎼🎵🎶"
+MUSIC_SHORT_LEN = int(os.getenv("ASR_MUSIC_SHORT_LEN", "30"))
+MUSIC_TAG_RATIO = float(os.getenv("ASR_MUSIC_TAG_RATIO", "0.08"))
+# 歌词弱判据只做「第二条件」，默认开；设 ASR_LYRIC_HINT=0 可关。
+# 只对短文本生效（<= ASR_LYRIC_HINT_MAX 字）：长口播里口头禅/重复句很常见，
+# 实测存量 10.1% 的长转写有 8 字片段重复 >=3 次，若全量启用会大面积误杀。
+LYRIC_HINT_ON = os.getenv("ASR_LYRIC_HINT", "1").strip().lower() not in (
+    "0", "off", "false", "no")
+LYRIC_HINT_MAX = int(os.getenv("ASR_LYRIC_HINT_MAX", "120"))
+
 
 # Ark base64 audio limits
 ARK_MAX_AUDIO_SIZE = 25 * 1024 * 1024  # 25MB
@@ -134,11 +159,34 @@ class AudioTooShort(TranscriptionError):
     """音频过短/过小，不送 ASR（避免静音/音效触发幻觉）。"""
 
 
+def _lyric_hint(text: str) -> bool:
+    """歌词/幻听的弱判据：只作第二条件，单独命中不判死。
+
+    - 8 字片段重复出现 >=3 次（副歌／幻听循环）
+    - 语气词占比 >= 0.4（无实义语气串）
+
+    只判短文本（<= LYRIC_HINT_MAX），长口播的重复口头禅不在此列。
+    """
+    chars = [c for c in text if not c.isspace()]
+    if len(chars) < 12 or len(chars) > LYRIC_HINT_MAX:
+        return False
+    if chars:
+        grams = Counter(text[i:i + 8] for i in range(max(0, len(text) - 7)))
+        if grams and max(grams.values()) >= 3:
+            return True
+    fillers = "啊哦嗯呀嘿哈哎唉喔噢啦吧呢嘛"
+    fill = sum(1 for c in chars if c in fillers)
+    return fill / float(len(chars)) >= 0.4
+
+
 def assess_transcript(text: str) -> dict:
     """Return a quality verdict for one ASR output.
 
-    Rules (2026-11-03):
+    Rules (2026-11-06):
       - empty / 'No text recognized' -> no_text
+      - 音乐标签：短文本（<30 字）命中即拒；长文本按密度 >= 0.08 拒
+        -> music_lyric（独立原因码，不并入 too_short_text / low_cjk）
+      - 歌词弱判据 + (音乐标签 或 low_cjk) -> music_lyric（可关，单独不判死）
       - CJK ratio < 0.5 -> low_cjk (foreign lyrics / filler)
       - repeated 4-gram ratio >= 0.3 -> repetitive (hallucination loops)
       - stripped length < 30 -> too_short_text
@@ -146,7 +194,8 @@ def assess_transcript(text: str) -> dict:
     raw = (text or "").strip()
     if not raw or raw == NO_TEXT_MARK:
         return {"ok": False, "reason": "no_text", "cjk_ratio": 0.0,
-                "repeat_ratio": 0.0, "length": 0, "quality": "no_text"}
+                "repeat_ratio": 0.0, "length": 0, "quality": "no_text",
+                "music_ratio": 0.0, "lyric_hint": False}
 
     chars = [c for c in raw if not c.isspace()]
     cjk = len(re.findall(r"[一-鿿]", raw))
@@ -157,7 +206,17 @@ def assess_transcript(text: str) -> dict:
     if shingles:
         repeat_ratio = 1.0 - (len(set(shingles)) / float(len(shingles)))
 
+    music_tags = sum(1 for c in raw if c in MUSIC_EVENT_TAGS)
+    music_ratio = (music_tags / float(len(chars))) if chars else 0.0
+    lyric_hint = _lyric_hint(raw) if LYRIC_HINT_ON else False
+
     reasons = []
+    # 音乐标签分两档判（见文件头注释）；歌词弱判据必须与音乐标签或低 CJK 同现
+    # 才拒，避免单靠它误杀真人短句。
+    if music_tags and (len(raw) < MUSIC_SHORT_LEN or music_ratio >= MUSIC_TAG_RATIO):
+        reasons.append("music_lyric")
+    elif lyric_hint and (music_tags or cjk_ratio < QUALITY_MIN_CJK_RATIO):
+        reasons.append("music_lyric")
     if cjk_ratio < QUALITY_MIN_CJK_RATIO:
         reasons.append("low_cjk")
     if repeat_ratio >= QUALITY_MAX_REPEAT_RATIO:
@@ -172,6 +231,8 @@ def assess_transcript(text: str) -> dict:
         "repeat_ratio": round(repeat_ratio, 4),
         "length": len(raw),
         "quality": "ok" if not reasons else "+".join(reasons),
+        "music_ratio": round(music_ratio, 4),
+        "lyric_hint": lyric_hint,
     }
 
 
@@ -179,9 +240,10 @@ def _check_text_or_raise(text: str, provider: str) -> str:
     verdict = assess_transcript(text)
     if not verdict["ok"]:
         raise TranscriptionError(
-            "asr_suspect[%s]: %s (cjk=%.2f repeat=%.2f len=%d)" % (
+            "asr_suspect[%s]: %s (cjk=%.2f repeat=%.2f len=%d music=%.3f hint=%s)" % (
                 provider, verdict["quality"], verdict["cjk_ratio"],
-                verdict["repeat_ratio"], verdict["length"])
+                verdict["repeat_ratio"], verdict["length"],
+                verdict.get("music_ratio", 0.0), verdict.get("lyric_hint", False))
         )
     return text.strip()
 
@@ -450,3 +512,45 @@ def _transcribe_ark(
         raise
     except Exception as e:
         raise TranscriptionError(f"Ark transcription error: {str(e)}")
+
+
+def selftest() -> int:
+    """离线自测：不联网、不读凭据、不依赖任何后端。
+
+    real_short_sentence 断言的是「不被音乐判据误杀」；12-29 字仍会被既有的
+    30 字长度闸判 too_short_text，这是既有策略，本过滤器不改它。
+    """
+    cases = [
+        ("music_tag_short", "🎼是谁的？あ。🎼不能分.", "music_lyric"),
+        ("music_tag_loop", "🎼你是我的小呀小苹果，怎么爱你都不嫌多。"
+                           "🎼你是我的小呀小苹果，怎么爱你都不嫌多。"
+                           "🎼你是我的小呀小苹果，怎么爱你都不嫌多。", "music_lyric"),
+        ("music_tag_dense_long", "🎼 Yeah.🎼 Yeah.🎼 Yeah.🎼 Yeah.🎼 Yeah."
+                                 "🎼 Yeah.🎼 Yeah.🎼 Yeah.🎼 Yeah.", "music_lyric"),
+        ("normal_speech_with_bgm", "🎼今天跟大家聊一个特别有意思的话题，就是我们在写作的时候，"
+                                   "到底应该先想清楚人物，还是先把情节推下去。", "ok"),
+        ("real_short_sentence", "这次真的下定决心了，明天就开始动手写第一本书。", "not_music_lyric"),
+        ("lyric_hint_without_tag", "哈哈哈哈哈哈哈哈哈哈哈哈，太好玩了吧，我真的笑死了。", "not_music_lyric"),
+        ("empty", "", "no_text"),
+    ]
+    failed = 0
+    for name, text, expect in cases:
+        v = assess_transcript(text)
+        quality = v["quality"]
+        if expect == "ok":
+            good = v["ok"]
+        elif expect == "not_music_lyric":
+            good = "music_lyric" not in quality
+        else:
+            good = v["reason"] == expect
+        failed += 0 if good else 1
+        print("%s %-24s len=%-3d cjk=%.2f music=%.3f hint=%-5s -> %s (%s)" % (
+            "PASS" if good else "FAIL", name, v["length"], v["cjk_ratio"],
+            v["music_ratio"], v["lyric_hint"], quality, expect))
+    print("SELFTEST %s (%d/%d)" % ("OK" if not failed else "FAILED",
+                                   len(cases) - failed, len(cases)))
+    return 0 if not failed else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(selftest())

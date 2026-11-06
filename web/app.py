@@ -1311,7 +1311,12 @@ def _pending_run_item(item: dict) -> None:
                         "status": "skip", "error": str(e)[:300]})
     except Exception as e:
         _pending_mark(item["id"], "fail", result=str(e))
-        _batch_publish({"stage": "error", "error": str(e)[:400]})
+        # 带上视频身份，避免重试失败在执行日志里变成 video_id/title 全空的
+        # 匿名 error 行，事后无法定位是哪条视频。
+        _m = re.search(r"/video/(\d+)", item.get("url") or "")
+        _batch_publish({"stage": "error", "error": str(e)[:400],
+                        "aweme_id": _m.group(1) if _m else "",
+                        "title": item.get("title") or ""})
     finally:
         # 条目已终态或回到 pending：唤醒等它的主页请求，避免空等到超时
         _pending_notify(item["id"])
@@ -2387,12 +2392,25 @@ def _extract_single_video(url: str, api_key: str, provider: str = None,
         api_base_url=backend['api_base_url'] or "",
     )
     video_info = processor.parse_share_url(url)
-    video_path = processor.download_video(video_info, show_progress=False)
-    audio_path = processor.extract_audio(video_path, show_progress=False)
     try:
-        text = processor.extract_text_from_audio(audio_path, show_progress=False)
-    finally:
-        processor.cleanup_files(video_path, audio_path)
+        video_path = processor.download_video(video_info, show_progress=False)
+        audio_path = processor.extract_audio(video_path, show_progress=False)
+        try:
+            text = processor.extract_text_from_audio(audio_path, show_progress=False)
+        finally:
+            processor.cleanup_files(video_path, audio_path)
+    except Exception as e:
+        # 重试失败也要把这次的时间和错误写回 history.json：否则「失败文案
+        # 清单」永远停留在首次失败的记录上，看起来像重试没生效。
+        try:
+            from batch_extractor import TranscriptHistory
+            h = TranscriptHistory()
+            if h.status_of(video_info["video_id"]) == "fail":
+                h.mark_fail(video_info["video_id"],
+                            video_info.get("title", ""), str(e))
+        except Exception:
+            pass
+        raise
     # Optional LLM polish (fixes homophones/punctuation)
     polish_cfg = (load_config_file().get("polish") or {})
     if polish_cfg.get("enabled"):

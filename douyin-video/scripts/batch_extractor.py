@@ -952,9 +952,10 @@ def batch_extract(
             verdict = assess_transcript(text)
             if not verdict["ok"]:
                 raise TranscriptionError(
-                    "asr_suspect: %s (cjk=%.2f repeat=%.2f len=%d)" % (
+                    "asr_suspect: %s (cjk=%.2f repeat=%.2f len=%d music=%.3f hint=%s)" % (
                         verdict["quality"], verdict["cjk_ratio"],
-                        verdict["repeat_ratio"], verdict["length"]))
+                        verdict["repeat_ratio"], verdict["length"],
+                        verdict.get("music_ratio", 0.0), verdict.get("lyric_hint", False)))
 
             # Optional LLM polish (fixes homophones/punctuation)
             if polish_cfg.get("enabled"):

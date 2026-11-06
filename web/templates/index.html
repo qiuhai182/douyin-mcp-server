@@ -2223,8 +2223,14 @@
                         const data = await res.json();
                         this.pendingLinks = data.items || [];
                         this.showFailedModal = false;
-                        const n = urls.length;
-                        this.showToast(`已把 ${n} 条失败视频加入待解析队列${(this.batchActive || this.loading || this.backendBusy) ? '，当前任务结束后自动执行' : '，即将开始'}`);
+                        const added = data.added ?? urls.length;
+                        const dup = data.duplicates ?? 0;
+                        if (!added) {
+                            this.showToast(`这 ${urls.length} 条都已在待解析队列中，未重复加入`);
+                        } else {
+                            const extra = dup ? `，另有 ${dup} 条已在队列中跳过` : '';
+                            this.showToast(`已加入 ${added} 条失败视频到待解析队列${extra}${(this.batchActive || this.loading || this.backendBusy) ? '，当前任务结束后自动执行' : '，即将开始'}`);
+                        }
                     } catch (e) {
                         this.showToast('加入队列失败，请重试');
                     } finally {
