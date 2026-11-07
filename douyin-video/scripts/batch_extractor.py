@@ -149,14 +149,24 @@ class TranscriptHistory:
         }
         self._flush()
 
-    def mark_fail(self, aweme_id: str, title: str = "", error: str = ""):
-        """Record a failed attempt so stats show it, but next run retries."""
+    def mark_fail(self, aweme_id: str, title: str = "", error: str = "",
+                  terminal: bool = False):
+        """Record a failed attempt so stats show it.
+
+        terminal=True means the failure is content-deterministic (same audio,
+        same ASR verdict), so later profile batches must not retry it forever.
+        A manual queue retry still goes through - the gate may have changed.
+        """
+        prev = self._data.get(aweme_id) or {}
         self._data[aweme_id] = {
-            "title": title,
+            # 队列重试往往没有标题：保留首次记录的标题，失败清单才不会变成
+            # 一排没有名字的空行。
+            "title": title or prev.get("title", ""),
             "extracted_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "output": "",
             "status": "fail",
             "error": (error or "")[:300],
+            "terminal": bool(terminal),
         }
         self._flush()
 
@@ -172,9 +182,45 @@ class TranscriptHistory:
         }
         self._flush()
 
+    def mark_ignored(self, aweme_id: str, title: str = "", reason: str = ""):
+        """Record content-invalid audio (music / no speech / unrecognizable)
+        as "ignored", not "fail".
+
+        It is not a technical failure: the video simply has no usable spoken
+        transcript. It must not appear in the failure list, must not count as
+        a failure, and must not be auto-retried by profile batches.
+        """
+        prev = self._data.get(aweme_id) or {}
+        self._data[aweme_id] = {
+            "title": title or prev.get("title", ""),
+            "extracted_at": prev.get("extracted_at")
+            or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "ignored_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "output": "",
+            "status": "ignored",
+            "error": (reason or "")[:300],
+            "terminal": True,
+        }
+        self._flush()
+
     def status_of(self, aweme_id: str) -> str:
         entry = self._data.get(aweme_id)
         return (entry or {}).get("status", "")
+
+    def is_terminal(self, aweme_id: str) -> bool:
+        """True when an entry is content-deterministic and should not be
+        auto-retried by profile batches. Old entries (written before the
+        terminal field existed) are classified from their error text."""
+        entry = self._data.get(aweme_id) or {}
+        status = entry.get("status", "")
+        if status in ("ignored", "skip"):
+            return True
+        if status != "fail":
+            return False
+        if entry.get("terminal"):
+            return True
+        from asr_backends import is_terminal_error
+        return is_terminal_error(entry.get("error", ""))
 
     def _flush(self):
         self.path.write_text(
@@ -186,16 +232,21 @@ class TranscriptHistory:
         return len(self._data)
 
     def counts(self) -> dict:
-        ok = fail = skip = 0
+        ok = fail = skip = ignored = 0
         for entry in self._data.values():
             status = entry.get("status", "ok")
             if status == "ok":
                 ok += 1
-            elif status == "skip":
-                skip += 1  # non-video entries are ignored, never failures
+            elif status in ("skip", "ignored"):
+                # 内容无效（音乐/无口播/非视频）不是失败：单列计数，
+                # 不参与失败数，避免界面永远挂着几十条“失败”。
+                if status == "ignored":
+                    ignored += 1
+                else:
+                    skip += 1
             else:
                 fail += 1
-        return {"ok": ok, "fail": fail, "skip": skip}
+        return {"ok": ok, "fail": fail, "skip": skip, "ignored": ignored}
 
 
 class ProfileCache:
@@ -795,12 +846,12 @@ def batch_extract(
         pass
 
     total = len(videos)
-    ok = skip = fail = 0
+    ok = skip = fail = ignored = 0
 
     # Shared mutable state guarded by one lock (counters, history file,
     # library file appends).
     state_lock = threading.Lock()
-    counters = {"ok": 0, "fail": 0, "resumed": 0, "skip": 0}
+    counters = {"ok": 0, "fail": 0, "resumed": 0, "skip": 0, "ignored": 0}
 
     # Library index (video_id -> record), loaded once, for resume lookups.
     from transcript_library import read_records as _lib_read_records
@@ -846,6 +897,16 @@ def batch_extract(
                      "aweme_id": aweme_id, "title": title,
                      "status": "skip", "output": "",
                      "error": "非视频内容，已忽略", "prefilter": True})
+            continue
+        # 确定性拒绝（ASR 质量闸 / 幻听 / 无文本）：同一音频每轮都会得到同一
+        # 结论，自动重跑只会烧额度。手动队列重试仍可强制跑（force=True）。
+        if not hist_ok and not force and history.is_terminal(aweme_id):
+            ignored += 1
+            _report({"stage": "extract", "index": i + 1, "total": total,
+                     "aweme_id": aweme_id, "title": title,
+                     "status": "skip", "ignored": True, "output": "",
+                     "error": "已忽略（内容无效）：音乐/无口播/无法识别出有效文本，不再自动重试",
+                     "prefilter": True})
             continue
         if hist_ok:
             pending.append((i, aweme_id, title))
@@ -1019,19 +1080,34 @@ def batch_extract(
                      "status": "skip", "output": "", "error": str(e)[:300]})
         except Exception as e:
             billing = _is_billing_error(e)
+            from asr_backends import is_terminal_error
+            terminal = is_terminal_error(str(e))
             with state_lock:
-                counters["fail"] += 1
-                try:
-                    history.mark_fail(aweme_id, title, str(e))
-                except Exception:
-                    pass
+                if terminal:
+                    # 内容无效（音乐/无口播/识别不出有效文本）：按“已忽略”
+                    # 记账，不占失败数，也不再自动重试。
+                    counters["ignored"] += 1
+                    try:
+                        history.mark_ignored(aweme_id, title, str(e))
+                    except Exception:
+                        pass
+                else:
+                    counters["fail"] += 1
+                    try:
+                        history.mark_fail(aweme_id, title, str(e),
+                                          terminal=False)
+                    except Exception:
+                        pass
                 if billing:
                     billing_shortage.set()
                     global billing_message
                     billing_message = str(e)[:300]
             _report({"stage": "extract", "index": index + 1, "total": total,
                      "aweme_id": aweme_id, "title": title,
-                     "status": "fail", "error": str(e)[:300]})
+                     "status": "skip" if terminal else "fail",
+                     "ignored": bool(terminal),
+                     "error": (("已忽略（内容无效）：" + str(e))[:300]
+                               if terminal else str(e)[:300])})
             if billing:
                 # 余额不足：立即停止拉取新视频，并单独上报一条醒目事件
                 # （WebUI 横幅＋刷新月报＋driver 心跳都消费这条事件）。
@@ -1066,6 +1142,7 @@ def batch_extract(
     ok += counters["ok"]
     fail += counters["fail"]
     skip += counters["skip"]
+    ignored += counters["ignored"]
     # Refresh the per-author catalog (filename <-> title/desc index)
     if not cancelled or not billing_shortage.is_set():
         try:
@@ -1076,6 +1153,7 @@ def batch_extract(
         "author": profile.get("nickname", ""),
         "sec_uid": profile.get("sec_uid", ""),
         "total": total, "ok": ok, "skip": skip, "fail": fail,
+        "ignored": ignored,
         "resumed": counters["resumed"],
         "output_dir": str(author_dir),
     }

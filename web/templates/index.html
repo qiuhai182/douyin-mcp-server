@@ -516,13 +516,13 @@
                 <span class="text-xs text-douyin-gray-400">
                     待执行 <span class="font-medium text-douyin-gray-600" x-text="pendingLinks.filter(i => i.status === 'pending').length"></span>
                     · 处理中 <span class="font-medium text-douyin-gray-600" x-text="pendingLinks.filter(i => i.status === 'running').length"></span>
-                    · 已完成/失败 <span class="font-medium text-douyin-gray-600" x-text="pendingLinks.filter(i => i.status === 'done' || i.status === 'fail' || i.status === 'skip').length"></span>
+                    · 已完成/忽略/失败 <span class="font-medium text-douyin-gray-600" x-text="pendingLinks.filter(i => i.status === 'done' || i.status === 'fail' || i.status === 'skip' || i.status === 'ignored').length"></span>
                 </span>
                 <button x-show="pendingLinks.length"
                         @click="clearAllQueue()"
                         title="一键清空整个任务队列（待执行与已完成全部删除；正在处理的一条会保留）"
                         class="text-xs text-douyin-red/70 hover:text-douyin-red mr-3">清空队列</button>
-                <button x-show="pendingLinks.some(i => i.status === 'done' || i.status === 'fail' || i.status === 'skip')"
+                <button x-show="pendingLinks.some(i => i.status === 'done' || i.status === 'fail' || i.status === 'skip' || i.status === 'ignored')"
                         @click="clearFinishedLinks()"
                         class="text-xs text-douyin-gray-400 hover:text-douyin-gray-600">清除已完成</button>
             </div>
@@ -541,7 +541,7 @@
             <div class="flex items-center justify-between px-6 py-4 border-b border-douyin-gray-100 flex-shrink-0">
                 <div class="min-w-0">
                     <h3 class="text-base font-semibold text-douyin-gray-900">获取失败的文案</h3>
-                    <p class="text-xs text-douyin-gray-400 mt-0.5">勾选后重新提取，成功的会进入对应作者的输出目录并从失败清单移除</p>
+                    <p class="text-xs text-douyin-gray-400 mt-0.5">技术失败（下载/音频损坏等）可勾选重试；「已忽略（内容无效）」是音乐/无口播/无法识别，不计失败、不再自动重试</p>
                 </div>
                 <button @click="showFailedModal = false"
                         class="flex-shrink-0 w-8 h-8 rounded-lg bg-douyin-gray-100 hover:bg-douyin-gray-200 flex items-center justify-center transition-smooth">
@@ -552,6 +552,7 @@
             </div>
             <!-- List -->
             <div class="flex-1 overflow-y-auto px-6 py-3 space-y-2">
+                <!-- 技术失败：可重试 -->
                 <template x-for="it in failedItems" :key="it.aweme_id">
                     <label class="bg-douyin-gray-50 rounded-xl px-3 py-2.5 flex items-start gap-2.5 cursor-pointer hover:bg-douyin-gray-100 transition-smooth">
                         <input type="checkbox" class="mt-0.5 accent-douyin-red w-4 h-4 flex-shrink-0"
@@ -560,12 +561,36 @@
                             <a :href="'https://www.douyin.com/video/' + it.aweme_id" target="_blank" rel="noopener noreferrer"
                                class="block text-xs font-medium text-douyin-gray-700 hover:text-douyin-red truncate"
                                x-text="it.title || ('视频 ' + it.aweme_id)"></a>
-                            <p class="mt-0.5 text-[11px] text-red-400 truncate" :title="it.error" x-text="it.error || '未知错误'"></p>
+                            <span class="inline-block mt-0.5 px-1.5 py-0.5 rounded text-[10px]"
+                                  :class="failedCategoryClass(it.category)"
+                                  x-text="failedCategoryLabel(it.category)"></span>
+                            <p class="mt-0.5 text-[11px] truncate text-red-400" :title="it.error" x-text="it.error || '未知错误'"></p>
                             <p class="text-[10px] text-douyin-gray-400" x-text="it.extracted_at"></p>
                         </div>
                     </label>
                 </template>
-                <p x-show="!failedItems.length && !failedLoading" class="text-center text-xs text-douyin-gray-300 py-10">没有失败记录，全部文案均已成功提取</p>
+                <p x-show="!failedItems.length && !failedLoading" class="text-center text-xs text-douyin-gray-300 py-6">没有技术失败记录</p>
+
+                <!-- 已忽略（内容无效）：只读，不计失败、不参与重试 -->
+                <div x-show="ignoredItems.length" class="pt-3 border-t border-douyin-gray-100">
+                    <div class="flex items-center justify-between gap-2">
+                        <p class="text-xs font-medium text-amber-700">
+                            已忽略（内容无效）
+                            <span class="ml-0.5 px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700 text-[10px] font-semibold" x-text="ignoredItems.length"></span>
+                        </p>
+                        <span class="text-[10px] text-amber-600">不计入失败 · 不再自动重试</span>
+                    </div>
+                    <p class="mt-1 text-[11px] text-douyin-gray-400">音乐／无口播／无法识别出有效文本：已按「通过并忽略」处理，不展示为错误。</p>
+                    <template x-for="it in ignoredItems" :key="'ignored-' + it.aweme_id">
+                        <div class="mt-1.5 bg-amber-50/60 rounded-xl px-3 py-2">
+                            <a :href="'https://www.douyin.com/video/' + it.aweme_id" target="_blank" rel="noopener noreferrer"
+                               class="block text-xs font-medium text-douyin-gray-700 hover:text-douyin-red truncate"
+                               x-text="it.title || ('视频 ' + it.aweme_id)"></a>
+                            <p class="mt-0.5 text-[11px] text-amber-700 truncate" :title="it.error" x-text="it.error || '内容无效'"></p>
+                        </div>
+                    </template>
+                </div>
+
                 <p x-show="failedLoading" class="text-center text-xs text-douyin-gray-400 py-10">加载中...</p>
             </div>
             <!-- Footer -->
@@ -588,8 +613,9 @@
                         关闭
                     </button>
                     <button @click="retryFailedItems()" :disabled="!failedSelectedCount() || failedRetrying"
+                            title="把勾选的技术失败项加入待解析队列，按队列顺序自动重试；「已忽略（内容无效）」项不参与"
                             class="h-9 px-4 bg-douyin-gray-800 hover:bg-douyin-dark text-white text-xs rounded-lg transition-smooth disabled:opacity-40">
-                        <span x-text="failedRetrying ? '加入中...' : '重试选中项'"></span>
+                        <span x-text="failedRetrying ? '入队中...' : '重试项加入队列'"></span>
                     </button>
                 </div>
             </div>
@@ -759,11 +785,18 @@
                         <button
                             @click="smartExtract"
                             :disabled="!url || !apiKeyConfigured"
+                            :title="queuedVideoPending()
+                                ? '该链接已在待解析队列中：点击立即提前解析（插队）'
+                                : (canJumpQueue()
+                                    ? '批量已暂停：点击把该链接加入队列并立即插队解析'
+                                    : ((workBusy || loading)
+                                        ? '当前有任务或待解析队列：点击把链接加入待解析队列，当前任务结束后自动执行'
+                                        : (isProfileLink() ? '立即批量提取该 UP 主页的视频文案' : '立即提取该视频文案')))"
                             class="flex-1 h-11 bg-gradient-douyin hover:opacity-90 text-white font-medium text-sm rounded-xl transition-smooth disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 shadow-lg shadow-douyin-red/20">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
                             </svg>
-                            <span x-text="queuedVideoPending() ? '提前解析' : (canJumpQueue() ? '插队解析' : ((backendBusy || loading) ? '排队解析' : (isProfileLink() ? '批量提取文案' : '提取文案')))"></span>
+                            <span x-text="queuedVideoPending() ? '提前解析' : (canJumpQueue() ? '插队解析' : ((workBusy || loading) ? (isProfileLink() ? '批量加入队列' : '加入队列') : (isProfileLink() ? '批量提取文案' : '提取文案')))"></span>
                         </button>
                     </div>
                     <p x-show="queuedNotice" x-transition class="mt-2 text-xs text-green-600" x-text="queuedNotice"></p>
@@ -784,6 +817,7 @@
                                 </svg>
                                 失败文案
                                 <span x-show="historyFailCount" class="ml-0.5 px-1.5 py-0.5 rounded-full bg-red-500 text-white text-[10px] font-semibold" x-text="historyFailCount"></span>
+                                <span x-show="historyIgnoredCount" class="ml-0.5 px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700 text-[10px] font-semibold" x-text="'已忽略 ' + historyIgnoredCount"></span>
                             </button>
                             <button @click="openRunLogModal()"
                                     class="flex-1 h-9 border border-douyin-gray-200 hover:border-douyin-gray-400 hover:bg-douyin-gray-50 text-douyin-gray-600 text-xs rounded-lg transition-smooth flex items-center justify-center gap-1.5">
@@ -862,9 +896,9 @@
                                       title="已请求重启服务：在途视频完成后不再拉新，随即自动重启">
                                     · 重启已排队<span class="font-normal">（在途视频完成后自动重启）</span>
                                 </span>
-                                <span x-show="runNew || runSkipped" class="text-green-600 font-normal"
-                                      :title="'本轮任务新增 ' + runNew + ' 条，跳过 ' + runSkipped + ' 条，失败 ' + runFail + ' 条'">
-                                    · 本轮新增 <span x-text="runNew"></span> 条<span x-show="runSkipped" class="text-douyin-gray-400">（跳过 <span x-text="runSkipped"></span>）</span>
+                                <span x-show="runNew || runSkipped || runIgnored" class="text-green-600 font-normal"
+                                      :title="'本轮任务新增 ' + runNew + ' 条，跳过 ' + runSkipped + ' 条，忽略 ' + runIgnored + ' 条，失败 ' + runFail + ' 条'">
+                                    · 本轮新增 <span x-text="runNew"></span> 条<span x-show="runSkipped" class="text-douyin-gray-400">（跳过 <span x-text="runSkipped"></span>）</span><span x-show="runIgnored" class="text-amber-600">（忽略 <span x-text="runIgnored"></span>）</span>
                                 </span>
                             </p>
                             <div class="flex items-center gap-2">
@@ -902,7 +936,7 @@
                         </div>
                         <div x-show="runFinished" x-transition
                              class="mb-2 rounded-lg bg-green-50 border border-green-200 px-3 py-2 text-xs text-green-700">
-                            本轮任务完成：共新增 <span class="font-semibold" x-text="runNew"></span> 条文案<span x-show="runSkipped">，跳过 <span x-text="runSkipped"></span> 条</span><span x-show="runFail">，失败 <span x-text="runFail"></span> 条</span>
+                            本轮任务完成：共新增 <span class="font-semibold" x-text="runNew"></span> 条文案<span x-show="runSkipped">，跳过 <span x-text="runSkipped"></span> 条</span><span x-show="runIgnored">，忽略 <span x-text="runIgnored"></span> 条</span><span x-show="runFail">，失败 <span x-text="runFail"></span> 条</span>
                         </div>
                         <div x-show="interruptedBatch && !batchRunning && !batchDetached" x-transition
                              class="mb-2 rounded-lg bg-amber-50 border border-amber-300 px-3 py-2 text-xs text-amber-800 flex items-center justify-between gap-3">
@@ -940,7 +974,7 @@
                                         @click="clearAllQueue()"
                                         title="一键清空整个任务队列（待执行与已完成全部删除；正在处理的一条会保留）"
                                         class="text-xs text-douyin-red/70 hover:text-douyin-red">清空队列</button>
-                                <button x-show="pendingLinks.some(i => i.status === 'done' || i.status === 'fail' || i.status === 'skip')"
+                                <button x-show="pendingLinks.some(i => i.status === 'done' || i.status === 'fail' || i.status === 'skip' || i.status === 'ignored')"
                                         @click="clearFinishedLinks()"
                                         class="text-xs text-douyin-gray-400 hover:text-douyin-gray-600">清除已完成</button>
                             </div>
@@ -1013,30 +1047,30 @@
                                     继续上次刷新任务
                                 </button>
                                 <button x-show="authors.length" @click="startBackendRefreshAll()"
-                                        :title="(backendBusy || authorQueueRunning)
-                                            ? '当前有任务在运行：点击把全部 UP 加入待解析队列，已在队列中的自动去重，当前任务结束后按队列顺序自动执行'
+                                        :title="workBusy
+                                            ? '当前有任务或待解析队列：点击把全部 UP 加入待解析队列，已在队列中的自动去重，当前任务结束后按队列顺序自动执行'
                                             : '以后台脚本方式静默刷新全部 UP：关闭浏览器不中断，页面实时显示进度，可随时终止'"
-                                        :class="(backendBusy || authorQueueRunning)
+                                        :class="workBusy
                                             ? 'bg-amber-50 text-amber-700 hover:bg-amber-100 border-amber-200'
                                             : 'bg-douyin-red/10 text-douyin-red hover:bg-douyin-red/20 border-douyin-red/30'"
                                         class="text-xs px-2.5 py-1 rounded-lg border transition-smooth flex items-center gap-1">
                                     <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
                                         <path d="M8 5v14l11-7z"/>
                                     </svg>
-                                    <span x-text="(backendBusy || authorQueueRunning) ? '全部UP加入队列' : '一键刷新全部'"></span>
+                                    <span x-text="workBusy ? '全部UP加入队列' : '一键刷新全部'"></span>
                                 </button>
                                 <button x-show="authors.length" @click="batchTodayLeft()"
-                                        :title="(backendBusy || authorQueueRunning)
-                                            ? '当前有任务在运行：点击把今天还没批量过的 UP 加入待解析队列（已在队列中的自动去重），当前任务结束后自动执行'
+                                        :title="workBusy
+                                            ? '当前有任务或待解析队列：点击把今天还没批量过的 UP 加入待解析队列（已在队列中的自动去重），当前任务结束后自动执行'
                                             : '只批量今天没跑过的 UP：按「最近批量」日期判定，已提取的视频自动跳过；可用「停止队列」中断，中断后可「继续上次刷新任务」'"
-                                        :class="(backendBusy || authorQueueRunning)
+                                        :class="workBusy
                                             ? 'bg-amber-50 text-amber-700 hover:bg-amber-100 border-amber-200'
                                             : 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border-emerald-200'"
                                         class="text-xs px-2.5 py-1 rounded-lg border transition-smooth flex items-center gap-1">
                                     <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
                                         <path d="M12 2a10 10 0 1 0 10 10h-2a8 8 0 1 1-8-8V2zm1 4v6l5 3-.9 1.6L11 12V6h2z"/>
                                     </svg>
-                                    <span x-text="(backendBusy || authorQueueRunning) ? '今日未跑UP入队' : '批量今日未跑UP'"></span>
+                                    <span x-text="workBusy ? '今日未跑UP加入队列' : '批量今日未跑UP'"></span>
                                 </button>
                                 <button @click="loadAuthors()"
                                         title="从后端重新拉取已提取作者列表（入队的新 UP 会立刻出现）"
@@ -1397,7 +1431,8 @@
                 batchDone: 0,
                 runNew: 0,                 // 本轮任务新增的文案条数（跨 UP 累计）
                 runSkipped: 0,             // 本轮跳过的条数（之前已提取过）
-                runFail: 0,                // 本轮失败的条数
+                runIgnored: 0,             // 本轮内容无效、按通过并忽略的条数
+                runFail: 0,                // 本轮技术失败的条数
                 runFinished: false,        // 本轮任务已结束（用于展示汇总条）
                 queueRemaining: 0,        // 后端待解析队列：当前 item 之后还剩几项（收尾判定用）
                 batchUseCache: false,
@@ -1408,11 +1443,13 @@
                 pendingLinkInput: '',
                 pendingLinkBusy: false,
                 pendingLinkMsg: '',
-                queuedNotice: '',          // 主输入框「排队解析」的反馈提示
+                queuedNotice: '',          // 主输入框「加入队列」的反馈提示
                 showPendingModal: false,   // 待解析列表独立管理弹窗
                 showFailedModal: false,    // 失败文案清单弹窗
-                historyFailCount: 0,       // 历史失败总数（入口徽标）
-                failedItems: [],           // history.json 中的 fail 记录
+                historyFailCount: 0,       // 历史技术失败总数（入口红色徽标）
+                historyIgnoredCount: 0,    // 历史内容无效已忽略总数（琥珀色徽标）
+                failedItems: [],           // history.json 中的技术失败（fail）
+                ignoredItems: [],          // history.json 中的内容无效忽略（ignored）
                 failedSelected: {},        // aweme_id -> bool
                 failedLoading: false,
                 failedRetrying: false,
@@ -1464,6 +1501,36 @@
                     // the backend script task (全UP刷新 driver). While busy,
                     // new tasks are blocked (the backend enforces it too).
                     return this.batchActive || !!this.driverTask;
+                },
+
+                get queuePending() {
+                    // True while the manual queue has work that has not started.
+                    // batchRunning only flips after the runner's 2s start delay,
+                    // so without this the refresh-all button kept offering the
+                    // driver during that gap (backend now refuses the driver
+                    // there too; this keeps the button honest immediately).
+                    return this.pendingLinks.some(
+                        it => it.status === 'pending' || it.status === 'running');
+                },
+
+                get workBusy() {
+                    // 单一“忙”判定源：待解析队列有 pending/running、WebUI 批量在跑、
+                    // 后端全UP刷新 driver 在跑、或本页逐个刷新链在跑。
+                    // 所有“开始解析/提取”类按钮的文案、tooltip、确认文案与
+                    // 点击分支都只看这一个 getter，避免各按钮各写一套条件。
+                    return this.queuePending || this.batchActive
+                        || !!this.driverTask || this.authorQueueRunning;
+                },
+
+                get workBusyReason() {
+                    // 与 workBusy 配套的单一原因文案（二次确认弹窗共用）。
+                    if (this.batchActive || this.driverTask || this.authorQueueRunning) {
+                        return '当前有任务在运行。';
+                    }
+                    if (this.queuePending) {
+                        return '当前有待解析队列还没开始执行。';
+                    }
+                    return '';
                 },
 
                 get driverProgressText() {
@@ -1564,6 +1631,7 @@
                         const res = await fetch('/api/profile/history');
                         const data = await res.json();
                         this.historyFailCount = data.fail || 0;
+                        this.historyIgnoredCount = data.ignored || 0;
                     } catch (e) { /* ignore */ }
                 },
 
@@ -1591,16 +1659,18 @@
                         this.runNew = task.run_new || 0;
                         this.runSkipped = task.run_skipped || 0;
                         this.runFail = task.run_fail || 0;
+                        this.runIgnored = task.run_ignored || 0;
                         this.runFinished = false;
                         if (typeof st.run_ok === 'number'
-                            && !st.run_ok && !st.run_skip && !st.run_fail) {
-                            this._seedRunStats(this.runNew, this.runSkipped, this.runFail);
+                            && !st.run_ok && !st.run_skip && !st.run_fail && !st.run_ignored) {
+                            this._seedRunStats(this.runNew, this.runSkipped, this.runFail, this.runIgnored);
                         }
                     } else if (typeof st.run_ok === 'number') {
                         // 无任务文件：直接采用服务端权威累计（进程未重启即为上一轮值）
                         this.runNew = st.run_ok;
                         this.runSkipped = st.run_skip;
                         this.runFail = st.run_fail;
+                        this.runIgnored = st.run_ignored || 0;
                         this.runFinished = false;
                     }
                     if (!st.batch_running) {
@@ -1649,13 +1719,13 @@
                     }
                 },
 
-                _seedRunStats(ok, skip, fail) {
+                _seedRunStats(ok, skip, fail, ignored = 0) {
                     // 把「继续上次刷新任务」恢复的累计灌进后端权威值（进程重启后
                     // _run_stats 归零，不灌回的话 6s 对账会把显示拉回 0）
                     fetch('/api/profile/run-stats/seed', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ ok, skip, fail })
+                        body: JSON.stringify({ ok, skip, fail, ignored })
                     }).catch(() => {});
                 },
 
@@ -1694,7 +1764,8 @@
                         // 本轮新增统计：随任务落盘，刷新/重启后仍能接着累计
                         run_new: this.runNew,
                         run_skipped: this.runSkipped,
-                        run_fail: this.runFail
+                        run_fail: this.runFail,
+                        run_ignored: this.runIgnored
                     };
                     this.lastTaskInfo = task;
                     this.hasLastTask = true;
@@ -1763,9 +1834,10 @@
                     this.runNew = task.run_new || 0;
                     this.runSkipped = task.run_skipped || 0;
                     this.runFail = task.run_fail || 0;
+                    this.runIgnored = task.run_ignored || 0;
                     this.runFinished = false;
                     // 灌回后端权威值（服务重启后内存清零，否则 6s 对账会拉回 0）
-                    this._seedRunStats(this.runNew, this.runSkipped, this.runFail);
+                    this._seedRunStats(this.runNew, this.runSkipped, this.runFail, this.runIgnored);
                     this.authorQueueDone = (task.done || []).slice();
                     this.authorQueue = pending
                         .map(n => this.authors.find(a => a.name === n))
@@ -2013,9 +2085,9 @@
                     const list = this._notBatchedToday();
                     if (!list.length) { this.showToast('今天所有 UP 都已批量过'); return; }
                     const videos = list.reduce((s, a) => s + (a.video_count || 0), 0);
-                    if (this.backendBusy || this.authorQueueRunning) {
+                    if (this.workBusy) {
                         // 忙时不打断：与「全部UP加入队列」同一路径（后端去重＋runner 等锁）
-                        if (!confirm(`当前有任务在运行。\n\n把今天未批量的 ${list.length} 位 UP 加入待解析队列？（已在队列中的自动去重）\n\n当前任务结束后会按队列顺序自动执行。`)) return;
+                        if (!confirm(`${this.workBusyReason}\n\n把今天未批量的 ${list.length} 位 UP 加入待解析队列？（已在队列中的自动去重）\n\n当前任务结束后会按队列顺序自动执行。`)) return;
                         try {
                             const res = await fetch('/api/pending-links', {
                                 method: 'POST',
@@ -2058,13 +2130,13 @@
                 pendingKindLabel(it) { return it.kind === 'up' ? 'UP主页' : '单个视频'; },
                 pendingStatusLabel(st) {
                     return st === 'running' ? '处理中' : st === 'done' ? '已完成'
-                         : st === 'fail' ? '失败' : st === 'skip' ? '已忽略' : '待处理';
+                         : st === 'fail' ? '失败' : (st === 'skip' || st === 'ignored') ? '已忽略' : '待处理';
                 },
                 pendingStatusClass(st) {
                     return st === 'running' ? 'bg-red-50 text-douyin-red'
                          : st === 'done' ? 'bg-green-50 text-green-600'
                          : st === 'fail' ? 'bg-red-100 text-red-600'
-                         : st === 'skip' ? 'bg-amber-50 text-amber-600'
+                         : (st === 'skip' || st === 'ignored') ? 'bg-amber-50 text-amber-600'
                          : 'bg-douyin-gray-100 text-douyin-gray-500';
                 },
 
@@ -2079,8 +2151,10 @@
                         const res = await fetch('/api/history/failed');
                         const data = await res.json();
                         this.failedItems = data.items || [];
-                        this.historyFailCount = this.failedItems.length;
-                        // 默认全选
+                        this.ignoredItems = data.ignored_items || [];
+                        this.historyFailCount = data.count ?? this.failedItems.length;
+                        this.historyIgnoredCount = data.ignored_count ?? this.ignoredItems.length;
+                        // 默认全选（仅技术失败；忽略项不参与重试）
                         const sel = {};
                         this.failedItems.forEach(it => { sel[it.aweme_id] = true; });
                         this.failedSelected = sel;
@@ -2089,6 +2163,17 @@
                     } finally {
                         this.failedLoading = false;
                     }
+                },
+                failedCategoryLabel(category) {
+                    return category === 'audio_corrupt' ? '坏音频（不可解析）'
+                         : category === 'download' ? '下载失败' : '技术失败';
+                },
+                failedCategoryClass(category) {
+                    return category === 'audio_corrupt'
+                        ? 'bg-amber-50 text-amber-700 border border-amber-200'
+                        : category === 'download'
+                        ? 'bg-blue-50 text-blue-600 border border-blue-200'
+                        : 'bg-red-50 text-red-600 border border-red-200';
                 },
                 toggleFailedItem(id) {
                     this.failedSelected[id] = !this.failedSelected[id];
@@ -2229,7 +2314,7 @@
                             this.showToast(`这 ${urls.length} 条都已在待解析队列中，未重复加入`);
                         } else {
                             const extra = dup ? `，另有 ${dup} 条已在队列中跳过` : '';
-                            this.showToast(`已加入 ${added} 条失败视频到待解析队列${extra}${(this.batchActive || this.loading || this.backendBusy) ? '，当前任务结束后自动执行' : '，即将开始'}`);
+                            this.showToast(`已加入 ${added} 条失败视频到待解析队列${extra}${(this.workBusy || this.loading) ? '，当前任务结束后自动执行' : '，即将开始'}`);
                         }
                     } catch (e) {
                         this.showToast('加入队列失败，请重试');
@@ -2312,7 +2397,7 @@
                     } catch (e) { /* ignore */ }
                 },
 
-                // ---------- 主输入框「排队解析」：忙时点击 = 加入待解析队列 ----------
+                // ---------- 主输入框「加入队列」：忙时点击 = 加入待解析队列 ----------
                 async queueFromMainInput() {
                     const text = (this.url || '').trim();
                     if (!text) return;
@@ -2377,6 +2462,7 @@
                                 this.runNew = st.run_ok;
                                 this.runSkipped = st.run_skip;
                                 this.runFail = st.run_fail;
+                                this.runIgnored = st.run_ignored || 0;
                             }
                             // 暂停状态同样以后端为准（页面刷新/重接流后不失忆）
                             if (st.batch_running) {
@@ -2571,10 +2657,10 @@
                     // 手动批量让出浏览器 profile 后才执行，所以入队永远是安全的，
                     // 不需要抢占正在跑的任务。
                     if (!this.authors.length) return;
-                    if (this.backendBusy || this.authorQueueRunning) {
+                    if (this.workBusy) {
                         const known = this.authors.filter(a => a.profile_url);
                         if (!known.length) return;
-                        if (!confirm(`当前有任务在运行。\n\n把全部 ${known.length} 位 UP 加入待解析队列？（已在队列中的会自动去重）\n\n当前任务结束后会按队列顺序自动执行。`)) return;
+                        if (!confirm(`${this.workBusyReason}\n\n把全部 ${known.length} 位 UP 加入待解析队列？（已在队列中的会自动去重）\n\n当前任务结束后会按队列顺序自动执行。`)) return;
                         try {
                             const res = await fetch('/api/pending-links', {
                                 method: 'POST',
@@ -2656,11 +2742,11 @@
                     }
 
                     // 忙时不打断：把链接加入待解析队列（UP/视频自动识别）
-                    // 注意必须把后端轮询出来的 batchDetached / batchRunning 也算
-                    // 进来：页面刷新或断流后本地 batchActive 为 false，但后端其实
-                    // 还在跑；只看本地状态会去「启动新任务」，被后端 409 拒绝，
-                    // 用户看到的就是「添加排队失败」。
-                    if (this.batchActive || this.loading || this.batchDetached || this.batchRunning) {
+                    // workBusy 同一判定源覆盖：待解析队列 pending/running、后端
+                    // 轮询出的 batchDetached/batchRunning（页面刷新或断流后本地
+                    // batchActive 为 false 但后端其实还在跑）、driver 与本页刷新链。
+                    // 只看本地状态会去「启动新任务」，被后端 409 拒绝或顶掉刚入队任务。
+                    if (this.workBusy || this.loading) {
                         await this.queueFromMainInput();
                         return;
                     }
@@ -2884,7 +2970,11 @@
                             this.addBatchLog(`[OK] ${evt.aweme_id} ${evt.title || ''}`, 'ok');
                         } else if (evt.status === 'skip') {
                             this.batchDone++;
-                            this.addBatchLog(`[跳过] ${evt.aweme_id} ${evt.title || ''}（已提取过）`, 'skip');
+                            if (evt.ignored) {
+                                this.addBatchLog(`[忽略] ${evt.aweme_id} ${evt.title || ''}（${evt.error || '内容无效'}）`, 'skip');
+                            } else {
+                                this.addBatchLog(`[跳过] ${evt.aweme_id} ${evt.title || ''}（${evt.error || '已提取过'}）`, 'skip');
+                            }
                         } else if (evt.status === 'fail') {
                             this.batchDone++;
                             this.addBatchLog(`[失败] ${evt.aweme_id} ${evt.title || ''} - ${evt.error || ''}`, 'error');
@@ -2894,6 +2984,7 @@
                         if (typeof evt.run_ok === 'number') this.runNew = evt.run_ok;
                         if (typeof evt.run_skip === 'number') this.runSkipped = evt.run_skip;
                         if (typeof evt.run_fail === 'number') this.runFail = evt.run_fail;
+                        if (typeof evt.run_ignored === 'number') this.runIgnored = evt.run_ignored;
                     } else if (stage === 'notice') {
                         this.addBatchLog(evt.message || '', 'warn');
                     } else if (stage === 'queue') {
@@ -2911,8 +3002,8 @@
                     } else if (stage === 'billing_paused') {
                         this.addBatchLog(`已自动暂停：成功 ${evt.ok ?? 0}，跳过 ${evt.skip ?? 0}，失败 ${evt.fail ?? 0}（充值后重跑可续传）`, 'warn');
                     } else if (stage === 'done') {
-                        this.addBatchLog(`完成：成功 ${evt.ok}，跳过 ${evt.skip}，失败 ${evt.fail}。输出目录: ${evt.output_dir}`, 'ok');
-                        this.showToast(`批量完成：成功 ${evt.ok}，跳过 ${evt.skip}，失败 ${evt.fail}`);
+                        this.addBatchLog(`完成：成功 ${evt.ok}，跳过 ${evt.skip}，忽略 ${evt.ignored ?? 0}，失败 ${evt.fail}。输出目录: ${evt.output_dir}`, 'ok');
+                        this.showToast(`批量完成：成功 ${evt.ok}，跳过 ${evt.skip}，忽略 ${evt.ignored ?? 0}，失败 ${evt.fail}`);
                     } else if (stage === 'aborted') {
                         this.addBatchLog(`已终止：成功 ${evt.ok ?? 0}，跳过 ${evt.skip ?? 0}，失败 ${evt.fail ?? 0}（已完成的文案保留）`, 'warn');
                         this.showToast('任务已终止');
@@ -3103,7 +3194,7 @@
 
                     // 忙时主输入也可以点：把链接加入待解析队列，当前任务结束后自动执行
                     // （WebUI 批量 / 后端刷新 driver / 本页解析中一律入队，不打断）
-                    if (this.backendBusy || this.loading) {
+                    if (this.workBusy || this.loading) {
                         // 批量已暂停时，单个视频链接还可以选择插队立即解析
                         if (this.canJumpQueue()) {
                             await this.jumpQueueExtract();

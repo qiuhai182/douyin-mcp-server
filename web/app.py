@@ -338,7 +338,7 @@ _batch_state = {"running": False}
 # authoritative source (exposed via /api/service/status) so a page reload or
 # a dropped SSE stream never loses the totals. Reset ONLY when a NEW run is
 # triggered: a manual batch (chain=False), a fresh queue-runner loop.
-_run_stats = {"ok": 0, "skip": 0, "fail": 0}
+_run_stats = {"ok": 0, "skip": 0, "fail": 0, "ignored": 0}
 
 
 def _reset_run_stats() -> None:
@@ -346,6 +346,7 @@ def _reset_run_stats() -> None:
     _run_stats["ok"] = 0
     _run_stats["skip"] = 0
     _run_stats["fail"] = 0
+    _run_stats["ignored"] = 0
 
 
 # Set by a finishing manual batch that hands straight off to queued links
@@ -423,11 +424,17 @@ def _batch_publish(event: dict) -> None:
     # (re)adopts the authoritative numbers instead of double-counting.
     if event.get("stage") == "extract":
         _st = event.get("status")
-        if _st in ("ok", "skip", "fail"):
+        _is_ignored = bool(event.get("ignored"))
+        # 内容无效事件沿用 status="skip" 的三态契约，但不能再计一次 skip，
+        # 否则「跳过」和「忽略」会重复计数。
+        if _st in ("ok", "fail") or (_st == "skip" and not _is_ignored):
             _run_stats[_st] += 1
+        if _is_ignored:
+            _run_stats["ignored"] += 1
         event["run_ok"] = _run_stats["ok"]
         event["run_skip"] = _run_stats["skip"]
         event["run_fail"] = _run_stats["fail"]
+        event["run_ignored"] = _run_stats["ignored"]
     if event.get("stage") == "billing_shortage":
         # 欠费自动暂停：持久化告警旗标（页面刷新/服务重启都不丢）并置暂停位，
         # 让队列接续的下一项也保持暂停，充值后点「继续」才恢复。
@@ -881,6 +888,18 @@ def _pending_items() -> list:
         return _load_pending()["items"]
 
 
+def _queue_has_pending() -> bool:
+    """True while the manual queue still has work that has not started.
+
+    The queue runner only flips ``_batch_state["running"]`` after its 2s
+    start delay, so a "queued but not started yet" item would otherwise be
+    invisible to the refresh-all busy check and let the driver start.
+    """
+    with _pending_lock:
+        return any(it.get("status") in ("pending", "running")
+                   for it in _load_pending()["items"])
+
+
 def _backfill_queue_titles(url: str, name: str) -> None:
     """Label queued/running UP items with the resolved nickname.
 
@@ -1024,6 +1043,16 @@ def _pending_add(urls: list, titles: list = None) -> tuple:
         data = _load_pending()
         queued = {_queue_url_key(it["url"]) for it in data["items"]
                   if it["status"] in ("pending", "running")}
+        # 失败项重试时复用原行，而不是每次追加一条新行：否则失败清单越点越长，
+        # 既看不清这条到底重试过几次，也会把同一个失败重复计入统计。
+        failed = {}
+        for it in data["items"]:
+            if it.get("status") not in ("fail", "ignored"):
+                continue
+            try:
+                failed[_queue_url_key(it["url"])] = it
+            except Exception:
+                continue
         for idx, raw in enumerate(urls):
             url = (raw or "").strip()
             if not url or not re.match(r"^https?://", url, re.I):
@@ -1037,10 +1066,31 @@ def _pending_add(urls: list, titles: list = None) -> tuple:
                 dup += 1
                 continue
             title = (titles[idx].strip() if idx < len(titles) and titles[idx] else "")
+            reuse = failed.pop(url, None)
+            if reuse is not None:
+                reuse.update({
+                    "status": "pending",
+                    "title": title or reuse.get("title", ""),
+                    "result": "",
+                    "terminal": False,
+                    "started_at": "", "finished_at": "",
+                    "requeued_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                })
+                if kind == "up":
+                    try:
+                        from batch_extractor import author_registry
+                        author_registry.ensure_registered(
+                            url, reuse.get("title", ""))
+                    except Exception:
+                        pass
+                queued.add(url)
+                added += 1
+                continue
             data["items"].append({
                 "id": data["next_id"], "url": url,
                 "kind": kind, "status": "pending",
                 "title": title,
+                "attempts": 0, "terminal": False,
                 "added_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "started_at": "", "finished_at": "", "result": "",
             })
@@ -1130,7 +1180,7 @@ def _pending_clear_finished() -> int:
     with _pending_lock:
         data = _load_pending()
         before = len(data["items"])
-        data["items"] = [it for it in data["items"] if it["status"] not in ("done", "fail", "skip")]
+        data["items"] = [it for it in data["items"] if it["status"] not in ("done", "fail", "skip", "ignored")]
         removed = before - len(data["items"])
         if removed:
             _save_pending(data)
@@ -1168,7 +1218,8 @@ def _pending_reorder(ids: list) -> bool:
         return True
 
 
-def _pending_mark(item_id: int, status: str, result: str = "") -> None:
+def _pending_mark(item_id: int, status: str, result: str = "",
+                  terminal: bool = False) -> None:
     from datetime import datetime
     with _pending_lock:
         data = _load_pending()
@@ -1176,7 +1227,8 @@ def _pending_mark(item_id: int, status: str, result: str = "") -> None:
             if it["id"] == item_id:
                 it["status"] = status
                 it["result"] = (result or "")[:300]
-                if status in ("done", "fail"):
+                it["terminal"] = bool(terminal)
+                if status in ("done", "fail", "ignored"):
                     it["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 break
         _save_pending(data)
@@ -1190,6 +1242,8 @@ def _pending_pop_next() -> dict:
         for it in data["items"]:
             if it["status"] == "pending":
                 it["status"] = "running"
+                it["attempts"] = int(it.get("attempts", 0) or 0) + 1
+                it["terminal"] = False
                 it["started_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 _save_pending(data)
                 return it
@@ -1285,6 +1339,29 @@ def _pending_api_key() -> str:
         or os.getenv("DASHSCOPE_API_KEY", "") or os.getenv("ARK_API_KEY", "")
 
 
+def _history_mark_video_outcome(url: str, title: str, error: str,
+                                terminal: bool) -> None:
+    """Write a queue-run outcome back into history.json.
+
+    内容无效（音乐/无口播）记 ``ignored``，不占失败数；下载/ffmpeg 这类技术
+    失败仍记 ``fail``，保留重试。_extract_single_video 也会写，但重试可能在
+    解析出 video_id 之前就失败，这里是兜底。
+    """
+    m = re.search(r"/video/(\d+)", url or "")
+    if not m:
+        return
+    try:
+        from batch_extractor import TranscriptHistory
+        h = TranscriptHistory()
+        aweme_id = m.group(1)
+        if terminal:
+            h.mark_ignored(aweme_id, title or "", str(error))
+        elif h.status_of(aweme_id) in ("fail", "", "ignored"):
+            h.mark_fail(aweme_id, title or "", str(error), terminal=False)
+    except Exception:
+        pass
+
+
 def _pending_run_item(item: dict) -> None:
     """Run one queued link (batch lock already held). Publishes progress on
     the same SSE channel as manual batches, so the WebUI shows it the same way."""
@@ -1310,11 +1387,27 @@ def _pending_run_item(item: dict) -> None:
                         "title": item.get("title") or item.get("url", ""),
                         "status": "skip", "error": str(e)[:300]})
     except Exception as e:
-        _pending_mark(item["id"], "fail", result=str(e))
+        from asr_backends import is_terminal_error
+        terminal = is_terminal_error(str(e))
+        if item["kind"] == "video":
+            _history_mark_video_outcome(item.get("url", ""),
+                                        item.get("title") or "",
+                                        str(e), terminal)
+        if terminal:
+            # 内容无效：不进失败数、不显示红色错误，也不再自动重试。
+            _pending_mark(item["id"], "ignored", result=str(e),
+                          terminal=True)
+        else:
+            _pending_mark(item["id"], "fail", result=str(e),
+                          terminal=False)
         # 带上视频身份，避免重试失败在执行日志里变成 video_id/title 全空的
         # 匿名 error 行，事后无法定位是哪条视频。
         _m = re.search(r"/video/(\d+)", item.get("url") or "")
-        _batch_publish({"stage": "error", "error": str(e)[:400],
+        _batch_publish({"stage": "extract" if terminal else "error",
+                        "index": 1, "total": 1,
+                        "status": "skip" if terminal else "fail",
+                        "error": (("已忽略（内容无效）：" + str(e))[:400]
+                                  if terminal else str(e)[:400]),
                         "aweme_id": _m.group(1) if _m else "",
                         "title": item.get("title") or ""})
     finally:
@@ -1778,6 +1871,7 @@ async def service_status():
         "run_ok": _run_stats["ok"],
         "run_skip": _run_stats["skip"],
         "run_fail": _run_stats["fail"],
+        "run_ignored": _run_stats["ignored"],
         # Dynamic concurrency: current parallel-video cap (auto CPU throttling)
         "dyn_workers": _dyn_workers_now(),
         "dyn_cpu": _dyn_monitor["cpu"],
@@ -1812,6 +1906,7 @@ class RunStatsSeedRequest(BaseModel):
     ok: int = 0
     skip: int = 0
     fail: int = 0
+    ignored: int = 0
 
 
 @app.post("/api/profile/run-stats/seed")
@@ -1826,6 +1921,7 @@ async def run_stats_seed(req: RunStatsSeedRequest):
     _run_stats["ok"] = max(0, int(req.ok))
     _run_stats["skip"] = max(0, int(req.skip))
     _run_stats["fail"] = max(0, int(req.fail))
+    _run_stats["ignored"] = max(0, int(req.ignored))
     return {"status": "ok"}
 
 
@@ -1887,9 +1983,11 @@ async def refresh_all_start(req: RefreshAllRequest):
     detail = _driver_busy_detail() if _driver_info() else ""
     if detail:
         raise HTTPException(status_code=409, detail=detail)
-    if _batch_state["running"] or _extract_busy:
-        # 排队而非等待：WebUI 批量运行时把全部 UP 追加进待解析队列，
-        # 当前任务结束后 runner 自动继续，无需人工等待或反复重试。
+    if _batch_state["running"] or _extract_busy or _queue_has_pending():
+        # 排队而非等待：WebUI 批量运行中/待解析队列刚入队但 runner 尚未
+        # 拿到全局锁时，都把全部 UP 追加进待解析队列。后者是关键空窗期：
+        # _batch_state["running"] 要等 2s 延迟后才置位，若此时启动 driver，
+        # 队列项会被 driver 长时间压在后面（不是被删除，但优先级被顶掉）。
         try:
             authors = json.loads(
                 (ROOT / "authors.json").read_text(encoding="utf-8"))
@@ -1902,7 +2000,7 @@ async def refresh_all_start(req: RefreshAllRequest):
         if added:
             log_operation("refreshall.queued", count=added, duplicates=dup)
         return {"status": "queued",
-                "notice": (f"批量任务正在运行：已把 {added} 位 UP 追加进"
+                "notice": (f"当前已有任务/待解析队列：已把 {added} 位 UP 追加进"
                            f"待解析队列（重复 {dup} 条），跑完当前任务后自动继续")}
     ps1 = ROOT / "scripts" / "refresh_guarded.ps1"
     if not ps1.exists():
@@ -2121,6 +2219,7 @@ class RefreshTaskRequest(BaseModel):
     run_new: int = 0     # transcripts added so far this run (completed UPs)
     run_skipped: int = 0
     run_fail: int = 0
+    run_ignored: int = 0
 
 
 @app.get("/api/refresh-task")
@@ -2245,26 +2344,70 @@ async def profile_history():
     from batch_extractor import TranscriptHistory
     h = TranscriptHistory()
     counts = h.counts()
-    return {"count": counts["ok"], "ok": counts["ok"], "fail": counts["fail"]}
+    return {"count": counts["ok"], "ok": counts["ok"], "fail": counts["fail"],
+            "ignored": counts.get("ignored", 0),
+            "skip": counts.get("skip", 0)}
+
+
+def _failure_category(error: str) -> str:
+    """Display-only sub-category for a technical failure.
+
+    `audio_corrupt` (ffmpeg cannot decode the AAC stream) and `download`
+    failures stay retriable `fail` entries - they must never be folded into
+    the content-invalid `ignored` bucket.
+    """
+    text = (error or "").lower()
+    if any(k in text for k in ("ffmpeg", "decode error", "conversion failed",
+                               "invalid data found", "audio stream")):
+        return "audio_corrupt"
+    if any(k in text for k in ("download", "remotedisconnected", "timed out",
+                               "timeout", "http", "connection", "ssl")):
+        return "download"
+    return "technical"
 
 
 @app.get("/api/history/failed")
 async def history_failed():
-    """List of videos whose extraction failed (history.json fail entries)."""
+    """Technical failures (retriable) separated from content-invalid ignores.
+
+    Content-invalid entries (music / no speech / unrecognizable) are NOT
+    failures: they are listed under `ignored_items` for transparency only and
+    never counted in `count`.
+    """
     from batch_extractor import TranscriptHistory
     h = TranscriptHistory()
     items = []
+    ignored_items = []
     for aweme_id, entry in h._data.items():
-        if entry.get("status", "ok") != "fail":
-            continue
-        items.append({
-            "aweme_id": aweme_id,
-            "title": entry.get("title", ""),
-            "error": entry.get("error", ""),
-            "extracted_at": entry.get("extracted_at", ""),
-        })
+        status = entry.get("status", "ok")
+        if status == "fail":
+            error = entry.get("error", "")
+            items.append({
+                "aweme_id": aweme_id,
+                "title": entry.get("title", ""),
+                "error": error,
+                "extracted_at": entry.get("extracted_at", ""),
+                "category": _failure_category(error),
+            })
+        elif status == "ignored":
+            ignored_items.append({
+                "aweme_id": aweme_id,
+                "title": entry.get("title", ""),
+                "error": entry.get("error", ""),
+                "extracted_at": entry.get("extracted_at", ""),
+                "ignored_at": entry.get("ignored_at", ""),
+            })
     items.sort(key=lambda x: x["extracted_at"], reverse=True)
-    return {"items": items, "count": len(items)}
+    ignored_items.sort(key=lambda x: x.get("ignored_at") or x["extracted_at"],
+                       reverse=True)
+    return {
+        "items": items,
+        "count": len(items),
+        "ignored_items": ignored_items,
+        "ignored_count": len(ignored_items),
+        "audio_corrupt_count": sum(
+            1 for it in items if it["category"] == "audio_corrupt"),
+    }
 
 
 @app.get("/api/authors")
@@ -2404,10 +2547,17 @@ def _extract_single_video(url: str, api_key: str, provider: str = None,
         # 清单」永远停留在首次失败的记录上，看起来像重试没生效。
         try:
             from batch_extractor import TranscriptHistory
+            from asr_backends import is_terminal_error
             h = TranscriptHistory()
-            if h.status_of(video_info["video_id"]) == "fail":
-                h.mark_fail(video_info["video_id"],
-                            video_info.get("title", ""), str(e))
+            vid = video_info["video_id"]
+            terminal = is_terminal_error(str(e))
+            if h.status_of(vid) in ("fail", "", "ignored"):
+                if terminal:
+                    h.mark_ignored(vid, video_info.get("title", ""),
+                                   str(e))
+                else:
+                    h.mark_fail(vid, video_info.get("title", ""), str(e),
+                                terminal=False)
         except Exception:
             pass
         raise

@@ -248,6 +248,21 @@ def _check_text_or_raise(text: str, provider: str) -> str:
     return text.strip()
 
 
+# 确定性拒绝：同一段音频重下重转必然得到同一段文本，重试不会改变结论。
+# 只有下载/网络/ffmpeg/欠费这类外部错误才值得再排一次队。
+TERMINAL_ERROR_MARKERS = (
+    "asr_suspect",
+    "all_segments_suspect",
+    "no text recognized",
+)
+
+
+def is_terminal_error(message: str) -> bool:
+    """True when retrying the same URL cannot plausibly change the outcome."""
+    text = (message or "").lower()
+    return any(marker in text for marker in TERMINAL_ERROR_MARKERS)
+
+
 def resolve_backend(
     api_key: Optional[str] = None,
     provider: Optional[str] = None,
