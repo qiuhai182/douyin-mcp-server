@@ -124,10 +124,23 @@ def _split_chunks(text: str, max_chars: int) -> List[str]:
 
 
 def _call_polish(api_base_url: str, api_key: str, model: str,
-                 chunk: str, retries: int) -> str:
-    """Polish a single chunk with retry + backoff. Returns the raw chunk on failure."""
+                 chunk: str, retries: int,
+                 stats: Optional[list] = None) -> str:
+    """Polish a single chunk with retry + backoff. Returns the raw chunk on failure.
+
+    stats: optional list, appended once with {"attempts": n, "ok": bool} so
+    callers can report the REAL retry count (never inferred from duration).
+    """
     attempts = max(1, retries)
+    used = 0
+
+    def _finish(result: str, ok: bool) -> str:
+        if stats is not None:
+            stats.append({"attempts": used, "ok": ok})
+        return result
+
     for attempt in range(attempts):
+        used = attempt + 1
         try:
             resp = requests.post(
                 api_base_url,
@@ -152,9 +165,9 @@ def _call_polish(api_base_url: str, api_key: str, model: str,
                     content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
                 except (ValueError, KeyError, IndexError, TypeError):
                     logger.warning("Polish: unparseable 200 response, keeping raw chunk")
-                    return chunk
+                    return _finish(chunk, True)
                 cleaned = _clean_output(content)
-                return cleaned or chunk
+                return _finish(cleaned or chunk, True)
             if resp.status_code in _RETRYABLE_STATUS:
                 logger.warning(
                     "Polish: HTTP %s, attempt %d/%d",
@@ -165,7 +178,7 @@ def _call_polish(api_base_url: str, api_key: str, model: str,
                     "Polish: non-retryable HTTP %s: %s",
                     resp.status_code, resp.text[:200],
                 )
-                return chunk
+                return _finish(chunk, False)
         except requests.exceptions.RequestException as e:
             logger.warning("Polish: request error (attempt %d/%d): %s",
                            attempt + 1, attempts, e)
@@ -176,7 +189,7 @@ def _call_polish(api_base_url: str, api_key: str, model: str,
         if attempt < attempts - 1:
             time.sleep(min(2 ** attempt, 8))
 
-    return chunk
+    return _finish(chunk, False)
 
 
 def polish_transcript(text: str, api_key: Optional[str] = None,
@@ -184,11 +197,15 @@ def polish_transcript(text: str, api_key: Optional[str] = None,
                       model: Optional[str] = None,
                       max_chars: int = 20000,
                       max_workers: int = 4,
-                      retries: int = _DEFAULT_RETRIES) -> str:
+                      retries: int = _DEFAULT_RETRIES,
+                      stats: Optional[list] = None) -> str:
     """Polish raw ASR text with an LLM. Long texts are processed in chunks.
 
     Never raises on failure - returns the original text so extraction
     never breaks because of polishing.
+
+    stats: optional list collecting per-chunk {"attempts", "ok"} readings
+    (thread-safe append) for real retry/timing instrumentation.
     """
     cfg = get_polish_config()
     api_key = api_key or cfg["api_key"]
@@ -202,7 +219,7 @@ def polish_transcript(text: str, api_key: Optional[str] = None,
     chunks = _split_chunks(text, CHUNK_CHARS)
 
     def _run(chunk: str) -> str:
-        return _call_polish(api_base_url, api_key, model, chunk, retries)
+        return _call_polish(api_base_url, api_key, model, chunk, retries, stats)
 
     if max_workers and max_workers > 1 and len(chunks) > 1:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:

@@ -80,6 +80,7 @@ from asr_backends import (
 from operation_logger import (
     log_operation, read_logs, log_file_path,
     log_video_result, read_video_logs, read_runtime_logs,
+    StageTrace, new_batch_id, stage_fields,
 )
 
 HEADERS_UA = HEADERS['User-Agent']
@@ -417,6 +418,8 @@ def _batch_publish(event: dict) -> None:
             trigger=str((_run_ctx or {}).get("trigger") or ""),
             error=str(event.get("error") or ""),
             output=str(event.get("output") or ""),
+            # 阶段耗时（只增字段；旧事件没有这些键时一条都不写）
+            **stage_fields(event),
         )
     # Run totals count EVERY result (prefilter skips included), mirroring the
     # WebUI's run counters so the two never drift. The totals ride along on
@@ -1204,6 +1207,13 @@ def _pending_update(item_id: int, url: str) -> bool:
         return False
 
 
+def _pending_positions(items: list) -> dict:
+    """id -> 1-based position in the persisted queue. The list order IS the
+    execution order (the runner takes the first `pending` row), so a position
+    here is also the dispatch priority."""
+    return {it["id"]: i + 1 for i, it in enumerate(items)}
+
+
 def _pending_reorder(ids: list) -> bool:
     """Apply a full item order (the id sequence the UI shows). id order only
     decides execution priority among pending items; done/fail items just keep
@@ -1216,6 +1226,76 @@ def _pending_reorder(ids: list) -> bool:
         data["items"] = [by_id[i] for i in ids]
         _save_pending(data)
         return True
+
+
+# 抢占正在跑的那一条不可行的原因（如实告知，不硬做）：
+# 队列 runner 对单个条目串行执行「分享页解析 → 下载 → 抽音 → ASR → 落盘」，
+# 整条链没有任何中断点（HTTP 请求、ffmpeg、ASR 都是阻塞调用），要中止只能杀
+# 线程，留下半截临时文件和未回收的进程。因此只做「插到下一个执行」。
+PREEMPT_UNSUPPORTED = (
+    "不支持抢占正在处理的那一条：队列 runner 会在单条内串行跑完"
+    "分享页解析→下载→抽音→ASR→落盘，全程没有可中断的检查点，强行中止只能"
+    "杀线程并留下半截文件/孤儿进程。请用「插到下一个执行」：当前这条跑完就"
+    "立刻轮到它，不打断在跑的工作。")
+
+
+def _pending_move(item_id: int, op: str, mode: str = "next") -> dict:
+    """Move one PENDING item inside the persisted queue (order = dispatch order).
+
+    op="pin"  - 置顶: put it at the queue head (index 0); the next dispatch
+                takes it first.
+    op="jump" - 插队: mode="next" inserts it right after the running item (or
+                at the head of the pending block when nothing is running), so
+                it becomes the next dispatch without touching the running one.
+                mode="preempt" is refused (see PREEMPT_UNSUPPORTED).
+
+    Only status == "pending" moves: the running item is inside an
+    uninterruptible call chain and done/fail rows are history, not work.
+    Returns {"ok", "reason", "from", "to", "item"} (positions are 1-based).
+    """
+    if op == "jump" and (mode or "next") == "preempt":
+        return {"ok": False, "reason": "preempt_unsupported"}
+    if op not in ("pin", "jump"):
+        return {"ok": False, "reason": "unknown_op"}
+    with _pending_lock:
+        data = _load_pending()
+        items = data["items"]
+        idx = next((i for i, it in enumerate(items) if it["id"] == item_id), None)
+        if idx is None:
+            return {"ok": False, "reason": "not_found"}
+        item = items[idx]
+        if item.get("status") != "pending":
+            return {"ok": False, "reason": "not_pending"}
+        before = _pending_positions(items)
+        moving = items.pop(idx)
+        if op == "pin":
+            target = 0
+        else:
+            run_idx = next((i for i, it in enumerate(items)
+                            if it.get("status") == "running"), None)
+            if run_idx is not None:
+                target = run_idx + 1
+            else:
+                target = next((i for i, it in enumerate(items)
+                               if it.get("status") == "pending"), len(items))
+        items.insert(min(target, len(items)), moving)
+        after = _pending_positions(items)
+        _save_pending(data)
+    return {"ok": True, "reason": "", "from": before[item_id],
+            "to": after[item_id], "item": dict(moving)}
+
+
+def _queue_actor(request, who: str = "") -> str:
+    """Who asked for a queue move. The service has no login, so the honest
+    answer is the caller-supplied label or the HTTP client address."""
+    who = (who or "").strip()
+    if who:
+        return who[:80]
+    try:
+        host = request.client.host if request and request.client else "-"
+    except Exception:
+        host = "-"
+    return f"web:{host}"[:80]
 
 
 def _pending_mark(item_id: int, status: str, result: str = "",
@@ -1466,16 +1546,19 @@ def _pending_run_video(item: dict) -> None:
     api_key = _pending_api_key()
     if not api_key:
         raise RuntimeError("未配置 API Key")
-    video_info, _text = _extract_single_video(item["url"], api_key)
+    trace = StageTrace(batch_id=new_batch_id(),
+                       worker_id=threading.current_thread().name)
+    video_info, _text = _extract_single_video(item["url"], api_key, trace=trace)
     _batch_publish({"stage": "extract", "index": 1, "total": 1,
                     "aweme_id": video_info["video_id"], "title": video_info["title"],
                     "author": video_info.get("author") or "",
-                    "status": "ok"})
+                    "status": "ok", **trace.result_fields()})
     _pending_mark(item["id"], "done", result=video_info.get("title", ""))
     log_video_result("ok", author=video_info.get("author") or "",
                      video_id=video_info["video_id"],
                      title=video_info.get("title") or "",
-                     trigger="待解析队列")
+                     trigger="待解析队列",
+                     **trace.result_fields())
     # 主页「提取文案」的HTTP请求在等这一条：把文案与视频信息交还给它
     _pending_notify(item["id"], {"video_id": video_info["video_id"],
                                  "title": video_info.get("title") or "",
@@ -1627,6 +1710,25 @@ class PendingLinkUpdateRequest(BaseModel):
 
 class PendingReorderRequest(BaseModel):
     ids: list = []
+    who: str = ""          # optional label for the audit trail
+
+
+class PendingJumpRequest(BaseModel):
+    mode: str = "next"     # "next" (default) | "preempt" (refused)
+    who: str = ""
+
+
+def _queue_move_error(res: dict) -> HTTPException:
+    reason = res.get("reason")
+    if reason == "not_found":
+        return HTTPException(status_code=404, detail="任务列表中不存在该条目")
+    if reason == "not_pending":
+        return HTTPException(
+            status_code=409,
+            detail="只有「待执行」条目可以调整顺序（处理中/已完成/失败的条目不动）")
+    if reason == "preempt_unsupported":
+        return HTTPException(status_code=409, detail=PREEMPT_UNSUPPORTED)
+    return HTTPException(status_code=400, detail="不支持的队列操作")
 
 
 @app.put("/api/pending-links/{item_id}")
@@ -1640,11 +1742,52 @@ async def pending_links_update(item_id: int, req: PendingLinkUpdateRequest):
 
 
 @app.post("/api/pending-links/reorder")
-async def pending_links_reorder(req: PendingReorderRequest):
-    """Apply the UI's item order (drag & drop)."""
+async def pending_links_reorder(req: PendingReorderRequest, request: Request):
+    """排序：整体重排（拖拽）。队列顺序即执行顺序，落盘持久化。"""
+    actor = _queue_actor(request, req.who)
+    before = _pending_positions(_pending_items())
     if not _pending_reorder(req.ids):
         raise HTTPException(status_code=409, detail="排序数据与当前列表不一致")
+    after = _pending_positions(_pending_items())
+    moved = [f"{iid}:{before[iid]}->{after[iid]}" for iid in after
+             if before.get(iid) != after[iid]]
+    log_operation("queue.order", op="sort", who=actor,
+                  moved_count=len(moved), total=len(after),
+                  moves=",".join(moved[:40]) or None)
     return {"ok": True, "items": _pending_items()}
+
+
+@app.post("/api/pending-links/{item_id}/pin")
+async def pending_links_pin(item_id: int, request: Request):
+    """置顶：把该条排到队首，下次调度先取它。"""
+    actor = _queue_actor(request)
+    res = _pending_move(item_id, "pin")
+    if not res["ok"]:
+        raise _queue_move_error(res)
+    log_operation("queue.order", op="pin", who=actor, item_id=item_id,
+                  kind=res["item"].get("kind"), url=res["item"].get("url"),
+                  from_pos=res["from"], to_pos=res["to"],
+                  title=res["item"].get("title") or None)
+    return {"ok": True, "from": res["from"], "to": res["to"],
+            "items": _pending_items()}
+
+
+@app.post("/api/pending-links/{item_id}/jump")
+async def pending_links_jump(item_id: int, req: PendingJumpRequest,
+                             request: Request):
+    """插队：mode=next 插到「下一个执行」（不打断在跑的那条，默认）；
+    mode=preempt 抢占在跑的那条——当前架构不支持，返回 409 并说明原因。"""
+    actor = _queue_actor(request, req.who)
+    res = _pending_move(item_id, "jump", req.mode)
+    if not res["ok"]:
+        raise _queue_move_error(res)
+    log_operation("queue.order", op="jump", mode=req.mode or "next", who=actor,
+                  item_id=item_id, kind=res["item"].get("kind"),
+                  url=res["item"].get("url"),
+                  from_pos=res["from"], to_pos=res["to"],
+                  title=res["item"].get("title") or None)
+    return {"ok": True, "from": res["from"], "to": res["to"],
+            "items": _pending_items()}
 
 
 @app.delete("/api/pending-links/{item_id}")
@@ -2517,16 +2660,30 @@ async def douyin_login():
     return StreamingResponse(_gen(), media_type="text/event-stream")
 
 
+def _safe_file_size(path):
+    """File size in bytes, or None when it cannot be stat'ed (log-only use)."""
+    try:
+        return Path(path).stat().st_size
+    except Exception:
+        return None
+
+
 def _extract_single_video(url: str, api_key: str, provider: str = None,
-                          model: str = None) -> tuple:
+                          model: str = None, trace: StageTrace = None) -> tuple:
     """Single-video pipeline: share-url -> download -> audio -> ASR (+polish)
     -> record to the global library -> save md into the per-author output dir.
 
     Raises on failure. Shared by the /api/video/extract endpoint and the
     pending-links queue runner so both behave identically.
+
+    trace: optional StageTrace for per-stage timing. When omitted a private
+    one is created so the stage events still land in the runtime log.
     """
     from douyin_downloader import DouyinProcessor
     from transcript_library import append_record
+    if trace is None:
+        trace = StageTrace(batch_id=new_batch_id(),
+                           worker_id=threading.current_thread().name)
     backend = resolve_backend(api_key, provider=provider, model=model)
     processor = DouyinProcessor(
         backend['api_key'],
@@ -2534,7 +2691,16 @@ def _extract_single_video(url: str, api_key: str, provider: str = None,
         model=backend['model'],
         api_base_url=backend['api_base_url'] or "",
     )
-    video_info = processor.parse_share_url(url)
+    processor.trace = trace
+    trace.start("resolve")
+    try:
+        video_info = processor.parse_share_url(url)
+    except Exception as e:
+        trace.emit("video.resolve", status="error",
+                   duration_ms=trace.end("resolve"), error=str(e)[:200])
+        raise
+    trace.video_id = str(video_info.get("video_id") or "")
+    trace.emit("video.resolve", duration_ms=trace.end("resolve"))
     try:
         video_path = processor.download_video(video_info, show_progress=False)
         audio_path = processor.extract_audio(video_path, show_progress=False)
@@ -2560,15 +2726,33 @@ def _extract_single_video(url: str, api_key: str, provider: str = None,
                                 terminal=False)
         except Exception:
             pass
+        trace.flush()
         raise
     # Optional LLM polish (fixes homophones/punctuation)
     polish_cfg = (load_config_file().get("polish") or {})
     if polish_cfg.get("enabled"):
+        _parse_in = len(text)
+        trace.start("parse")
         try:
             from transcript_polish import polish_transcript
-            text = polish_transcript(text)
-        except Exception:
-            pass  # never break extraction due to polish failure
+            _px_stats = []
+            text = polish_transcript(text, stats=_px_stats)
+            _px_chunks = len(_px_stats) or 1
+            _px_tries = sum(s["attempts"] for s in _px_stats) or 1
+            trace.emit("parse.extract",
+                       status="ok" if all(s["ok"] for s in _px_stats) else "error",
+                       mode="llm",
+                       model=(polish_cfg.get("model") or ""),
+                       input_chars=_parse_in,
+                       output_chars=len(text),
+                       retry=max(0, _px_tries - _px_chunks),
+                       duration_ms=trace.end("parse"))
+        except Exception as e:
+            trace.emit("parse.extract", status="error", mode="llm",
+                       model=(polish_cfg.get("model") or ""),
+                       input_chars=_parse_in, output_chars=len(text),
+                       retry="", duration_ms=trace.end("parse"),
+                       error=str(e)[:300])
     # Record to the global library file
     append_record(
         video_id=video_info["video_id"],
@@ -2586,8 +2770,12 @@ def _extract_single_video(url: str, api_key: str, provider: str = None,
         safe_author = re.sub(r'[\\/:*?"<>|]', '_', author).strip() or "未知作者"
         author_dir = (Path(__file__).resolve().parent.parent
                       / "output" / safe_author)
+        trace.start("kb_write")
         md_path = save_transcript(author_dir, video_info["video_id"],
                                   video_info["title"], author, text)
+        trace.emit("kb.write", path=str(md_path),
+                   bytes=_safe_file_size(md_path),
+                   duration_ms=trace.end("kb_write"))
         # A previously failed batch video retried successfully here: flip its
         # history ledger entry fail -> ok so the next batch won't redo it.
         try:
@@ -2602,6 +2790,7 @@ def _extract_single_video(url: str, api_key: str, provider: str = None,
         log_operation("video.extract.save_md_failed",
                       video_id=video_info["video_id"],
                       error=str(e)[:200])
+    trace.flush()
     return video_info, text
 
 

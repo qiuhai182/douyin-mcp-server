@@ -493,6 +493,12 @@
                               :class="pendingStatusClass(it.status)" x-text="pendingStatusLabel(it.status)"></span>
                         <template x-if="editingLinkId !== it.id">
                             <div class="flex-shrink-0 flex items-center gap-1">
+                                <button x-show="it.status === 'pending'" @click="pinPendingLink(it)"
+                                        title="置顶：排到队首，下次调度先执行它"
+                                        class="h-6 px-1.5 rounded-lg bg-douyin-gray-100 hover:bg-amber-50 text-[10px] text-douyin-gray-500 hover:text-amber-600 transition-smooth">置顶</button>
+                                <button x-show="it.status === 'pending'" @click="jumpPendingLink(it)"
+                                        title="插队：插到下一个执行（不打断正在处理的那条）"
+                                        class="h-6 px-1.5 rounded-lg bg-douyin-gray-100 hover:bg-blue-50 text-[10px] text-douyin-gray-500 hover:text-blue-600 transition-smooth">插队</button>
                                 <button @click="startEditLink(it)" :disabled="it.status !== 'pending'" title="编辑链接"
                                         class="w-6 h-6 rounded-lg bg-douyin-gray-100 hover:bg-blue-50 flex items-center justify-center disabled:opacity-40 disabled:cursor-not-allowed transition-smooth">
                                     <svg class="w-3 h-3 text-douyin-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1003,6 +1009,12 @@
                                        :title="it.result ? it.url + '｜' + it.result : it.url" x-text="it.title || it.url"></a>
                                     <span class="flex-shrink-0 text-[10px] px-1.5 py-0.5 rounded"
                                           :class="pendingStatusClass(it.status)" x-text="pendingStatusLabel(it.status)"></span>
+                                    <button x-show="it.status === 'pending'" @click="pinPendingLink(it)"
+                                            title="置顶：排到队首，下次调度先执行它"
+                                            class="flex-shrink-0 h-6 px-1.5 rounded-lg bg-douyin-gray-100 hover:bg-amber-50 text-[10px] text-douyin-gray-500 hover:text-amber-600 transition-smooth">置顶</button>
+                                    <button x-show="it.status === 'pending'" @click="jumpPendingLink(it)"
+                                            title="插队：插到下一个执行（不打断正在处理的那条）"
+                                            class="flex-shrink-0 h-6 px-1.5 rounded-lg bg-douyin-gray-100 hover:bg-blue-50 text-[10px] text-douyin-gray-500 hover:text-blue-600 transition-smooth">插队</button>
                                     <button @click="removePendingLink(it)" :disabled="it.status === 'running'"
                                             title="从队列移除"
                                             class="flex-shrink-0 w-6 h-6 rounded-lg bg-douyin-gray-100 hover:bg-red-50 flex items-center justify-center disabled:opacity-40 transition-smooth">
@@ -2395,6 +2407,30 @@
                             this.pendingLinks = data.items || [];
                         }
                     } catch (e) { /* ignore */ }
+                },
+                // 置顶：排到队首，下次调度先取它（落盘走 pending_links.json）
+                async pinPendingLink(it) {
+                    try {
+                        const res = await fetch('/api/pending-links/' + it.id + '/pin', { method: 'POST' });
+                        const data = await res.json().catch(() => ({}));
+                        if (!res.ok) { this.showToast(data.detail || '置顶失败'); return; }
+                        this.pendingLinks = data.items || [];
+                        this.showToast(`已置顶：第 ${data.from} 位 → 第 ${data.to} 位`);
+                    } catch (e) { this.showToast('置顶失败，请重试'); }
+                },
+                // 插队：插到「下一个执行」，不打断正在处理的那一条
+                async jumpPendingLink(it) {
+                    try {
+                        const res = await fetch('/api/pending-links/' + it.id + '/jump', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ mode: 'next' })
+                        });
+                        const data = await res.json().catch(() => ({}));
+                        if (!res.ok) { this.showToast(data.detail || '插队失败'); return; }
+                        this.pendingLinks = data.items || [];
+                        this.showToast(`已插到下一个执行（第 ${data.to} 位）`);
+                    } catch (e) { this.showToast('插队失败，请重试'); }
                 },
 
                 // ---------- 主输入框「加入队列」：忙时点击 = 加入待解析队列 ----------

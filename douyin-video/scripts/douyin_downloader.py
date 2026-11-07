@@ -90,6 +90,14 @@ class NonVideoContent(ValueError):
     Callers treat this as "ignore/skip", not as a retriable failure."""
 
 
+def _safe_size(path) -> Optional[int]:
+    """File size in bytes, or None when the file cannot be stat'ed."""
+    try:
+        return Path(path).stat().st_size
+    except Exception:
+        return None
+
+
 def _check_video_usable(info: dict) -> None:
     """Raise NonVideoContent when the play URL is a placeholder (image post
     or removed video) - there is no spoken audio to transcribe."""
@@ -109,6 +117,9 @@ class DouyinProcessor:
         self.model = model
         self.api_base_url = api_base_url
         self.temp_dir = Path(tempfile.mkdtemp())
+        # Optional StageTrace set by the caller (batch / single-video
+        # pipeline). None = no stage instrumentation, behaviour unchanged.
+        self.trace = None
 
     def __del__(self):
         """Clean up temp directory"""
@@ -242,56 +253,80 @@ class DouyinProcessor:
             {**dl_headers, 'User-Agent': HEADERS['User-Agent']},         # alternate UA
         ]
         last_err = None
-        for attempt_idx, headers in enumerate(attempts):
-            try:
-                response = requests.get(
-                    video_info['url'], headers=headers, stream=True, timeout=60
-                )
-                if response.status_code == 403 and attempt_idx < len(attempts) - 1:
-                    continue
-                response.raise_for_status()
+        trace = getattr(self, "trace", None)
+        last_http = [None]
+        last_attempt = [0]
 
-                # Get file size
-                total_size = int(response.headers.get('content-length', 0))
+        def _finish_ok(attempt_idx: int, size: int):
+            if trace:
+                trace.emit("video.download.end", bytes=size,
+                           http_status=last_http[0], retry=attempt_idx,
+                           duration_ms=trace.end("download"))
 
-                # Download file
-                downloaded = 0
-                with open(filepath, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            if show_progress and total_size > 0:
-                                pass  # quiet in batch
-                # quick sanity: a real video should be > 100KB and its file
-                # header must look like media - this catches the static mp3
-                # placeholder (ID3 header) and html/json error pages early.
-                if filepath.exists():
-                    size = filepath.stat().st_size
-                    with open(filepath, 'rb') as fh:
-                        head = fh.read(16)
-                    if head[:3] == b'ID3':
-                        last_err = RuntimeError(
-                            "downloaded an audio placeholder (mp3) - "
-                            "likely an image post without video")
-                    elif head[:1] in (b'<', b'{'):
-                        last_err = RuntimeError(
-                            "downloaded an error page instead of a video")
-                    elif size > 100_000:
-                        return filepath
+        if trace:
+            trace.start("download")
+            trace.emit("video.download.start", retry=0)
+        try:
+            for attempt_idx, headers in enumerate(attempts):
+                last_attempt[0] = attempt_idx
+                try:
+                    response = requests.get(
+                        video_info['url'], headers=headers, stream=True, timeout=60
+                    )
+                    last_http[0] = response.status_code
+                    if response.status_code == 403 and attempt_idx < len(attempts) - 1:
+                        continue
+                    response.raise_for_status()
+
+                    # Get file size
+                    total_size = int(response.headers.get('content-length', 0))
+
+                    # Download file
+                    downloaded = 0
+                    with open(filepath, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                if show_progress and total_size > 0:
+                                    pass  # quiet in batch
+                    # quick sanity: a real video should be > 100KB and its file
+                    # header must look like media - this catches the static mp3
+                    # placeholder (ID3 header) and html/json error pages early.
+                    if filepath.exists():
+                        size = filepath.stat().st_size
+                        with open(filepath, 'rb') as fh:
+                            head = fh.read(16)
+                        if head[:3] == b'ID3':
+                            last_err = RuntimeError(
+                                "downloaded an audio placeholder (mp3) - "
+                                "likely an image post without video")
+                        elif head[:1] in (b'<', b'{'):
+                            last_err = RuntimeError(
+                                "downloaded an error page instead of a video")
+                        elif size > 100_000:
+                            _finish_ok(attempt_idx, size)
+                            return filepath
+                        else:
+                            last_err = RuntimeError(
+                                f"downloaded file too small ({size} bytes)")
                     else:
-                        last_err = RuntimeError(
-                            f"downloaded file too small ({size} bytes)")
-                else:
-                    last_err = RuntimeError("download produced no file")
-            except (requests.exceptions.RequestException, RuntimeError) as e:
-                last_err = e
-                if show_progress:
-                    print(f"  download attempt {attempt_idx+1} failed: {e}")
-            # Cooldown between attempts: longer for the last retry so we
-            # don't hammer the CDN if it's rate-limiting us.
-            time.sleep(2.0 + attempt_idx * 3.0)
-        raise RuntimeError(f"Error downloading video after {len(attempts)} attempts: {last_err}")
+                        last_err = RuntimeError("download produced no file")
+                except (requests.exceptions.RequestException, RuntimeError) as e:
+                    last_err = e
+                    if show_progress:
+                        print(f"  download attempt {attempt_idx+1} failed: {e}")
+                # Cooldown between attempts: longer for the last retry so we
+                # don't hammer the CDN if it's rate-limiting us.
+                time.sleep(2.0 + attempt_idx * 3.0)
+            raise RuntimeError(f"Error downloading video after {len(attempts)} attempts: {last_err}")
+        except Exception as e:
+            if trace:
+                trace.emit("video.download.end", status="error",
+                           http_status=last_http[0], retry=last_attempt[0],
+                           duration_ms=trace.end("download"),
+                           error=str(e)[:300])
+            raise
 
     def extract_audio(self, video_path: Path, show_progress: bool = True) -> Path:
         """Extract audio from video file.
@@ -303,6 +338,10 @@ class DouyinProcessor:
         - loudnorm: normalize volume so quiet speech is audible
         """
         audio_path = video_path.with_suffix('.mp3')
+        trace = getattr(self, "trace", None)
+
+        if trace:
+            trace.start("audio")
 
         if show_progress:
             print("Extracting audio (voice optimized)...")
@@ -321,6 +360,10 @@ class DouyinProcessor:
             )
             if show_progress:
                 print(f"Audio extracted: {audio_path}")
+            if trace:
+                trace.emit("audio.extract", mode="voice",
+                           bytes=_safe_size(audio_path),
+                           duration_ms=trace.end("audio"))
             return audio_path
         except Exception as e:
             # Fallback to plain extraction if the filter chain fails
@@ -333,8 +376,16 @@ class DouyinProcessor:
                 )
                 if show_progress:
                     print(f"Audio extracted (plain): {audio_path}")
+                if trace:
+                    trace.emit("audio.extract", mode="plain",
+                               bytes=_safe_size(audio_path),
+                               duration_ms=trace.end("audio"))
                 return audio_path
             except Exception as e2:
+                if trace:
+                    trace.emit("audio.extract", status="error", mode="plain",
+                               duration_ms=trace.end("audio"),
+                               error=str(e2)[:300])
                 raise Exception(f"Error extracting audio: {str(e2)}")
 
     def get_audio_info(self, audio_path: Path) -> dict:
@@ -472,52 +523,80 @@ class DouyinProcessor:
 
     def extract_text_from_audio(self, audio_path: Path, show_progress: bool = True) -> str:
         """Extract text from audio file (short-audio guard + VAD + auto-split)"""
-        if not self.api_key:
-            raise ValueError("API key not set, please set API_KEY environment variable")
+        trace = getattr(self, "trace", None)
+        audio_seconds = None
+        requested = False       # 是否真的发出了 ASR 请求
+        status = "skip"         # 未请求（短音频/无 key）时如实记 skip
+        error_text = ""
+        if trace:
+            trace.start("asr")
+        try:
+            if not self.api_key:
+                raise ValueError("API key not set, please set API_KEY environment variable")
 
-        audio_info = self.get_audio_info(audio_path)
-        if float(audio_info.get('duration') or 0) < 2.0 or int(audio_info.get('size') or 0) < 20 * 1024:
-            raise AudioTooShort(
-                "too_short: duration=%.2fs size=%dB (skip ASR)" % (
-                    float(audio_info.get('duration') or 0), int(audio_info.get('size') or 0)))
+            audio_info = self.get_audio_info(audio_path)
+            audio_seconds = float(audio_info.get('duration') or 0) or None
+            if float(audio_info.get('duration') or 0) < 2.0 or int(audio_info.get('size') or 0) < 20 * 1024:
+                raise AudioTooShort(
+                    "too_short: duration=%.2fs size=%dB (skip ASR)" % (
+                        float(audio_info.get('duration') or 0), int(audio_info.get('size') or 0)))
 
-        max_duration = 3600  # 1 hour
-        max_size = 50 * 1024 * 1024  # 50MB
-        need_split = audio_info['duration'] > max_duration or audio_info['size'] > max_size
+            max_duration = 3600  # 1 hour
+            max_size = 50 * 1024 * 1024  # 50MB
+            need_split = audio_info['duration'] > max_duration or audio_info['size'] > max_size
 
-        # VAD segmentation for long audio (20-60s speech spans)
-        if os.getenv("ASR_VAD_ENABLED", "1") != "0" and audio_info['duration'] > 60:
-            segments = self.split_audio_on_silence(audio_path, max_segment=60)
-        elif need_split:
+            # VAD segmentation for long audio (20-60s speech spans)
+            if os.getenv("ASR_VAD_ENABLED", "1") != "0" and audio_info['duration'] > 60:
+                segments = self.split_audio_on_silence(audio_path, max_segment=60)
+            elif need_split:
+                if show_progress:
+                    print(f"Audio file is large (duration: {audio_info['duration']:.0f}s, size: {audio_info['size'] / 1024 / 1024:.1f}MB)")
+                    print("Will auto-split...")
+                segments = self.split_audio(audio_path, segment_duration=540, show_progress=show_progress)
+            else:
+                if show_progress:
+                    print("Recognizing speech...")
+                requested = True
+                text = self.transcribe_single_audio(audio_path)
+                status = "ok"
+                return text
+
+            all_texts, errors = [], []
+            requested = True
+            for i, segment_path in enumerate(segments):
+                if show_progress:
+                    print(f"Recognizing segment {i + 1}/{len(segments)}...")
+                try:
+                    text = self.transcribe_single_audio(segment_path)
+                    if text.strip():
+                        all_texts.append(text.strip())
+                except Exception as e:
+                    errors.append(str(e)[:160])
+                finally:
+                    if segment_path != audio_path:
+                        self.cleanup_files(segment_path)
+
+            if not all_texts:
+                raise TranscriptionError("all_segments_suspect: " + " | ".join(errors[:3]))
+            merged_text = "\n".join(all_texts)
             if show_progress:
-                print(f"Audio file is large (duration: {audio_info['duration']:.0f}s, size: {audio_info['size'] / 1024 / 1024:.1f}MB)")
-                print("Will auto-split...")
-            segments = self.split_audio(audio_path, segment_duration=540, show_progress=show_progress)
-        else:
-            if show_progress:
-                print("Recognizing speech...")
-            return self.transcribe_single_audio(audio_path)
-
-        all_texts, errors = [], []
-        for i, segment_path in enumerate(segments):
-            if show_progress:
-                print(f"Recognizing segment {i + 1}/{len(segments)}...")
-            try:
-                text = self.transcribe_single_audio(segment_path)
-                if text.strip():
-                    all_texts.append(text.strip())
-            except Exception as e:
-                errors.append(str(e)[:160])
-            finally:
-                if segment_path != audio_path:
-                    self.cleanup_files(segment_path)
-
-        if not all_texts:
-            raise TranscriptionError("all_segments_suspect: " + " | ".join(errors[:3]))
-        merged_text = "\n".join(all_texts)
-        if show_progress:
-            print(f"Speech recognition done, processed {len(segments)} segments")
-        return merged_text
+                print(f"Speech recognition done, processed {len(segments)} segments")
+            status = "ok"
+            return merged_text
+        except Exception as e:
+            status = "error" if requested else "skip"
+            error_text = str(e)[:300]
+            raise
+        finally:
+            if trace:
+                # retry 留空：ASR 层按 provider 顺序回落，没有对外暴露的
+                # 重试计数（不臆造，也不用总时长倒推）。
+                trace.emit("asr.request", status=status,
+                           model=self.model or "",
+                           audio_seconds=audio_seconds,
+                           retry="",
+                           duration_ms=trace.end("asr"),
+                           error=error_text or None)
 
     def cleanup_files(self, *file_paths: Path):
         """Clean up given files"""

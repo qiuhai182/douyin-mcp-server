@@ -16,6 +16,8 @@ Line schema:
 
 import json
 import re
+import time
+import uuid
 import threading
 from pathlib import Path
 from datetime import datetime
@@ -29,18 +31,21 @@ MAX_FIELD_LEN = 500
 _lock = threading.Lock()
 
 
-def log_operation(action: str, status: str = "ok", **fields):
-    """Append one operation record to the runtime log file.
+def _now_ts() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    Non-serializable values are str()'d; long strings are truncated so each
-    line stays bounded. Logging failures never propagate to the caller.
-    """
+
+def _build_record(action: str, status: str = "ok", ts: str = None,
+                  fields: Optional[dict] = None) -> dict:
+    """One operation-log record. Existing keys keep their meaning; callers may
+    pass an explicit `ts` (stage events timestamped when they happened, not
+    when the buffered write lands)."""
     record = {
-        "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "ts": ts or _now_ts(),
         "action": action,
         "status": status,
     }
-    for k, v in fields.items():
+    for k, v in (fields or {}).items():
         if v is None:
             continue
         if not isinstance(v, (str, int, float, bool)):
@@ -51,6 +56,16 @@ def log_operation(action: str, status: str = "ok", **fields):
         if isinstance(v, str) and len(v) > MAX_FIELD_LEN:
             v = v[:MAX_FIELD_LEN] + "..."
         record[k] = v
+    return record
+
+
+def log_operation(action: str, status: str = "ok", ts: str = None, **fields):
+    """Append one operation record to the runtime log file.
+
+    Non-serializable values are str()'d; long strings are truncated so each
+    line stays bounded. Logging failures never propagate to the caller.
+    """
+    record = _build_record(action, status, ts, fields)
     try:
         _LOG_DIR.mkdir(parents=True, exist_ok=True)
         with _lock:
@@ -60,9 +75,132 @@ def log_operation(action: str, status: str = "ok", **fields):
         pass  # logging must never break the app
 
 
+def append_operations(items) -> None:
+    """Append several buffered records in ONE open/write (no fsync).
+
+    items: iterable of {"ts", "action", "status", "fields"} dicts, produced by
+    StageTrace. Same line schema as log_operation, so existing readers are
+    unaffected.
+    """
+    lines = []
+    for it in items or []:
+        rec = _build_record(it.get("action", ""), it.get("status", "ok"),
+                            it.get("ts"), it.get("fields"))
+        lines.append(json.dumps(rec, ensure_ascii=False))
+    if not lines:
+        return
+    try:
+        _LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with _lock:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+    except Exception:
+        pass
+
+
 def log_file_path() -> Path:
     """Absolute path of the runtime log file."""
     return LOG_FILE
+
+
+# ---------------------------------------------------------------------------
+# Per-stage timing (download / audio extract / ASR / kb write)
+#
+# Why a buffer instead of a log call per event: the pipeline must not pay a
+# file open+write (or a fsync) on every stage boundary. StageTrace only takes
+# one perf_counter() per boundary and one clock read per event, then flush()
+# appends all of the video's events with a single buffered write.
+#
+# Every stage event carries batch_id / worker_id / video_id so one video's
+# download and ASR can be told apart from the next one's in the flat log.
+# Fields that a stage cannot actually measure are left EMPTY (None -> omitted)
+# - never back-filled from the total duration.
+# ---------------------------------------------------------------------------
+STAGE_EVENT_FIELDS = ("batch_id", "worker_id",
+                      "resolve_ms", "download_ms", "audio_ms", "asr_ms",
+                      "parse_ms", "kb_write_ms")
+
+
+def new_batch_id() -> str:
+    """Short unique id for one batch/single-video run (log correlation)."""
+    return "%s_%s" % (datetime.now().strftime("%Y%m%d_%H%M%S"),
+                      uuid.uuid4().hex[:6])
+
+
+def stage_fields(payload: Optional[dict]) -> dict:
+    """Pick the stage-timing keys out of an event/trace payload.
+
+    Missing/empty values are dropped, so a video processed by an older code
+    path yields exactly the old record (no empty columns added).
+    """
+    payload = payload or {}
+    return {k: payload[k] for k in STAGE_EVENT_FIELDS
+            if payload.get(k) not in (None, "")}
+
+
+class StageTrace:
+    """Timing + events for ONE video's processing stages.
+
+    Usage:
+        trace = StageTrace(video_id=..., batch_id=..., worker_id=...)
+        trace.start("download"); ...; ms = trace.end("download")
+        trace.emit("video.download.end", bytes=n, http_status=200,
+                   retry=0, duration_ms=ms)
+        ...
+        trace.flush()   # one append for all events of this video
+    """
+
+    # resolve = 取播放直链（parse_share_url，抓取的前半段）
+    STAGES = ("resolve", "download", "audio", "asr", "parse", "kb_write")
+
+    def __init__(self, video_id: str = "", batch_id: str = "",
+                 worker_id: str = ""):
+        self.video_id = str(video_id or "")
+        self.batch_id = batch_id or ""
+        self.worker_id = worker_id or ""
+        self.durations = {}
+        self._starts = {}
+        self._events = []
+
+    # -- timing -----------------------------------------------------------
+    def start(self, stage: str) -> None:
+        self._starts[stage] = time.perf_counter()
+
+    def end(self, stage: str) -> Optional[float]:
+        """Close one stage, remember the ms reading, and return it."""
+        t0 = self._starts.pop(stage, None)
+        if t0 is None:
+            return None
+        ms = round((time.perf_counter() - t0) * 1000.0, 1)
+        self.durations[stage] = ms
+        return ms
+
+    # -- events -----------------------------------------------------------
+    def emit(self, action: str, status: str = "ok", **fields) -> None:
+        enriched = {"batch_id": self.batch_id,
+                    "worker_id": self.worker_id,
+                    "video_id": self.video_id}
+        enriched.update(fields)
+        self._events.append({"ts": _now_ts(), "action": action,
+                             "status": status, "fields": enriched})
+
+    def result_fields(self) -> dict:
+        """Stage durations in video_results.jsonl column form."""
+        out = {"batch_id": self.batch_id, "worker_id": self.worker_id}
+        for stage in self.STAGES:
+            if stage in self.durations:
+                out[stage + "_ms"] = self.durations[stage]
+        return out
+
+    def flush(self) -> None:
+        """Write all buffered events in one go. Never raises."""
+        if not self._events:
+            return
+        pending, self._events = self._events, []
+        try:
+            append_operations(pending)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

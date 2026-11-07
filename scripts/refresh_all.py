@@ -49,7 +49,7 @@ _LIVE_F = open(LIVE_LOG, "a", encoding="utf-8", buffering=1)
 # 让 douyin-video/scripts 下的模块能被 import
 sys.path.insert(0, str(ROOT / "douyin-video" / "scripts"))
 
-from operation_logger import log_video_result, log_operation  # noqa: E402  (path set above)
+from operation_logger import log_video_result, log_operation, stage_fields  # noqa: E402  (path set above)
 
 
 def now():
@@ -174,7 +174,8 @@ def main():
                              video_id=aweme_id, title=evt.get("title") or "",
                              trigger="全UP刷新",
                              error=evt.get("error") or "",
-                             output=evt.get("output") or "")
+                             output=evt.get("output") or "",
+                             **stage_fields(evt))
             # throttle: only print every 5th or on status change
             if status != "skip" or idx == 1 or idx == tot or (isinstance(idx, int) and idx % 5 == 0):
                 line = f"    [{idx}/{tot}] {marker} {status}  {aweme_id}  {title}"

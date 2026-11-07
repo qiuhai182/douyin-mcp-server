@@ -1,0 +1,241 @@
+{
+  "summary": {
+    "count": 20,
+    "ok": 20,
+    "fail": 0,
+    "fail_rate": 0.0,
+    "polish_enabled": false,
+    "batch_id": "20261108_013541_96d840",
+    "stages": {
+      "resolve": {
+        "n": 20,
+        "median": 12107.7,
+        "p90": 13478.7,
+        "max": 28358.4,
+        "mean": 13554.5,
+        "sum": 271089.3
+      }
+    },
+    "ratio": {
+      "resolve": 1.0,
+      "download": 0.0,
+      "audio": 0.0,
+      "asr": 0.0,
+      "parse": 0.0,
+      "kb_write": 0.0
+    },
+    "download_retry_gt0": 0,
+    "download_retry_max": 0,
+    "cache_hit_lt_20ms": 0,
+    "by_duration": {
+      "<60s": {
+        "n": 20,
+        "mean_ms": {
+          "resolve": 13554.5,
+          "download": null,
+          "audio": null,
+          "asr": null,
+          "parse": null,
+          "kb_write": null
+        },
+        "ratio": {
+          "resolve": 1.0,
+          "download": 0.0,
+          "audio": 0.0,
+          "asr": 0.0,
+          "parse": 0.0,
+          "kb_write": 0.0
+        }
+      }
+    },
+    "residual_ms": {
+      "median": 0.0,
+      "p90": 0.1,
+      "max": 0.1,
+      "mean": 0.0,
+      "ratio": 0.0
+    }
+  },
+  "rows": [
+    {
+      "video_id": "7704140805614734602",
+      "author": "编辑老张说写作",
+      "status": "ok",
+      "stage_fail": "",
+      "resolve_ms": 13478.7,
+      "total_ms": 13478.7,
+      "residual_ms": 0.0
+    },
+    {
+      "video_id": "7679640571686844538",
+      "author": "于雷讲故事",
+      "status": "ok",
+      "stage_fail": "",
+      "resolve_ms": 12507.2,
+      "total_ms": 12507.2,
+      "residual_ms": 0.0
+    },
+    {
+      "video_id": "7677817357171676155",
+      "author": "于雷讲故事",
+      "status": "ok",
+      "stage_fail": "",
+      "resolve_ms": 12850.3,
+      "total_ms": 12850.3,
+      "residual_ms": 0.0
+    },
+    {
+      "video_id": "7673485169890160549",
+      "author": "于雷讲故事",
+      "status": "ok",
+      "stage_fail": "",
+      "resolve_ms": 12107.7,
+      "total_ms": 12107.7,
+      "residual_ms": 0.0
+    },
+    {
+      "video_id": "7671434556876899963",
+      "author": "于雷讲故事",
+      "status": "ok",
+      "stage_fail": "",
+      "resolve_ms": 11592.7,
+      "total_ms": 11592.7,
+      "residual_ms": 0.0
+    },
+    {
+      "video_id": "7661617060746024101",
+      "author": "于雷讲故事",
+      "status": "ok",
+      "stage_fail": "",
+      "resolve_ms": 23771.0,
+      "total_ms": 23771.1,
+      "residual_ms": 0.1
+    },
+    {
+      "video_id": "7657476322574831269",
+      "author": "于雷讲故事",
+      "status": "ok",
+      "stage_fail": "",
+      "resolve_ms": 11985.4,
+      "total_ms": 11985.4,
+      "residual_ms": 0.0
+    },
+    {
+      "video_id": "7654541218345591973",
+      "author": "于雷讲故事",
+      "status": "ok",
+      "stage_fail": "",
+      "resolve_ms": 12027.8,
+      "total_ms": 12027.8,
+      "residual_ms": 0.0
+    },
+    {
+      "video_id": "7705000028691074331",
+      "author": "天天看动漫",
+      "status": "ok",
+      "stage_fail": "",
+      "resolve_ms": 11986.8,
+      "total_ms": 11986.9,
+      "residual_ms": 0.1
+    },
+    {
+      "video_id": "7704546851504016667",
+      "author": "天天看动漫",
+      "status": "ok",
+      "stage_fail": "",
+      "resolve_ms": 12252.0,
+      "total_ms": 12252.1,
+      "residual_ms": 0.1
+    },
+    {
+      "video_id": "7704531826513104162",
+      "author": "天天看动漫",
+      "status": "ok",
+      "stage_fail": "",
+      "resolve_ms": 11731.3,
+      "total_ms": 11731.4,
+      "residual_ms": 0.1
+    },
+    {
+      "video_id": "7703806321203612979",
+      "author": "天天看动漫",
+      "status": "ok",
+      "stage_fail": "",
+      "resolve_ms": 11800.0,
+      "total_ms": 11800.0,
+      "residual_ms": 0.0
+    },
+    {
+      "video_id": "7703784246225227071",
+      "author": "天天看动漫",
+      "status": "ok",
+      "stage_fail": "",
+      "resolve_ms": 11516.4,
+      "total_ms": 11516.4,
+      "residual_ms": 0.0
+    },
+    {
+      "video_id": "7704906500566173370",
+      "author": "上上签An",
+      "status": "ok",
+      "stage_fail": "",
+      "resolve_ms": 11615.9,
+      "total_ms": 11615.9,
+      "residual_ms": 0.0
+    },
+    {
+      "video_id": "7704154141007189157",
+      "author": "上上签An",
+      "status": "ok",
+      "stage_fail": "",
+      "resolve_ms": 12143.5,
+      "total_ms": 12143.6,
+      "residual_ms": 0.1
+    },
+    {
+      "video_id": "7705291204505750847",
+      "author": "木业小钻风",
+      "status": "ok",
+      "stage_fail": "",
+      "resolve_ms": 12485.0,
+      "total_ms": 12485.1,
+      "residual_ms": 0.1
+    },
+    {
+      "video_id": "7704930404507192619",
+      "author": "木业小钻风",
+      "status": "ok",
+      "stage_fail": "",
+      "resolve_ms": 11657.2,
+      "total_ms": 11657.2,
+      "residual_ms": 0.0
+    },
+    {
+      "video_id": "7704192279954590991",
+      "author": "木业小钻风",
+      "status": "ok",
+      "stage_fail": "",
+      "resolve_ms": 12042.7,
+      "total_ms": 12042.7,
+      "residual_ms": 0.0
+    },
+    {
+      "video_id": "7703829958908513551",
+      "author": "木业小钻风",
+      "status": "ok",
+      "stage_fail": "",
+      "resolve_ms": 28358.4,
+      "total_ms": 28358.4,
+      "residual_ms": 0.0
+    },
+    {
+      "video_id": "7700855391059561791",
+      "author": "木业小钻风",
+      "status": "ok",
+      "stage_fail": "",
+      "resolve_ms": 13179.3,
+      "total_ms": 13179.4,
+      "residual_ms": 0.1
+    }
+  ]
+}

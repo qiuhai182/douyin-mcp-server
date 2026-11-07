@@ -487,6 +487,14 @@ def _read_complete_transcript(path: Path) -> Optional[str]:
     return tail or None
 
 
+def _safe_file_size(path) -> Optional[int]:
+    """File size in bytes, or None when it cannot be stat'ed (log-only use)."""
+    try:
+        return Path(path).stat().st_size
+    except Exception:
+        return None
+
+
 def _write_transcript_md(path: Path, title: str, aweme_id: str,
                          author: str, text: str):
     """Write a transcript md atomically: .part file first, then rename, so
@@ -725,6 +733,11 @@ def batch_extract(
     # Import here to avoid circular import at module load
     from douyin_downloader import DouyinProcessor, NonVideoContent
     from asr_backends import resolve_backend
+    from operation_logger import StageTrace, new_batch_id
+
+    # One id per batch run: every stage event and every video_results record
+    # of this run carries it, so interleaved workers stay separable.
+    batch_id = new_batch_id()
 
     # Each batch starts uncancelled; pause state depends on `start_paused`:
     # auto-started follow-up work (queue advance, chained refresh, restart
@@ -984,6 +997,10 @@ def batch_extract(
         """Full per-video pipeline; runs inside a worker thread."""
         if cancel_flag.is_set():
             raise BatchCancelled()
+        # Stage instrumentation for THIS video (download / audio / ASR /
+        # kb write). Events are buffered and flushed once in `finally`.
+        trace = StageTrace(video_id=aweme_id, batch_id=batch_id,
+                           worker_id=threading.current_thread().name)
         # One processor per task: isolated temp dir, auto-cleaned on exit.
         processor = DouyinProcessor(
             backend_cfg['api_key'],
@@ -991,13 +1008,22 @@ def batch_extract(
             model=backend_cfg['model'],
             api_base_url=backend_cfg['api_base_url'] or "",
         )
+        processor.trace = trace
         # Dynamic concurrency: may wait here when the monitor lowered the
         # live limit; cancel is re-checked inside _paced_start right after.
         _dyn_gate_acquire()
         _paced_start()
         try:
             share_url = f"https://www.iesdouyin.com/share/video/{aweme_id}"
-            video_info = processor.parse_share_url(share_url)
+            trace.start("resolve")
+            try:
+                video_info = processor.parse_share_url(share_url)
+            except Exception as e:
+                trace.emit("video.resolve", status="error",
+                           duration_ms=trace.end("resolve"),
+                           error=str(e)[:200])
+                raise
+            trace.emit("video.resolve", duration_ms=trace.end("resolve"))
             video_path = processor.download_video(video_info, show_progress=False)
             audio_path = processor.extract_audio(video_path, show_progress=False)
             audio_info = processor.get_audio_info(audio_path)
@@ -1020,16 +1046,37 @@ def batch_extract(
 
             # Optional LLM polish (fixes homophones/punctuation)
             if polish_cfg.get("enabled"):
+                _parse_in = len(text)
+                trace.start("parse")
                 try:
                     from transcript_polish import polish_transcript
-                    text = polish_transcript(text)
-                except Exception:
-                    pass
+                    _px_stats = []
+                    text = polish_transcript(text, stats=_px_stats)
+                    _px_chunks = len(_px_stats) or 1
+                    _px_tries = sum(s["attempts"] for s in _px_stats) or 1
+                    trace.emit("parse.extract",
+                               status="ok" if all(s["ok"] for s in _px_stats) else "error",
+                               mode="llm",
+                               model=(polish_cfg.get("model") or ""),
+                               input_chars=_parse_in,
+                               output_chars=len(text),
+                               retry=max(0, _px_tries - _px_chunks),
+                               duration_ms=trace.end("parse"))
+                except Exception as e:
+                    trace.emit("parse.extract", status="error", mode="llm",
+                               model=(polish_cfg.get("model") or ""),
+                               input_chars=_parse_in, output_chars=len(text),
+                               retry="", duration_ms=trace.end("parse"),
+                               error=str(e)[:300])
 
             transcript_path = _transcript_file(
                 author_dir, aweme_id, _serial_for(aweme_id))
+            trace.start("kb_write")
             _write_transcript_md(transcript_path, title, aweme_id,
                                  profile.get("nickname", ""), text)
+            trace.emit("kb.write", path=str(transcript_path),
+                       bytes=_safe_file_size(transcript_path),
+                       duration_ms=trace.end("kb_write"))
 
             if save_video:
                 saved = author_dir / f"{aweme_id}.mp4"
@@ -1061,7 +1108,8 @@ def batch_extract(
             _log_new_record(author_name, transcript_path, title)
             _report({"stage": "extract", "index": index + 1, "total": total,
                      "aweme_id": aweme_id, "title": title,
-                     "status": "ok", "output": str(transcript_path)})
+                     "status": "ok", "output": str(transcript_path),
+                     **trace.result_fields()})
         except BatchPausedByBilling:
             raise  # 欠费自动暂停：该视频未启动，不计失败
         except BatchCancelled:
@@ -1077,7 +1125,8 @@ def batch_extract(
                     pass
             _report({"stage": "extract", "index": index + 1, "total": total,
                      "aweme_id": aweme_id, "title": title,
-                     "status": "skip", "output": "", "error": str(e)[:300]})
+                     "status": "skip", "output": "", "error": str(e)[:300],
+                     **trace.result_fields()})
         except Exception as e:
             billing = _is_billing_error(e)
             from asr_backends import is_terminal_error
@@ -1107,7 +1156,8 @@ def batch_extract(
                      "status": "skip" if terminal else "fail",
                      "ignored": bool(terminal),
                      "error": (("已忽略（内容无效）：" + str(e))[:300]
-                               if terminal else str(e)[:300])})
+                               if terminal else str(e)[:300]),
+                     **trace.result_fields()})
             if billing:
                 # 余额不足：立即停止拉取新视频，并单独上报一条醒目事件
                 # （WebUI 横幅＋刷新月报＋driver 心跳都消费这条事件）。
@@ -1116,6 +1166,7 @@ def batch_extract(
                          "aweme_id": aweme_id,
                          "title": title})
         finally:
+            trace.flush()   # 一次批量落盘，不逐条同步刷
             _dyn_gate_release()
 
     workers = max(1, int(workers or 1))
