@@ -37,10 +37,14 @@ DASHSCOPE_MODEL = "qwen3-asr-flash"
 ARK_CHAT_URL = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
 ARK_MODEL = "doubao-seed-1-6-250615"
 
-# ASR quality gate (2026-11-03)
-DEFAULT_LANGUAGE = os.getenv("ASR_LANGUAGE", "zh")
+# ASR quality gate (2026-11-03; language-aware since 2026-11-08)
+# 默认不再写死中文：'auto' 表示走语种识别（DashScope enable_lid /
+# 兼容端点不传 language / Ark 按原语言转写）。需要强制时设 ASR_LANGUAGE=zh。
+DEFAULT_LANGUAGE = os.getenv("ASR_LANGUAGE", "auto")
 QUALITY_MIN_CJK_RATIO = float(os.getenv("ASR_MIN_CJK_RATIO", "0.5"))
 QUALITY_MAX_REPEAT_RATIO = float(os.getenv("ASR_MAX_REPEAT_RATIO", "0.3"))
+QUALITY_MIN_LATIN_RATIO = float(os.getenv("ASR_MIN_LATIN_RATIO", "0.6"))
+QUALITY_MIN_LATIN_LENGTH = int(os.getenv("ASR_MIN_TEXT_LENGTH_LATIN", "40"))
 # 30：2026-11-06 小样本实测，12-29 字档几乎全是音乐/幻听文本，
 # 下限放到 12 会把歌词当成功稿收进来（5/5 误收），故维持 30。
 QUALITY_MIN_LENGTH = int(os.getenv("ASR_MIN_TEXT_LENGTH", "30"))
@@ -179,27 +183,94 @@ def _lyric_hint(text: str) -> bool:
     return fill / float(len(chars)) >= 0.4
 
 
-def assess_transcript(text: str) -> dict:
+# 脚本判定用的字符集。只用于「识别成什么语言」，不做翻译。
+_CJK_RE = re.compile(r"[一-鿿]")
+_KANA_RE = re.compile(r"[぀-ヿ]")
+_HANGUL_RE = re.compile(r"[가-힯]")
+_LATIN_RE = re.compile(r"[A-Za-z]")
+_CYRILLIC_RE = re.compile(r"[Ѐ-ӿ]")
+_ARABIC_RE = re.compile(r"[؀-ۿ]")
+_THAI_RE = re.compile(r"[฀-๿]")
+_DEVANAGARI_RE = re.compile(r"[ऀ-ॿ]")
+
+
+def _normalize_language(language) -> Optional[str]:
+    """把 None/'auto'/空串统一成 None（= 走语种识别），其余小写透传。"""
+    lang = (DEFAULT_LANGUAGE if language is None else language) or ""
+    lang = str(lang).strip().lower()
+    return None if lang in ("", "auto", "none", "null") else lang
+
+
+def detect_text_language(text: str) -> dict:
+    """根据文本脚本判断语言，供 ASR 无语言标注时兜底。
+
+    只给能处理的语言命名：zh / ja / ko / latin（英法德西等拉丁字母语言）。
+    其余脚本（西里尔、阿拉伯、泰、天城文等）返回 unknown——调用方应如实
+    报「不支持」，而不是硬转成中文。
+    """
+    raw = (text or "").strip()
+    chars = [c for c in raw if not c.isspace()]
+    n = float(len(chars)) or 1.0
+    cjk = len(_CJK_RE.findall(raw))
+    kana = len(_KANA_RE.findall(raw))
+    hangul = len(_HANGUL_RE.findall(raw))
+    latin = len(_LATIN_RE.findall(raw))
+    cyrillic = len(_CYRILLIC_RE.findall(raw))
+    arabic = len(_ARABIC_RE.findall(raw))
+    thai = len(_THAI_RE.findall(raw))
+    devanagari = len(_DEVANAGARI_RE.findall(raw))
+
+    if kana / n >= 0.05:
+        lang = "ja"
+    elif hangul / n >= 0.3:
+        lang = "ko"
+    elif cjk / n >= 0.3:
+        lang = "zh"
+    elif latin / n >= 0.6:
+        lang = "latin"
+    else:
+        lang = "unknown"
+
+    return {
+        "language": lang,
+        "cjk_ratio": round(cjk / n, 4),
+        "kana_ratio": round(kana / n, 4),
+        "hangul_ratio": round(hangul / n, 4),
+        "latin_ratio": round(latin / n, 4),
+        "cyrillic_ratio": round(cyrillic / n, 4),
+        "arabic_ratio": round(arabic / n, 4),
+        "thai_ratio": round(thai / n, 4),
+        "devanagari_ratio": round(devanagari / n, 4),
+    }
+
+
+def assess_transcript(text: str, language: Optional[str] = None) -> dict:
     """Return a quality verdict for one ASR output.
 
-    Rules (2026-11-06):
+    Rules (2026-11-08, language-aware; Chinese rules unchanged):
       - empty / 'No text recognized' -> no_text
       - 音乐标签：短文本（<30 字）命中即拒；长文本按密度 >= 0.08 拒
         -> music_lyric（独立原因码，不并入 too_short_text / low_cjk）
-      - 歌词弱判据 + (音乐标签 或 low_cjk) -> music_lyric（可关，单独不判死）
-      - CJK ratio < 0.5 -> low_cjk (foreign lyrics / filler)
+      - 歌词弱判据 + (音乐标签 或 中文低 CJK) -> music_lyric（可关，单独不判死）
       - repeated 4-gram ratio >= 0.3 -> repetitive (hallucination loops)
-      - stripped length < 30 -> too_short_text
+      - 中文：CJK < 0.5 -> low_cjk；长度 < 30 -> too_short_text
+      - 拉丁字母语言：拉丁字符占比 < 0.6 -> low_latin；长度 < 40 -> too_short_text
+      - 日/韩：对应脚本占比不足 -> low_script；长度 < 30 -> too_short_text
+      - 其他无法判定的脚本 -> unsupported_language（不硬转、不误收）
     """
     raw = (text or "").strip()
+    lang = _normalize_language(language)
     if not raw or raw == NO_TEXT_MARK:
         return {"ok": False, "reason": "no_text", "cjk_ratio": 0.0,
+                "latin_ratio": 0.0, "language": lang or "unknown",
                 "repeat_ratio": 0.0, "length": 0, "quality": "no_text",
                 "music_ratio": 0.0, "lyric_hint": False}
 
+    detected = detect_text_language(raw)
+    lang = lang or detected["language"]
     chars = [c for c in raw if not c.isspace()]
-    cjk = len(re.findall(r"[一-鿿]", raw))
-    cjk_ratio = (cjk / len(chars)) if chars else 0.0
+    cjk_ratio = (len(_CJK_RE.findall(raw)) / float(len(chars))) if chars else 0.0
+    latin_ratio = detected["latin_ratio"]
 
     shingles = [raw[i:i + 4] for i in range(max(0, len(raw) - 3))]
     repeat_ratio = 0.0
@@ -211,23 +282,44 @@ def assess_transcript(text: str) -> dict:
     lyric_hint = _lyric_hint(raw) if LYRIC_HINT_ON else False
 
     reasons = []
-    # 音乐标签分两档判（见文件头注释）；歌词弱判据必须与音乐标签或低 CJK 同现
-    # 才拒，避免单靠它误杀真人短句。
+    # 音乐/幻听判据与语言无关：所有语种都保留。
     if music_tags and (len(raw) < MUSIC_SHORT_LEN or music_ratio >= MUSIC_TAG_RATIO):
         reasons.append("music_lyric")
-    elif lyric_hint and (music_tags or cjk_ratio < QUALITY_MIN_CJK_RATIO):
+    elif lyric_hint and (music_tags or (lang == "zh" and cjk_ratio < QUALITY_MIN_CJK_RATIO)):
         reasons.append("music_lyric")
-    if cjk_ratio < QUALITY_MIN_CJK_RATIO:
-        reasons.append("low_cjk")
     if repeat_ratio >= QUALITY_MAX_REPEAT_RATIO:
         reasons.append("repetitive")
-    if len(raw) < QUALITY_MIN_LENGTH:
-        reasons.append("too_short_text")
+
+    if lang == "zh":
+        if cjk_ratio < QUALITY_MIN_CJK_RATIO:
+            reasons.append("low_cjk")
+        if len(raw) < QUALITY_MIN_LENGTH:
+            reasons.append("too_short_text")
+    elif lang == "ja":
+        if (cjk_ratio + detected["kana_ratio"]) < 0.5:
+            reasons.append("low_script")
+        if len(raw) < QUALITY_MIN_LENGTH:
+            reasons.append("too_short_text")
+    elif lang == "ko":
+        if detected["hangul_ratio"] < 0.5:
+            reasons.append("low_script")
+        if len(raw) < QUALITY_MIN_LENGTH:
+            reasons.append("too_short_text")
+    elif lang == "latin":
+        if latin_ratio < QUALITY_MIN_LATIN_RATIO:
+            reasons.append("low_latin")
+        if len(raw) < QUALITY_MIN_LATIN_LENGTH:
+            reasons.append("too_short_text")
+    else:
+        reasons.append("unsupported_language")
 
     return {
         "ok": not reasons,
         "reason": reasons[0] if reasons else "ok",
         "cjk_ratio": round(cjk_ratio, 4),
+        "latin_ratio": round(latin_ratio, 4),
+        "language": lang,
+        "detected_language": detected["language"],
         "repeat_ratio": round(repeat_ratio, 4),
         "length": len(raw),
         "quality": "ok" if not reasons else "+".join(reasons),
@@ -236,12 +328,15 @@ def assess_transcript(text: str) -> dict:
     }
 
 
-def _check_text_or_raise(text: str, provider: str) -> str:
-    verdict = assess_transcript(text)
+def _check_text_or_raise(text: str, provider: str,
+                         language: Optional[str] = None) -> str:
+    verdict = assess_transcript(text, language=language)
     if not verdict["ok"]:
         raise TranscriptionError(
-            "asr_suspect[%s]: %s (cjk=%.2f repeat=%.2f len=%d music=%.3f hint=%s)" % (
-                provider, verdict["quality"], verdict["cjk_ratio"],
+            "asr_suspect[%s]: %s (lang=%s cjk=%.2f latin=%.2f repeat=%.2f "
+            "len=%d music=%.3f hint=%s)" % (
+                provider, verdict["quality"], verdict.get("language", ""),
+                verdict["cjk_ratio"], verdict.get("latin_ratio", 0.0),
                 verdict["repeat_ratio"], verdict["length"],
                 verdict.get("music_ratio", 0.0), verdict.get("lyric_hint", False))
         )
@@ -338,7 +433,7 @@ def _default_fallbacks(primary: str) -> List[str]:
     return order.get(primary, [])
 
 
-def transcribe_audio_file(
+def transcribe_audio_file_ex(
     audio_path: Path,
     api_key: str,
     provider: str = 'siliconflow',
@@ -347,15 +442,20 @@ def transcribe_audio_file(
     context: Optional[str] = None,
     language: Optional[str] = DEFAULT_LANGUAGE,
     fallbacks: Optional[List[str]] = None,
-) -> str:
+) -> dict:
     """Transcribe a local audio file with provider fallback + quality gate.
 
     Order: primary provider -> ASR_FALLBACKS (default dashscope/ark/siliconflow
     order). Providers without a configured key are skipped. A backend that
-    returns empty / foreign / repetitive text is treated as failure, so the
-    caller never writes a "successful" transcript from a song or silence.
+    returns empty / repetitive text is treated as failure; foreign-language
+    text is now accepted when its own script ratio passes the language-aware
+    gate (2026-11-08). Returns the transcript plus the language actually used:
+
+        {"text": str, "language": "zh|en|latin|ja|ko|unknown",
+         "provider": str, "verdict": {...}}
     """
     audio_path = Path(audio_path)
+    language = _normalize_language(language)
     configs = [resolve_backend(api_key, provider, model, api_base_url)]
     for name in (fallbacks if fallbacks is not None else _default_fallbacks(configs[0]['provider'])):
         try:
@@ -374,12 +474,25 @@ def transcribe_audio_file(
             else:
                 text = _transcribe_openai_compatible(
                     audio_path, cfg['api_key'], cfg['model'], cfg['api_base_url'], language, context)
-            return _check_text_or_raise(text, backend)
+            stripped = _check_text_or_raise(text, backend, language=language)
+            detected = detect_text_language(stripped)
+            effective = language or detected["language"]
+            return {
+                "text": stripped,
+                "language": effective,
+                "provider": backend,
+                "verdict": assess_transcript(stripped, language=effective),
+            }
         except AsrBalanceError:
             raise  # 欠费立即停批，不回落掩盖
         except Exception as e:
             errors.append("%s: %s" % (backend, str(e)[:160]))
     raise TranscriptionError("All ASR backends failed or produced suspect text -> " + " | ".join(errors))
+
+
+def transcribe_audio_file(*args, **kwargs) -> str:
+    """Backward-compatible wrapper: text only (old callers unchanged)."""
+    return transcribe_audio_file_ex(*args, **kwargs)["text"]
 
 
 def _transcribe_openai_compatible(
@@ -391,6 +504,7 @@ def _transcribe_openai_compatible(
     context: Optional[str] = None,
 ) -> str:
     """SiliconFlow / OpenAI / Groq / any compatible transcriptions endpoint."""
+    language = _normalize_language(language)
     try:
         with open(audio_path, 'rb') as audio_file:
             files = {
@@ -426,6 +540,7 @@ def _transcribe_dashscope(
     language: Optional[str] = DEFAULT_LANGUAGE,
 ) -> str:
     """Alibaba Bailian qwen3-asr via dashscope SDK."""
+    language = _normalize_language(language)
     try:
         import dashscope
     except ImportError:
@@ -473,6 +588,7 @@ def _transcribe_ark(
     (e.g. doubao-seed-1.6+ / doubao-seed-asr series).
     Audio must be <= 25MB for base64 upload.
     """
+    language = _normalize_language(language)
     size = audio_path.stat().st_size
     if size > ARK_MAX_AUDIO_SIZE:
         raise TranscriptionError(
@@ -481,6 +597,13 @@ def _transcribe_ark(
         )
 
     audio_b64 = base64.b64encode(audio_path.read_bytes()).decode('utf-8')
+    if language == "zh":
+        instruction = ("音频为中文，请逐字转写中文；若音频是外语歌曲/纯音乐，"
+                       "只输出语言标记或空，不要编造中文。")
+    else:
+        instruction = ((f"音频语言为 {language}，" if language else "")
+                       + "请按音频实际语言逐字转写原文，不要翻译成中文；"
+                         "若音频是纯音乐/无口播，只输出语言标记或空，不要编造内容。")
     payload = {
         "model": model,
         "messages": [
@@ -496,8 +619,7 @@ def _transcribe_ark(
                     },
                     {
                         "type": "text",
-                        "text": ("音频为中文，请逐字转写中文；若音频是外语歌曲/纯音乐，"
-                                 "只输出语言标记或空，不要编造中文。"
+                        "text": (instruction
                                  + ("\n上下文：" + context[:300] if context else "")
                                  + "\nOutput only the transcribed text, no explanations."),
                     },

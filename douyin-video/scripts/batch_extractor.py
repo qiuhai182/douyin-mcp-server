@@ -88,9 +88,23 @@ run_gate = threading.Event()
 # batch_extract() clears it on entry; web /api/profile/batch/abort sets it.
 cancel_flag = threading.Event()
 
+# 插队抢占控制：置位后不再启动任何新视频；已在跑的视频正常收尾，然后整批
+# 让出执行位给插队任务（不当作失败/终止，队列条目回到 pending 稍后续跑）。
+# batch_extract() 每轮开始时清除；WebUI 把条目设为插队时置位。
+preempt_flag = threading.Event()
+
 
 class BatchCancelled(Exception):
     """Raised inside worker threads when cancel_flag is seen."""
+
+
+class BatchPreempted(BatchCancelled):
+    """Raised when a jump task claimed the slot at a video boundary.
+
+    Subclasses BatchCancelled so any boundary already handling cancel also
+    stops starting new videos; the run loop checks it first to tell
+    "requeue and resume later" apart from a user abort.
+    """
 
 
 # 余额不足（HTTP 402）自动暂停：命中后不再启动任何新视频，剩余待解析
@@ -484,6 +498,12 @@ def _read_complete_transcript(path: Path) -> Optional[str]:
     if "## Transcript" not in content:
         return None
     tail = content.split("## Transcript", 1)[1].strip()
+    # 双语文件：原文段之后还有译文段，恢复/续跑只取原文
+    for marker in ("## 中文翻译", "## Translation"):
+        if marker in tail:
+            tail = tail.split(marker, 1)[0].strip()
+            tail = re.sub(r"\n*-{3,}\s*$", "", tail).strip()
+            break
     return tail or None
 
 
@@ -496,18 +516,30 @@ def _safe_file_size(path) -> Optional[int]:
 
 
 def _write_transcript_md(path: Path, title: str, aweme_id: str,
-                         author: str, text: str):
+                         author: str, text: str,
+                         language: str = "", translated_text: str = ""):
     """Write a transcript md atomically: .part file first, then rename, so
-    a crash mid-write can never leave a partial file that looks complete."""
+    a crash mid-write can never leave a partial file that looks complete.
+
+    Chinese output stays byte-for-byte structurally unchanged (no extra
+    metadata). Foreign videos add a Language row and, when translation
+    succeeded, a second '## 中文翻译' section; `text` is ALWAYS the original
+    transcript and is never replaced by the translation.
+    """
     path = Path(path)
     part = path.with_suffix(".md.part")
+    is_foreign = bool(language) and language != "zh"
     with open(part, 'w', encoding='utf-8') as f:
         f.write(f"# {title}\n\n")
         f.write("| Attribute | Value |\n|---|---|\n")
         f.write(f"| Video ID | `{aweme_id}` |\n")
         f.write(f"| Author | {author} |\n")
+        if is_foreign:
+            f.write(f"| Language | {language} |\n")
         f.write(f"| Extracted at | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} |\n\n")
         f.write(f"---\n\n## Transcript\n\n{text}\n")
+        if translated_text:
+            f.write(f"\n---\n\n## 中文翻译\n\n{translated_text}\n")
     part.replace(path)
 
 
@@ -646,7 +678,8 @@ def update_catalog(author_dir: Path, author: str = "") -> int:
 
 
 def save_transcript(author_dir: Path, aweme_id: str, title: str,
-                    author: str, text: str) -> Path:
+                    author: str, text: str,
+                    language: str = "", translated_text: str = "") -> Path:
     """Save one transcript into a per-author directory (single-video flow).
 
     One directory per UP: output/<author>/N-<aweme_id>.md. Legacy
@@ -662,7 +695,8 @@ def save_transcript(author_dir: Path, aweme_id: str, title: str,
         pass
     serial = _next_serial(author_dir, aweme_id)
     path = author_dir / f"{serial}-{aweme_id}.md"
-    _write_transcript_md(path, title, aweme_id, author, text)
+    _write_transcript_md(path, title, aweme_id, author, text,
+                         language=language, translated_text=translated_text)
     try:
         update_catalog(author_dir, author)
     except Exception:
@@ -744,6 +778,7 @@ def batch_extract(
     # restore) passes True so a user pause is sticky - nothing processes
     # until an explicit resume.
     cancel_flag.clear()
+    preempt_flag.clear()      # 新一轮开始：上一轮的插队抢占请求作废
     billing_shortage.clear()  # 新一轮开始：上一轮的欠费暂停状态作废
     global billing_message
     billing_message = ""
@@ -938,7 +973,9 @@ def batch_extract(
                     _write_transcript_md(
                         md_path,
                         (lib_rec.get("title") or title).strip() or title,
-                        aweme_id, profile.get("nickname", ""), text)
+                        aweme_id, profile.get("nickname", ""), text,
+                        language=(lib_rec.get("language") or ""),
+                        translated_text=(lib_rec.get("translated_text") or ""))
                 with state_lock:
                     if aweme_id not in lib_ids:
                         from transcript_library import append_record
@@ -948,6 +985,9 @@ def batch_extract(
                             output=str(md_path),
                             provider=backend_cfg['provider'],
                             model=backend_cfg['model'],
+                            language=(lib_rec.get("language") or ""),
+                            original_text=(lib_rec.get("original_text") or ""),
+                            translated_text=(lib_rec.get("translated_text") or ""),
                         )
                     history.add(aweme_id, title, str(md_path))
                     counters["ok"] += 1
@@ -981,10 +1021,16 @@ def batch_extract(
         while not run_gate.wait(0.5):
             if cancel_flag.is_set():
                 raise BatchCancelled()
+            if preempt_flag.is_set():
+                raise BatchPreempted()
             if billing_shortage.is_set():
                 raise BatchPausedByBilling()
         if cancel_flag.is_set():
             raise BatchCancelled()
+        # 判断点就在「取下一个视频之前」：插队任务一到，当前条做完就让位，
+        # 不会因为批内还有几十条而继续往下跑。
+        if preempt_flag.is_set():
+            raise BatchPreempted()
         if billing_shortage.is_set():
             raise BatchPausedByBilling()
         with start_lock:
@@ -1013,6 +1059,10 @@ def batch_extract(
         # live limit; cancel is re-checked inside _paced_start right after.
         _dyn_gate_acquire()
         _paced_start()
+        # 开始事件：WebUI 用它显示「正在处理哪一条」，并让后端把该批进度
+        # 记在权威状态里（与插队让位共用同一份运行态）。
+        _report({"stage": "video_start", "index": index + 1, "total": total,
+                 "aweme_id": aweme_id, "title": title})
         try:
             share_url = f"https://www.iesdouyin.com/share/video/{aweme_id}"
             trace.start("resolve")
@@ -1028,24 +1078,30 @@ def batch_extract(
             audio_path = processor.extract_audio(video_path, show_progress=False)
             audio_info = processor.get_audio_info(audio_path)
             try:
-                text = processor.extract_text_from_audio(audio_path, show_progress=False)
+                asr_result = processor.extract_text_from_audio_ex(
+                    audio_path, show_progress=False)
             finally:
                 processor.cleanup_files(audio_path)
+            text = asr_result["text"]
+            language = asr_result["language"] or "unknown"
 
             # Hard quality gate before any success write (2026-11-03):
             # empty / foreign lyrics / repetitive filler / too-short text
             # never reaches the transcript file or the global library.
-            from asr_backends import assess_transcript, TranscriptionError
-            verdict = assess_transcript(text)
+            # 语言分流在 assess_transcript 内完成（中文看 CJK，外文看拉丁占比）。
+            from asr_backends import TranscriptionError
+            verdict = asr_result["verdict"]
             if not verdict["ok"]:
                 raise TranscriptionError(
-                    "asr_suspect: %s (cjk=%.2f repeat=%.2f len=%d music=%.3f hint=%s)" % (
-                        verdict["quality"], verdict["cjk_ratio"],
-                        verdict["repeat_ratio"], verdict["length"],
-                        verdict.get("music_ratio", 0.0), verdict.get("lyric_hint", False)))
+                    "asr_suspect: %s (lang=%s cjk=%.2f latin=%.2f repeat=%.2f len=%d music=%.3f hint=%s)" % (
+                        verdict["quality"], language, verdict["cjk_ratio"],
+                        verdict.get("latin_ratio", 0.0), verdict["repeat_ratio"],
+                        verdict["length"], verdict.get("music_ratio", 0.0),
+                        verdict.get("lyric_hint", False)))
 
-            # Optional LLM polish (fixes homophones/punctuation)
-            if polish_cfg.get("enabled"):
+            # Optional LLM polish (fixes homophones/punctuation). The prompt is
+            # Chinese-specific, so it only runs for Chinese transcripts.
+            if language == "zh" and polish_cfg.get("enabled"):
                 _parse_in = len(text)
                 trace.start("parse")
                 try:
@@ -1069,11 +1125,38 @@ def batch_extract(
                                retry="", duration_ms=trace.end("parse"),
                                error=str(e)[:300])
 
+            # 外文：校对之后、写 md 之前翻译成中文。翻译失败时保留原文，
+            # 绝不用空译文或混合文本覆盖原文。
+            translated_text = ""
+            if language != "zh":
+                trace.start("translate")
+                try:
+                    from transcript_polish import translate_transcript
+                    _tr_stats = []
+                    translated_text = translate_transcript(text, stats=_tr_stats)
+                    trace.emit("translate",
+                               status="ok" if translated_text else "skip",
+                               mode="llm",
+                               model=(polish_cfg.get("model") or ""),
+                               input_chars=len(text),
+                               output_chars=len(translated_text),
+                               retry="",
+                               duration_ms=trace.end("translate"),
+                               error=None if translated_text else "translation unavailable or failed")
+                except Exception as e:
+                    trace.emit("translate", status="error", mode="llm",
+                               model=(polish_cfg.get("model") or ""),
+                               input_chars=len(text), output_chars=0,
+                               retry="", duration_ms=trace.end("translate"),
+                               error=str(e)[:300])
+
             transcript_path = _transcript_file(
                 author_dir, aweme_id, _serial_for(aweme_id))
             trace.start("kb_write")
             _write_transcript_md(transcript_path, title, aweme_id,
-                                 profile.get("nickname", ""), text)
+                                 profile.get("nickname", ""), text,
+                                 language=language,
+                                 translated_text=translated_text)
             trace.emit("kb.write", path=str(transcript_path),
                        bytes=_safe_file_size(transcript_path),
                        duration_ms=trace.end("kb_write"))
@@ -1097,7 +1180,9 @@ def batch_extract(
                     provider=backend_cfg['provider'],
                     model=backend_cfg['model'],
                     duration=audio_info.get('duration'),
-                    language='zh',
+                    language=language,
+                    original_text=text if language != "zh" else "",
+                    translated_text=translated_text,
                     cjk_ratio=verdict['cjk_ratio'],
                     retry_count=0,
                     quality=verdict['quality'],
@@ -1171,10 +1256,14 @@ def batch_extract(
 
     workers = max(1, int(workers or 1))
     cancelled = False
+    preempted = False
     if workers == 1 or len(pending) <= 1:
         for index, aweme_id, title in pending:
             try:
                 _process_one(index, aweme_id, title)
+            except BatchPreempted:
+                preempted = True
+                break
             except (BatchCancelled, BatchPausedByBilling):
                 cancelled = True
                 break
@@ -1187,6 +1276,8 @@ def batch_extract(
             for f in futures:
                 try:
                     f.result()  # errors are reported inside _process_one
+                except BatchPreempted:
+                    preempted = True  # in-flight ones still finish
                 except (BatchCancelled, BatchPausedByBilling):
                     cancelled = True  # still wait for the in-flight ones
 
@@ -1208,6 +1299,13 @@ def batch_extract(
         "resumed": counters["resumed"],
         "output_dir": str(author_dir),
     }
+    if preempted:
+        # 插队抢占：不是失败也不是用户终止——剩余视频原样留在历史里，队列
+        # 条目会被重新置为 pending，插队任务跑完后自动续跑（已完成的不重跑）。
+        summary["preempted"] = True
+        _report({"stage": "preempted", "ok": ok, "skip": skip, "fail": fail})
+        _dyn_gate = None
+        return summary
     if billing_shortage.is_set():
         # 与用户主动终止区分：余额不足是「自动暂停」，剩余视频留待充值后重跑
         summary["billing_paused"] = True
@@ -1253,6 +1351,8 @@ class _DynamicGate:
             while self._active >= self._limit:
                 if cancel_flag.is_set():
                     raise BatchCancelled()
+                if preempt_flag.is_set():
+                    raise BatchPreempted()
                 self._cond.wait(0.5)  # periodic wake: observe limit raises too
             self._active += 1
 

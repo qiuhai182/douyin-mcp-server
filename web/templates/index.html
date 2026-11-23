@@ -111,11 +111,11 @@
         }
     </style>
 </head>
-<body class="bg-douyin-gray-50 min-h-screen lg:h-screen lg:overflow-hidden bg-gradient-mesh flex flex-col" x-data="douyinExtractor()" x-init="checkHealth(); loadPendingLinks(); startQueueWatchers(); window.addEventListener('pageshow', () => { pendingLinkInput = ''; document.querySelectorAll('.pending-link-input').forEach(el => { el.value = ''; }); })">
+<body class="bg-douyin-gray-50 min-h-screen xl:h-screen xl:overflow-hidden bg-gradient-mesh flex flex-col" x-data="douyinExtractor()" x-init="checkHealth(); loadPendingLinks(); startQueueWatchers(); window.addEventListener('pageshow', () => { pendingLinkInput = ''; document.querySelectorAll('.pending-link-input').forEach(el => { el.value = ''; }); })">
 
     <!-- Top Navigation Bar -->
     <nav class="sticky top-0 z-50 flex-shrink-0 bg-white/80 backdrop-blur-xl border-b border-douyin-gray-100">
-        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+        <div class="max-w-[1680px] mx-auto px-4 sm:px-6 lg:px-8">
             <div class="flex items-center justify-between h-16">
                 <!-- Logo -->
                 <div class="flex items-center gap-3">
@@ -131,7 +131,14 @@
                 </div>
 
                 <!-- API Status Badge -->
-                <div class="flex items-center gap-4">
+                <div class="flex items-center gap-3">
+                    <button @click="openSchedule()"
+                            class="flex items-center gap-2 px-3 py-1.5 rounded-full text-sm bg-douyin-gray-100 text-douyin-gray-700 hover:bg-douyin-gray-200 transition-smooth">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                        </svg>
+                        <span>定时任务</span>
+                    </button>
                     <button @click="showSettings = true"
                             class="flex items-center gap-2 px-3 py-1.5 rounded-full text-sm cursor-pointer hover:opacity-80 transition-smooth"
                             :class="apiKeyConfigured ? 'bg-green-50 text-green-700' : 'bg-amber-50 text-amber-700'">
@@ -343,6 +350,285 @@
         </div>
     </div>
 
+    <!-- Scheduled Tasks Modal (config-driven, saved -> Windows task re-registered) -->
+    <div x-show="showSchedule" x-transition.opacity class="fixed inset-0 z-50 bg-black/50 backdrop-blur-sm flex items-center justify-center p-4"
+         @click.self="showSchedule = false">
+        <div x-show="showSchedule" x-transition:enter="transition ease-out duration-200"
+             x-transition:enter-start="opacity-0 scale-95" x-transition:enter-end="opacity-100 scale-100"
+             class="bg-white rounded-2xl shadow-2xl max-w-2xl w-full p-6 animate-fadeIn max-h-[90vh] overflow-y-auto">
+            <div class="flex items-center justify-between mb-5">
+                <div class="flex items-center gap-3">
+                    <div class="w-10 h-10 bg-gradient-douyin rounded-xl flex items-center justify-center">
+                        <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                        </svg>
+                    </div>
+                    <div>
+                        <h3 class="text-lg font-semibold text-douyin-gray-900">定时任务</h3>
+                        <p class="text-xs text-douyin-gray-400">列出已配置任务与 Windows 实际登记状态，可直接新增／编辑／删除／启停</p>
+                    </div>
+                </div>
+                <button @click="showSchedule = false" class="w-8 h-8 rounded-full hover:bg-douyin-gray-100 flex items-center justify-center">
+                    <svg class="w-5 h-5 text-douyin-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                    </svg>
+                </button>
+            </div>
+
+            <div class="flex items-center justify-between gap-3">
+                <p class="text-xs text-douyin-gray-500">
+                    共 <span class="font-semibold text-douyin-gray-800" x-text="scheduleTasks.length"></span> 条
+                    <span x-show="scheduleMismatch" class="ml-2 px-1.5 py-0.5 rounded bg-amber-50 text-amber-700"
+                          x-text="scheduleMismatch + ' 处配置/系统不一致'"></span>
+                    <span x-show="scheduleDirty" class="ml-2 text-douyin-red">有未保存修改</span>
+                </p>
+                <button @click="startNewTask()"
+                        class="h-8 px-3 rounded-lg text-xs font-medium bg-douyin-gray-100 text-douyin-gray-700 hover:bg-douyin-gray-200 transition-smooth">
+                    + 新增任务
+                </button>
+            </div>
+
+            <p x-show="scheduleScanError" class="text-xs text-red-500">
+                计划任务状态读取失败：<span class="font-mono" x-text="scheduleScanError"></span>
+            </p>
+            <p x-show="scheduleLoading" class="text-sm text-douyin-gray-500 py-6 text-center">读取配置与计划任务状态…</p>
+
+            <!-- 新增任务 -->
+            <template x-if="scheduleDraft">
+            <div class="border-2 border-dashed border-douyin-red/40 bg-douyin-red/5 rounded-xl p-4 space-y-3">
+                <p class="text-xs font-semibold text-douyin-gray-800">新增定时任务</p>
+                <div class="grid grid-cols-2 gap-3">
+                    <div>
+                        <label class="block text-xs font-medium text-douyin-gray-600 mb-1">任务 ID <span class="text-douyin-gray-400 font-normal">（字母/数字/-/_，保存后不可改）</span></label>
+                        <input x-model="scheduleDraft.id" placeholder="例如 weekly_review"
+                               class="w-full px-3 py-2 text-sm border border-douyin-gray-200 rounded-lg font-mono">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-medium text-douyin-gray-600 mb-1">显示名称</label>
+                        <input x-model="scheduleDraft.label" placeholder="例如 每周复盘"
+                               class="w-full px-3 py-2 text-sm border border-douyin-gray-200 rounded-lg">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-medium text-douyin-gray-600 mb-1">计划任务名</label>
+                        <input x-model="scheduleDraft.task_name" placeholder="例如 DouyinWeeklyReview"
+                               class="w-full px-3 py-2 text-sm border border-douyin-gray-200 rounded-lg font-mono">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-medium text-douyin-gray-600 mb-1">入口脚本 <span class="text-douyin-gray-400 font-normal">（相对项目根目录）</span></label>
+                        <input x-model="scheduleDraft.script" placeholder="scripts/scheduled_refresh.py"
+                               class="w-full px-3 py-2 text-sm border border-douyin-gray-200 rounded-lg font-mono">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-medium text-douyin-gray-600 mb-1">参数</label>
+                        <input x-model="scheduleDraft.arguments" placeholder="--once"
+                               class="w-full px-3 py-2 text-sm border border-douyin-gray-200 rounded-lg font-mono">
+                    </div>
+                    <div class="flex gap-3">
+                        <div>
+                            <label class="block text-xs font-medium text-douyin-gray-600 mb-1">执行时间</label>
+                            <input type="time" x-model="scheduleDraft.time"
+                                   class="px-3 py-2 text-sm border border-douyin-gray-200 rounded-lg font-mono">
+                        </div>
+                        <div>
+                            <label class="block text-xs font-medium text-douyin-gray-600 mb-1">间隔（天）</label>
+                            <input type="number" min="1" max="30" x-model.number="scheduleDraft.interval_days"
+                                   class="w-20 px-3 py-2 text-sm border border-douyin-gray-200 rounded-lg font-mono">
+                        </div>
+                    </div>
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-douyin-gray-600 mb-1">
+                        星期范围 <span class="text-douyin-gray-400 font-normal">（全选 = 每天；不选满则忽略「间隔」）</span>
+                    </label>
+                    <div class="flex gap-1.5">
+                        <template x-for="d in [1,2,3,4,5,6,7]" :key="'draft-' + d">
+                            <button @click="toggleScheduleDay(scheduleDraft, d)"
+                                    class="w-8 h-8 rounded-lg text-xs font-medium border transition-smooth"
+                                    :class="(scheduleDraft.weekdays && scheduleDraft.weekdays.length ? scheduleDraft.weekdays.includes(d) : true)
+                                        ? 'bg-douyin-red text-white border-douyin-red'
+                                        : 'bg-white text-douyin-gray-500 border-douyin-gray-200'"
+                                    x-text="weekdayLabel(d)"></button>
+                        </template>
+                    </div>
+                </div>
+                <div class="flex gap-2">
+                    <button @click="scheduleDraft = null"
+                            class="h-9 px-3 rounded-lg text-xs text-douyin-gray-600 border border-douyin-gray-200 hover:bg-white">取消</button>
+                    <button @click="commitDraft()"
+                            class="h-9 px-3 rounded-lg text-xs font-medium bg-douyin-red text-white hover:opacity-90">加入列表</button>
+                    <span class="text-[11px] text-douyin-gray-400 self-center">加入后点下方「保存并重登记」才会写入配置并登记计划任务</span>
+                </div>
+            </div>
+            </template>
+
+            <div class="space-y-4">
+                <template x-for="t in scheduleTasks" :key="t.id">
+                    <div class="border border-douyin-gray-200 rounded-xl p-4 space-y-3">
+                        <div class="flex items-start justify-between gap-2">
+                            <div class="min-w-0 flex-1">
+                                <div class="flex items-center gap-2 flex-wrap">
+                                    <p class="text-sm font-semibold text-douyin-gray-900" x-text="t.label"></p>
+                                    <span class="text-[10px] font-mono text-douyin-gray-400" x-text="'#' + t.id"></span>
+                                    <template x-for="(is, i) in (t.issues || [])" :key="t.id + '-issue-' + i">
+                                        <span class="px-1.5 py-0.5 rounded text-[10px] font-medium"
+                                              :class="scheduleIssueClass(is.code)" x-text="is.text"></span>
+                                    </template>
+                                </div>
+                                <p class="text-[11px] text-douyin-gray-400 font-mono break-all"
+                                   x-text="'计划任务名：' + t.task_name + (t.task_path && t.task_path !== '\\' ? '（' + t.task_path + '）' : '')"></p>
+                            </div>
+                            <div class="flex items-center gap-1.5 shrink-0">
+                                <button @click="toggleTaskEnabled(t)"
+                                        class="relative inline-flex h-6 w-11 items-center rounded-full transition-smooth"
+                                        :class="t.enabled ? 'bg-green-500' : 'bg-douyin-gray-300'"
+                                        :title="t.enabled ? '点击停用' : '点击启用'">
+                                    <span class="inline-block h-4 w-4 transform rounded-full bg-white transition-transform"
+                                          :class="t.enabled ? 'translate-x-6' : 'translate-x-1'"></span>
+                                </button>
+                                <button @click="scheduleEditing = (scheduleEditing === t.id ? '' : t.id)"
+                                        class="h-7 px-2 rounded-lg text-[11px] border border-douyin-gray-200 text-douyin-gray-600 hover:bg-douyin-gray-50"
+                                        x-text="scheduleEditing === t.id ? '收起' : '编辑'"></button>
+                                <button @click="removeTask(t)"
+                                        class="h-7 px-2 rounded-lg text-[11px] border border-red-200 text-red-500 hover:bg-red-50">删除</button>
+                            </div>
+                        </div>
+
+                        <div class="text-xs text-douyin-gray-500 space-y-1 bg-douyin-gray-50 rounded-lg px-3 py-2">
+                            <p>生效：<span class="font-medium text-douyin-gray-800" x-text="t.effective"></span>
+                               <span class="text-douyin-gray-400" x-text="t.enabled ? '｜已启用' : '｜已停用'"></span>
+                            </p>
+                            <p>脚本：<span class="font-mono text-douyin-gray-700 break-all" x-text="t.script"></span><span
+                                    class="font-mono text-douyin-gray-500" x-text="t.arguments ? ' ' + t.arguments : '（无参数）'"></span></p>
+                            <p>系统：
+                                <span :class="t.registered ? 'text-green-600' : 'text-red-500'"
+                                      x-text="scheduleSysText(t)"></span>
+                                <span x-show="t.next_run" class="text-douyin-gray-400" x-text="'｜下次 ' + t.next_run"></span>
+                                <span x-show="t.registered" class="text-douyin-gray-400"
+                                      x-text="'｜计划任务返回码 ' + (t.last_task_result || '—')"></span>
+                            </p>
+                            <p>上次运行：
+                                <span class="inline-block px-1.5 py-0.5 rounded text-[11px]"
+                                      :class="scheduleStatusClass(t)" x-text="scheduleStatusLabel(t)"></span>
+                                <span class="text-douyin-gray-400" x-text="scheduleStatusDetail(t)"></span>
+                            </p>
+                        </div>
+
+                        <!-- 编辑 -->
+                        <div x-show="scheduleEditing === t.id" class="border-t border-dashed border-douyin-gray-200 pt-3 space-y-3">
+                            <div class="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label class="block text-xs font-medium text-douyin-gray-600 mb-1">显示名称</label>
+                                    <input x-model="t.label" @input="scheduleDirty = true"
+                                           class="w-full px-3 py-2 text-sm border border-douyin-gray-200 rounded-lg">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-medium text-douyin-gray-600 mb-1">计划任务名 <span class="text-douyin-gray-400 font-normal">（改名会先注销旧登记）</span></label>
+                                    <input x-model="t.task_name" @input="scheduleDirty = true"
+                                           class="w-full px-3 py-2 text-sm border border-douyin-gray-200 rounded-lg font-mono">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-medium text-douyin-gray-600 mb-1">入口脚本</label>
+                                    <input x-model="t.script" @input="scheduleDirty = true"
+                                           class="w-full px-3 py-2 text-sm border border-douyin-gray-200 rounded-lg font-mono">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-medium text-douyin-gray-600 mb-1">参数</label>
+                                    <input x-model="t.arguments" @input="scheduleDirty = true"
+                                           class="w-full px-3 py-2 text-sm border border-douyin-gray-200 rounded-lg font-mono">
+                                </div>
+                                <div class="flex gap-3">
+                                    <div>
+                                        <label class="block text-xs font-medium text-douyin-gray-600 mb-1">执行时间</label>
+                                        <input type="time" x-model="t.time" @input="scheduleDirty = true"
+                                               class="px-3 py-2 text-sm border border-douyin-gray-200 rounded-lg font-mono">
+                                    </div>
+                                    <div>
+                                        <label class="block text-xs font-medium text-douyin-gray-600 mb-1">间隔（天）</label>
+                                        <input type="number" min="1" max="30" x-model.number="t.interval_days"
+                                               @input="scheduleDirty = true" :disabled="t.weekdays && t.weekdays.length"
+                                               class="w-20 px-3 py-2 text-sm border border-douyin-gray-200 rounded-lg font-mono disabled:bg-douyin-gray-50 disabled:text-douyin-gray-400">
+                                    </div>
+                                </div>
+                                <div x-show="t.id === 'refresh'">
+                                    <label class="block text-xs font-medium text-douyin-gray-600 mb-1">并发</label>
+                                    <input type="number" min="1" max="10" x-model.number="t.workers" @input="scheduleDirty = true"
+                                           class="w-20 px-3 py-2 text-sm border border-douyin-gray-200 rounded-lg font-mono">
+                                </div>
+                            </div>
+                            <div>
+                                <label class="block text-xs font-medium text-douyin-gray-600 mb-1">
+                                    星期范围 <span class="text-douyin-gray-400 font-normal">（全选 = 每天；不选满则忽略「间隔」）</span>
+                                </label>
+                                <div class="flex gap-1.5">
+                                    <template x-for="d in [1,2,3,4,5,6,7]" :key="t.id + '-' + d">
+                                        <button @click="toggleScheduleDay(t, d)"
+                                                class="w-8 h-8 rounded-lg text-xs font-medium border transition-smooth"
+                                                :class="(t.weekdays && t.weekdays.length ? t.weekdays.includes(d) : true)
+                                                    ? 'bg-douyin-red text-white border-douyin-red'
+                                                    : 'bg-white text-douyin-gray-500 border-douyin-gray-200'"
+                                                x-text="weekdayLabel(d)"></button>
+                                    </template>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </template>
+                <p x-show="!scheduleLoading && !scheduleTasks.length" class="text-sm text-douyin-gray-400 py-6 text-center">
+                    暂无定时任务，点右上「新增任务」。
+                </p>
+            </div>
+
+            <div x-show="scheduleOrphans.length" class="mt-4 border border-amber-200 bg-amber-50 rounded-xl p-3 space-y-1">
+                <p class="text-xs font-semibold text-amber-800">系统里已登记、配置里没有（未自动删除，需确认后处理）</p>
+                <template x-for="(o, i) in scheduleOrphans" :key="'orphan-' + i">
+                    <p class="text-[11px] font-mono text-amber-700 break-all">
+                        <span x-text="o.task_name"></span>
+                        <span class="text-amber-500"
+                              x-text="'｜' + (o.task_path || '\\') + '｜' + (o.state || '') + (o.next_run ? '｜下次 ' + o.next_run : '')"></span>
+                        <span class="text-amber-500" x-text="o.arguments ? '｜' + o.arguments : ''"></span>
+                    </p>
+                </template>
+            </div>
+
+            <div x-show="scheduleDuplicates.length" class="mt-4 border border-red-200 bg-red-50 rounded-xl p-3 space-y-1">
+                <p class="text-xs font-semibold text-red-700">同名多份</p>
+                <template x-for="(d, i) in scheduleDuplicates" :key="'dup-' + i">
+                    <p class="text-[11px] text-red-600 break-all">
+                        <span x-text="(d.scope === 'config' ? '配置内：' : '系统内：') + d.task_name"></span>
+                        <span x-text="d.ids ? '（任务 ' + d.ids.join('、') + '）' : '（' + (d.paths || []).join('、') + '）'"></span>
+                    </p>
+                </template>
+            </div>
+
+            <div x-show="scheduleReg.length" class="mt-4 space-y-1">
+                <template x-for="(r, i) in scheduleReg" :key="i">
+                    <p class="text-xs text-douyin-gray-600">
+                        <span :class="r.ok ? 'text-green-600' : 'text-red-500'" x-text="r.ok ? '✓' : '✗'"></span>
+                        <span x-text="r.readable || r.message"></span>
+                    </p>
+                </template>
+            </div>
+
+            <div class="flex gap-3 mt-5">
+                <button @click="showSchedule = false"
+                        class="flex-1 h-11 border border-douyin-gray-200 hover:bg-douyin-gray-50 text-douyin-gray-700 font-medium text-sm rounded-xl transition-smooth">
+                    关闭
+                </button>
+                <button @click="saveSchedule()" :disabled="scheduleSaving"
+                        class="flex-1 h-11 bg-gradient-douyin hover:opacity-90 text-white font-medium text-sm rounded-xl transition-smooth flex items-center justify-center gap-2 shadow-lg shadow-douyin-red/20 disabled:opacity-60">
+                    <svg x-show="!scheduleSaving" class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                    </svg>
+                    <span x-text="scheduleSaving ? '保存并重登记…' : '保存并重登记计划任务'"></span>
+                </button>
+            </div>
+            <p class="mt-3 text-[11px] text-douyin-gray-400">
+                配置文件：<span class="font-mono" x-text="scheduleConfigPath || 'schedule.json'"></span>
+                （保存在项目目录；计划任务登记在 Windows 任务计划程序根目录，保存后立即刷新列表，无需重启程序）
+            </p>
+        </div>
+    </div>
+
     <!-- Help Modal -->
     <div x-show="showHelp" x-transition.opacity class="fixed inset-0 z-50 bg-black/50 backdrop-blur-sm flex items-center justify-center p-4"
          @click.self="showHelp = false">
@@ -449,9 +735,10 @@
             </div>
             <p x-show="pendingLinkMsg" x-transition class="px-6 pt-2 text-xs text-green-600 flex-shrink-0" x-text="pendingLinkMsg"></p>
             <!-- List -->
-            <div class="flex-1 overflow-y-auto px-6 py-3 space-y-2">
+            <div class="flex-1 overflow-y-auto px-6 py-3 space-y-2" style="overflow-anchor: none">
                 <template x-for="it in pendingLinks" :key="it.id">
                     <div class="bg-douyin-gray-50 rounded-xl px-3 py-2.5 flex items-center gap-2.5"
+                         :data-pending-id="it.id"
                          :draggable="editingLinkId !== it.id"
                          @dragstart="onLinkDragStart(it, $event)"
                          @dragover.prevent="onLinkDragOver(it, $event)"
@@ -490,14 +777,28 @@
                             </div>
                         </template>
                         <span class="flex-shrink-0 text-[10px] px-1.5 py-0.5 rounded"
-                              :class="pendingStatusClass(it.status)" x-text="pendingStatusLabel(it.status)"></span>
+                              :class="pendingStatusClass(it)" x-text="pendingStatusLabel(it)"></span>
                         <template x-if="editingLinkId !== it.id">
                             <div class="flex-shrink-0 flex items-center gap-1">
-                                <button x-show="it.status === 'pending'" @click="pinPendingLink(it)"
+                                <button x-show="it.status === 'pending'" @click="movePendingLink($event, it, 'pin')"
+                                        data-move-op="pin"
                                         title="置顶：排到队首，下次调度先执行它"
                                         class="h-6 px-1.5 rounded-lg bg-douyin-gray-100 hover:bg-amber-50 text-[10px] text-douyin-gray-500 hover:text-amber-600 transition-smooth">置顶</button>
-                                <button x-show="it.status === 'pending'" @click="jumpPendingLink(it)"
-                                        title="插队：插到下一个执行（不打断正在处理的那条）"
+                                <button x-show="it.status === 'pending'" @click="movePendingLink($event, it, 'up')"
+                                        data-move-op="up"
+                                        title="上移：与上一条待执行任务交换位置"
+                                        class="h-6 px-1.5 rounded-lg bg-douyin-gray-100 hover:bg-douyin-gray-200 text-[10px] text-douyin-gray-500 hover:text-douyin-gray-800 transition-smooth">上移</button>
+                                <button x-show="it.status === 'pending'" @click="movePendingLink($event, it, 'down')"
+                                        data-move-op="down"
+                                        title="下移：与下一条待执行任务交换位置"
+                                        class="h-6 px-1.5 rounded-lg bg-douyin-gray-100 hover:bg-douyin-gray-200 text-[10px] text-douyin-gray-500 hover:text-douyin-gray-800 transition-smooth">下移</button>
+                                <button x-show="it.status === 'pending'" @click="movePendingLink($event, it, 'bottom')"
+                                        data-move-op="bottom"
+                                        title="置底：排到所有待执行任务之后，最后才执行它"
+                                        class="h-6 px-1.5 rounded-lg bg-douyin-gray-100 hover:bg-sky-50 text-[10px] text-douyin-gray-500 hover:text-sky-600 transition-smooth">置底</button>
+                                <button x-show="it.status === 'pending'" @click="movePendingLink($event, it, 'jump')"
+                                        data-move-op="jump"
+                                        title="插队：最高优先级——批量立即停止取新视频，当前条做完就让位"
                                         class="h-6 px-1.5 rounded-lg bg-douyin-gray-100 hover:bg-blue-50 text-[10px] text-douyin-gray-500 hover:text-blue-600 transition-smooth">插队</button>
                                 <button @click="startEditLink(it)" :disabled="it.status !== 'pending'" title="编辑链接"
                                         class="w-6 h-6 rounded-lg bg-douyin-gray-100 hover:bg-blue-50 flex items-center justify-center disabled:opacity-40 disabled:cursor-not-allowed transition-smooth">
@@ -646,7 +947,7 @@
                         </span>
                         <span x-show="!runLogsLive" class="px-1.5 py-0.5 rounded-full bg-douyin-gray-100 text-douyin-gray-400 text-[10px] font-medium">已暂停</span>
                     </h3>
-                    <p class="text-xs text-douyin-gray-400 mt-0.5">分类（成功/跳过/失败/错误）只显示任务与文案结果；驱动输出与 Web 动作日志只在【全部】里出现 · 最新在前，可下翻历史</p>
+                    <p class="text-xs text-douyin-gray-400 mt-0.5">左组按结果分类（成功/跳过/失败/错误，只含任务与文案结果）；右组按来源分类（视频结果/程序动作/批量进度/驱动输出）· 最新在前，可下翻历史</p>
                 </div>
                 <button @click="closeRunLogModal()"
                         class="flex-shrink-0 w-8 h-8 rounded-lg bg-douyin-gray-100 hover:bg-douyin-gray-200 flex items-center justify-center transition-smooth">
@@ -665,20 +966,33 @@
                         x-text="runLogsLive ? '暂停实时' : '恢复实时'"></button>
                 <button @click="loadRunLogs()" class="text-xs text-douyin-gray-400 hover:text-douyin-gray-600 ml-1.5">刷新</button>
                 <template x-for="f in [['all','全部'],['ok','成功'],['skip','跳过'],['fail','失败'],['error','错误']]">
-                    <button @click="runLogFilter = f[0]; loadRunLogs()"
+                    <button @click="runLogFilter = f[0]; if (f[0] !== 'all') runLogKind = ''; loadRunLogs()"
                             class="px-2.5 py-1 rounded-full text-xs transition-smooth border"
                             :class="runLogFilter === f[0]
                                     ? 'bg-douyin-gray-800 text-white border-douyin-gray-800'
                                     : 'bg-white text-douyin-gray-500 border-douyin-gray-200 hover:bg-douyin-gray-50'"
                             x-text="f[1]"></button>
                 </template>
+                <span class="w-px h-4 bg-douyin-gray-200 mx-1"></span>
+                <!-- 来源/类型：把「藏在全部里」的程序动作、批量进度、驱动输出分出来 -->
+                <template x-for="k in [['','全部来源'],['video','视频结果'],['action','程序动作'],['progress','批量进度'],['scheduler','定时任务'],['driver','驱动输出']]">
+                    <button @click="runLogKind = k[0]; loadRunLogs()"
+                            class="px-2.5 py-1 rounded-full text-xs transition-smooth border"
+                            :class="runLogKind === k[0] && runLogFilter === 'all'
+                                    ? 'bg-blue-50 text-blue-600 border-blue-300'
+                                    : 'bg-white text-douyin-gray-500 border-douyin-gray-200 hover:bg-douyin-gray-50'"
+                            :disabled="runLogFilter !== 'all'"
+                            :title="runLogFilter !== 'all' ? '状态分类下只显示任务/文案结果；取消状态分类后可按来源筛选' : ''"
+                            x-text="k[1]"></button>
+                </template>
                 <span class="flex-1"></span>
                 <span class="text-[11px] text-douyin-gray-400" x-text="runLogs.length + ' 条'"></span>
             </div>
             <!-- Stream -->
             <div class="flex-1 overflow-y-auto px-6 py-2 font-mono">
-                <template x-for="(it, i) in runLogs" :key="runLogKey(it) + '-' + i">
+                <template x-for="it in runLogs" :key="it._k">
                     <div class="flex items-start gap-2 py-1.5 border-b border-douyin-gray-50 hover:bg-douyin-gray-50/60"
+                         style="content-visibility:auto; contain-intrinsic-size:auto 34px"
                          :class="['fail','error'].includes(it.status) ? 'bg-red-50/40' : ''">
                         <span class="whitespace-nowrap text-[11px] text-douyin-gray-400 pt-0.5"
                               x-text="(it.ts || '').slice(5)"></span>
@@ -687,19 +1001,25 @@
                               class="px-1.5 py-0.5 rounded-full text-[10px] font-medium flex-shrink-0"
                               :class="runLogStatusClass(it.status)"
                               x-text="runLogStatusLabel(it.status)"></span>
-                        <!-- 驱动 / Web 行：来源徽标 -->
+                        <!-- 驱动 / 动作 / 进度 / 定时 行：来源徽标 -->
                         <span x-show="it.kind !== 'video'"
                               class="px-1.5 py-0.5 rounded text-[10px] font-medium flex-shrink-0"
-                              :class="it.kind === 'driver' ? 'bg-amber-50 text-amber-600' : 'bg-blue-50 text-blue-600'"
-                              x-text="it.kind === 'driver' ? '驱动' : 'Web'"></span>
+                              :class="it.kind === 'driver' ? 'bg-amber-50 text-amber-600'
+                                    : it.kind === 'scheduler' ? 'bg-purple-50 text-purple-600'
+                                    : it.kind === 'progress' ? 'bg-douyin-gray-100 text-douyin-gray-500'
+                                    : 'bg-blue-50 text-blue-600'"
+                              x-text="it.kind === 'driver' ? '驱动'
+                                    : it.kind === 'scheduler' ? '定时'
+                                    : it.kind === 'progress' ? '进度' : '动作'"></span>
                         <!-- 视频行：UP -->
                         <span x-show="it.kind === 'video'"
                               class="text-[11px] leading-5 text-douyin-gray-700 font-medium flex-shrink-0 max-w-[110px] truncate"
                               :title="it.author" x-text="it.author || '-'"></span>
-                        <!-- Web 行：action -->
-                        <span x-show="it.kind === 'web'"
+                        <!-- Web 行：动作名（中文名，鼠标悬停看原始 action） -->
+                        <span x-show="it.kind !== 'video' && it.kind !== 'driver'"
                               class="px-1.5 py-0.5 rounded text-[10px] flex-shrink-0 bg-douyin-gray-100 text-douyin-gray-500 max-w-[130px] truncate"
-                              x-text="it.action"></span>
+                              :title="it.action"
+                              x-text="it.label || it.action"></span>
                         <!-- 视频行：标题（可点开原视频） -->
                         <span x-show="it.kind === 'video'" class="text-[11px] leading-5 min-w-0 flex-1 truncate">
                             <a x-show="it.video_id" :href="'https://www.douyin.com/video/' + it.video_id"
@@ -746,11 +1066,11 @@
     </div>
 
     <!-- Main Content -->
-    <main class="w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 lg:flex-1 lg:min-h-0">
-        <div class="grid grid-cols-1 lg:grid-cols-12 gap-6 lg:h-full lg:min-h-0">
+    <main class="w-full max-w-[1680px] mx-auto px-4 sm:px-6 lg:px-8 py-6 xl:flex-1 xl:min-h-0">
+        <div class="grid grid-cols-1 xl:grid-cols-12 gap-5 xl:h-full xl:min-h-0">
 
-            <!-- Left Panel - Input -->
-            <div class="lg:col-span-5 space-y-6 lg:h-full lg:min-h-0 lg:overflow-y-auto lg:pr-1">
+            <!-- Column A - Input & settings -->
+            <div class="xl:col-span-4 space-y-5 xl:h-full xl:min-h-0 xl:overflow-y-auto xl:pr-1">
 
                 <!-- Input Card -->
                 <div class="bg-white rounded-2xl shadow-card p-6">
@@ -867,6 +1187,57 @@
                         </div>
                     </div>
 
+                    <!-- API Warning -->
+                    <div x-show="!apiKeyConfigured" @click="showSettings = true"
+                         class="mt-4 p-3 bg-amber-50 border border-amber-100 rounded-xl cursor-pointer hover:bg-amber-100 transition-smooth">
+                        <div class="flex items-center justify-between">
+                            <div class="flex items-start gap-2">
+                                <svg class="w-4 h-4 text-amber-500 mt-0.5 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20">
+                                    <path fill-rule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clip-rule="evenodd"/>
+                                </svg>
+                                <div class="text-xs text-amber-800">
+                                    <p class="font-medium">需要配置 API Key 才能提取文案</p>
+                                    <p class="mt-1 text-amber-600">点击此处配置 API Key</p>
+                                </div>
+                            </div>
+                            <svg class="w-4 h-4 text-amber-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+                            </svg>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Column B - Queue, batch progress & authors -->
+            <div class="xl:col-span-4 space-y-5 xl:h-full xl:min-h-0 xl:overflow-y-auto xl:pr-1">
+                <div class="bg-white rounded-2xl shadow-card p-5">
+
+                    <!-- 本批视频解析进度：独立区块，数字全部来自后端
+                         /api/service/status 的 batch_progress，前端不另算一套 -->
+                    <div x-show="batchRunning || batchDetached" x-transition
+                         class="bg-douyin-gray-50 border border-douyin-gray-100 rounded-xl p-4">
+                        <div class="flex items-end justify-between gap-3">
+                            <div class="min-w-0">
+                                <p class="text-xs text-douyin-gray-500">本批视频解析进度</p>
+                                <p class="mt-1 text-lg font-semibold text-douyin-gray-900 leading-none">
+                                    <span x-text="batchProgress.done"></span>
+                                    <span class="text-douyin-gray-400 font-normal">/</span>
+                                    <span x-text="batchProgress.total || '—'"></span>
+                                </p>
+                            </div>
+                            <p class="text-xs text-douyin-gray-400 flex-shrink-0"
+                               x-text="batchProgress.total > 0 ? Math.min(100, Math.round(batchProgress.done * 100 / batchProgress.total)) + '%' : ''"></p>
+                        </div>
+                        <div class="mt-2.5 h-1.5 rounded-full bg-douyin-gray-200 overflow-hidden">
+                            <div class="h-full bg-gradient-douyin transition-smooth"
+                                 :style="'width:' + (batchProgress.total > 0 ? Math.min(100, Math.round(batchProgress.done * 100 / batchProgress.total)) : 0) + '%'"></div>
+                        </div>
+                        <p class="mt-2 text-xs text-douyin-gray-500 truncate" :title="batchProgress.current_title">
+                            <span class="text-douyin-gray-400">正在处理：</span>
+                            <span class="text-douyin-gray-700" x-text="batchProgress.current_title || '等待下一条视频…'"></span>
+                        </p>
+                    </div>
+
                     <!-- Batch Progress Panel -->
                     <div x-show="batchRunning || batchDetached || driverTask || batchLogs.length" x-transition
                          class="mt-4 bg-douyin-gray-50 rounded-xl p-4">
@@ -889,8 +1260,8 @@
                         <div class="flex items-center justify-between mb-2">
                             <p class="text-sm font-medium text-douyin-gray-700">
                                 批量进度
-                                <span x-show="batchTotal" class="text-douyin-gray-400 font-normal">
-                                    (<span x-text="batchDone"></span>/<span x-text="batchTotal"></span>)
+                                <span x-show="batchProgress.total" class="text-douyin-gray-400 font-normal">
+                                    (<span x-text="batchProgress.done"></span>/<span x-text="batchProgress.total"></span>)
                                 </span>
                                 <span x-show="(authorQueueCurrent || backgroundLabel) && (batchRunning || batchDetached)" class="text-douyin-red font-normal">
                                     · 正在解析「<span x-text="authorQueueCurrent || backgroundLabel"></span>」
@@ -998,9 +1369,9 @@
                             </button>
                         </div>
                         <p x-show="pendingLinkMsg" x-transition class="mt-1.5 text-xs text-green-600" x-text="pendingLinkMsg"></p>
-                        <div x-show="pendingLinks.length" class="mt-2 space-y-1.5 max-h-56 overflow-y-auto">
+                        <div x-show="pendingLinks.length" class="mt-2 space-y-1.5 max-h-56 overflow-y-auto" style="overflow-anchor: none">
                             <template x-for="it in pendingLinks" :key="it.id">
-                                <div class="bg-white rounded-lg px-3 py-2 flex items-center gap-2">
+                                <div class="bg-white rounded-lg px-3 py-2 flex items-center gap-2" :data-pending-id="it.id">
                                     <span class="flex-shrink-0 text-[10px] px-1.5 py-0.5 rounded font-medium"
                                           :class="it.kind === 'up' ? 'bg-douyin-pink/10 text-douyin-pink' : 'bg-blue-50 text-blue-500'"
                                           x-text="pendingKindLabel(it)"></span>
@@ -1008,12 +1379,26 @@
                                        class="flex-1 min-w-0 text-xs text-douyin-gray-600 hover:text-douyin-red truncate"
                                        :title="it.result ? it.url + '｜' + it.result : it.url" x-text="it.title || it.url"></a>
                                     <span class="flex-shrink-0 text-[10px] px-1.5 py-0.5 rounded"
-                                          :class="pendingStatusClass(it.status)" x-text="pendingStatusLabel(it.status)"></span>
-                                    <button x-show="it.status === 'pending'" @click="pinPendingLink(it)"
+                                          :class="pendingStatusClass(it)" x-text="pendingStatusLabel(it)"></span>
+                                    <button x-show="it.status === 'pending'" @click="movePendingLink($event, it, 'pin')"
+                                            data-move-op="pin"
                                             title="置顶：排到队首，下次调度先执行它"
                                             class="flex-shrink-0 h-6 px-1.5 rounded-lg bg-douyin-gray-100 hover:bg-amber-50 text-[10px] text-douyin-gray-500 hover:text-amber-600 transition-smooth">置顶</button>
-                                    <button x-show="it.status === 'pending'" @click="jumpPendingLink(it)"
-                                            title="插队：插到下一个执行（不打断正在处理的那条）"
+                                    <button x-show="it.status === 'pending'" @click="movePendingLink($event, it, 'up')"
+                                            data-move-op="up"
+                                            title="上移：与上一条待执行任务交换位置"
+                                            class="flex-shrink-0 h-6 px-1.5 rounded-lg bg-douyin-gray-100 hover:bg-douyin-gray-200 text-[10px] text-douyin-gray-500 hover:text-douyin-gray-800 transition-smooth">上移</button>
+                                    <button x-show="it.status === 'pending'" @click="movePendingLink($event, it, 'down')"
+                                            data-move-op="down"
+                                            title="下移：与下一条待执行任务交换位置"
+                                            class="flex-shrink-0 h-6 px-1.5 rounded-lg bg-douyin-gray-100 hover:bg-douyin-gray-200 text-[10px] text-douyin-gray-500 hover:text-douyin-gray-800 transition-smooth">下移</button>
+                                    <button x-show="it.status === 'pending'" @click="movePendingLink($event, it, 'bottom')"
+                                            data-move-op="bottom"
+                                            title="置底：排到所有待执行任务之后，最后才执行它"
+                                            class="flex-shrink-0 h-6 px-1.5 rounded-lg bg-douyin-gray-100 hover:bg-sky-50 text-[10px] text-douyin-gray-500 hover:text-sky-600 transition-smooth">置底</button>
+                                    <button x-show="it.status === 'pending'" @click="movePendingLink($event, it, 'jump')"
+                                            data-move-op="jump"
+                                            title="插队：最高优先级——批量立即停止取新视频，当前条做完就让位"
                                             class="flex-shrink-0 h-6 px-1.5 rounded-lg bg-douyin-gray-100 hover:bg-blue-50 text-[10px] text-douyin-gray-500 hover:text-blue-600 transition-smooth">插队</button>
                                     <button @click="removePendingLink(it)" :disabled="it.status === 'running'"
                                             title="从队列移除"
@@ -1146,25 +1531,11 @@
                         </div>
                     </div>
 
-                    <!-- API Warning -->
-                    <div x-show="!apiKeyConfigured" @click="showSettings = true"
-                         class="mt-4 p-3 bg-amber-50 border border-amber-100 rounded-xl cursor-pointer hover:bg-amber-100 transition-smooth">
-                        <div class="flex items-center justify-between">
-                            <div class="flex items-start gap-2">
-                                <svg class="w-4 h-4 text-amber-500 mt-0.5 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20">
-                                    <path fill-rule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clip-rule="evenodd"/>
-                                </svg>
-                                <div class="text-xs text-amber-800">
-                                    <p class="font-medium">需要配置 API Key 才能提取文案</p>
-                                    <p class="mt-1 text-amber-600">点击此处配置 API Key</p>
-                                </div>
-                            </div>
-                            <svg class="w-4 h-4 text-amber-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
-                            </svg>
-                        </div>
-                    </div>
                 </div>
+            </div>
+
+            <!-- Column C - Video info & results -->
+            <div class="xl:col-span-4 space-y-5 xl:h-full xl:min-h-0 xl:overflow-y-auto">
 
                 <!-- Video Info Card -->
                 <div x-show="videoInfo" x-transition:enter="transition ease-out duration-300"
@@ -1286,13 +1657,9 @@
                         </button>
                     </div>
                 </div>
-            </div>
-
-            <!-- Right Panel - Results -->
-            <div class="lg:col-span-7 lg:h-full lg:min-h-0">
 
                 <!-- Empty State -->
-                <div x-show="!transcript && !loading" class="bg-white rounded-2xl shadow-card h-full min-h-[500px] lg:min-h-0 flex flex-col items-center justify-center p-8 text-center">
+                <div x-show="!transcript && !loading" class="bg-white rounded-2xl shadow-card min-h-[420px] flex flex-col items-center justify-center p-8 text-center">
                     <div class="w-24 h-24 bg-douyin-gray-100 rounded-3xl flex items-center justify-center mb-6">
                         <svg class="w-12 h-12 text-douyin-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
@@ -1312,7 +1679,7 @@
                 <!-- Transcript Card -->
                 <div x-show="transcript" x-transition:enter="transition ease-out duration-300"
                      x-transition:enter-start="opacity-0 translate-y-2" x-transition:enter-end="opacity-100 translate-y-0"
-                     class="bg-white rounded-2xl shadow-card overflow-hidden h-full flex flex-col">
+                     class="bg-white rounded-2xl shadow-card overflow-hidden min-h-[420px] flex flex-col">
 
                     <!-- Card Header -->
                     <div class="px-6 py-4 border-b border-douyin-gray-100 flex items-center justify-between flex-shrink-0">
@@ -1388,7 +1755,7 @@
     </div>
 
     <!-- Footer -->
-    <footer class="w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 flex-shrink-0">
+    <footer class="w-full max-w-[1680px] mx-auto px-4 sm:px-6 lg:px-8 py-8 flex-shrink-0">
         <div class="flex flex-col sm:flex-row items-center justify-between gap-4 text-sm text-douyin-gray-400">
             <p>Made with <span class="text-douyin-red">?</span> by <a href="https://github.com/yzfly" target="_blank" class="hover:text-douyin-red transition-colors">yzfly</a></p>
             <div class="flex items-center gap-4">
@@ -1418,6 +1785,20 @@
                 toast: '',
                 showHelp: false,
                 showSettings: false,
+                showSchedule: false,
+                scheduleTasks: [],
+                scheduleOrphans: [],
+                scheduleDuplicates: [],
+                scheduleMismatch: 0,
+                scheduleScanError: '',
+                scheduleDirty: false,
+                scheduleEditing: '',
+                scheduleDeleted: [],
+                scheduleDraft: null,
+                scheduleLoading: false,
+                scheduleSaving: false,
+                scheduleReg: [],
+                scheduleConfigPath: '',
                 showApiKey: false,
                 apiKey: '',
                 apiKeyInput: '',
@@ -1441,6 +1822,8 @@
                 batchLogs: [],
                 batchTotal: 0,
                 batchDone: 0,
+                // 后端权威的视频级进度（已完成/总数 + 正在处理的视频）
+                batchProgress: { done: 0, total: 0, current_id: '', current_title: '' },
                 runNew: 0,                 // 本轮任务新增的文案条数（跨 UP 累计）
                 runSkipped: 0,             // 本轮跳过的条数（之前已提取过）
                 runIgnored: 0,             // 本轮内容无效、按通过并忽略的条数
@@ -1467,6 +1850,8 @@
                 failedRetrying: false,
                 showRunLogModal: false,    // 统一日志弹窗（视频结果 + driver 实时输出 + WebUI 操作）
                 runLogs: [],               // 合并后的倒序日志流（最新在前）
+                runLogsMax: 3000,          // 前端最多保留条数（超出从最旧端裁掉）
+                runLogSeq: 0,              // 稳定行 id：轮询插新时旧行不重建
                 runLogsLoading: false,
                 runLogsLoadingMore: false,
                 runLogsHasMore: false,     // 服务端提示还有更早历史
@@ -1474,6 +1859,7 @@
                 runLogsTimer: null,
                 runLogsOldest: '',         // 已加载的最老时间戳（加载更多锚点）
                 runLogFilter: 'all',      // all | ok | skip | fail | error
+                runLogKind: '',           // 来源/类型：'' | video | action | progress | driver
                 editingLinkId: null,       // 正在编辑链接的条目 id
                 editingLinkUrl: '',
                 dragLinkId: null,          // 拖拽排序：被拖动条目 id
@@ -2140,11 +2526,17 @@
                 },
 
                 pendingKindLabel(it) { return it.kind === 'up' ? 'UP主页' : '单个视频'; },
-                pendingStatusLabel(st) {
+                // 徽标必须与 run 的真实结果一致：批量跑完但整批有失败时显示
+                // 「已完成·失败N」（琥珀色），不能只报绿色「已完成」。
+                pendingStatusLabel(it) {
+                    const st = typeof it === 'string' ? it : (it && it.status);
+                    if (st === 'done' && it && it.fail_count > 0) return '已完成·失败' + it.fail_count;
                     return st === 'running' ? '处理中' : st === 'done' ? '已完成'
                          : st === 'fail' ? '失败' : (st === 'skip' || st === 'ignored') ? '已忽略' : '待处理';
                 },
-                pendingStatusClass(st) {
+                pendingStatusClass(it) {
+                    const st = typeof it === 'string' ? it : (it && it.status);
+                    if (st === 'done' && it && it.fail_count > 0) return 'bg-amber-50 text-amber-700';
                     return st === 'running' ? 'bg-red-50 text-douyin-red'
                          : st === 'done' ? 'bg-green-50 text-green-600'
                          : st === 'fail' ? 'bg-red-100 text-red-600'
@@ -2246,14 +2638,36 @@
                     if (this.runLogFilter === 'all') return logs || [];
                     return (logs || []).filter(it => it.kind === 'video');
                 },
+                // 稳定行 id + 上限裁剪：轮询插新不会重建整表；超过上限从最旧端
+                // 裁掉，并把「加载更早」锚点顺移到新的末行，避免出现断档。
+                _runLogsApply(list) {
+                    list.forEach(it => { if (!it._k) it._k = ++this.runLogSeq; });
+                    if (list.length > this.runLogsMax) {
+                        list = list.slice(0, this.runLogsMax);
+                        this.runLogsOldest = list[list.length - 1].ts || this.runLogsOldest;
+                        this.runLogsHasMore = true;
+                    }
+                    return list;
+                },
+                // 查询参数统一出口：状态分类与来源分类互斥（服务端在 status
+                // 下只返回视频结果），切换筛选只带对应参数，不重复读全量。
+                _runLogQuery(opts) {
+                    opts = opts || {};
+                    let q = 'limit=' + (opts.limit || 200);
+                    if (this.runLogFilter !== 'all') {
+                        q += '&status=' + encodeURIComponent(this.runLogFilter);
+                    } else if (this.runLogKind) {
+                        q += '&kinds=' + encodeURIComponent(this.runLogKind);
+                    }
+                    if (opts.before) q += '&before=' + encodeURIComponent(opts.before);
+                    return q;
+                },
                 async loadRunLogs() {
                     this.runLogsLoading = true;
                     try {
-                        const res = await fetch('/api/logs/runtime?limit=200'
-                            + (this.runLogFilter !== 'all'
-                               ? '&status=' + encodeURIComponent(this.runLogFilter) : ''));
+                        const res = await fetch('/api/logs/runtime?' + this._runLogQuery());
                         const data = await res.json();
-                        this.runLogs = this._runLogsForFilter(data.logs || []);
+                        this.runLogs = this._runLogsApply(this._runLogsForFilter(data.logs || []));
                         this.runLogsHasMore = !!data.has_more;
                         this.runLogsOldest = this.runLogs.length
                             ? this.runLogs[this.runLogs.length - 1].ts : '';
@@ -2266,15 +2680,13 @@
                 async pollRunLogs() {
                     // 只把新条目插到顶部，不打断正在下翻的历史
                     try {
-                        const res = await fetch('/api/logs/runtime?limit=100'
-                            + (this.runLogFilter !== 'all'
-                               ? '&status=' + encodeURIComponent(this.runLogFilter) : ''));
+                        const res = await fetch('/api/logs/runtime?' + this._runLogQuery({limit: 100}));
                         const data = await res.json();
                         const fresh = this._runLogsForFilter(data.logs || []);
                         if (!fresh.length) return;
                         const seen = new Set(this.runLogs.map(it => this.runLogKey(it)));
                         const add = fresh.filter(it => !seen.has(this.runLogKey(it)));
-                        if (add.length) this.runLogs = [...add, ...this.runLogs];
+                        if (add.length) this.runLogs = this._runLogsApply([...add, ...this.runLogs]);
                     } catch (e) { /* 静默：下一轮再试 */ }
                 },
                 async loadMoreRunLogs() {
@@ -2282,14 +2694,11 @@
                     this.runLogsLoadingMore = true;
                     try {
                         // 下翻历史同样带分类（此前漏传 status：成功页下翻会混入动作日志）
-                        const url = '/api/logs/runtime?limit=200&before='
-                            + encodeURIComponent(this.runLogsOldest)
-                            + (this.runLogFilter !== 'all'
-                               ? '&status=' + encodeURIComponent(this.runLogFilter) : '');
+                        const url = '/api/logs/runtime?' + this._runLogQuery({before: this.runLogsOldest});
                         const res = await fetch(url);
                         const data = await res.json();
                         const older = this._runLogsForFilter(data.logs || []);
-                        this.runLogs = [...this.runLogs, ...older];
+                        this.runLogs = this._runLogsApply([...this.runLogs, ...older]);
                         this.runLogsHasMore = !!data.has_more;
                         if (older.length) {
                             this.runLogsOldest = older[older.length - 1].ts;
@@ -2408,29 +2817,60 @@
                         }
                     } catch (e) { /* ignore */ }
                 },
-                // 置顶：排到队首，下次调度先取它（落盘走 pending_links.json）
-                async pinPendingLink(it) {
+                // 队列排序：置顶/上移/下移/置底/插队。五者同走一个入口，
+                // 顺序即执行顺序（落盘 pending_links.json，审计写 queue.order）。
+                // 连点体验：重排前记下被点这一行的视口位置和所在滚动容器，
+                // 重排后按位移差补 scrollTop，把这一行钉回原位；焦点还给
+                // 同一个按钮（preventScroll，避免浏览器再抢一次滚动）。
+                async movePendingLink($event, it, op) {
+                    const meta = {
+                        pin:    { label: '置顶', done: '已置顶', edge: '已经在队首了' },
+                        up:     { label: '上移', done: '已上移', edge: '已经是最靠前的待执行条目' },
+                        down:   { label: '下移', done: '已下移', edge: '已经是最靠后的待执行条目' },
+                        bottom: { label: '置底', done: '已置底', edge: '已经在队尾了' },
+                        jump:   { label: '插队', done: '已插队：批量已停止取新视频', edge: '已经是最高优先级（插队位）' }
+                    }[op] || { label: '调整顺序', done: '已调整顺序', edge: '位置没有变化' };
+                    // 点击瞬间的锚点（DOM 引用与数值都在 await 前取好）
+                    const btn = $event && $event.currentTarget;
+                    const rowEl = btn ? btn.closest('[data-pending-id]') : null;
+                    const scroller = rowEl ? rowEl.parentElement : null;
+                    const beforeTop = rowEl ? rowEl.getBoundingClientRect().top : null;
                     try {
-                        const res = await fetch('/api/pending-links/' + it.id + '/pin', { method: 'POST' });
-                        const data = await res.json().catch(() => ({}));
-                        if (!res.ok) { this.showToast(data.detail || '置顶失败'); return; }
-                        this.pendingLinks = data.items || [];
-                        this.showToast(`已置顶：第 ${data.from} 位 → 第 ${data.to} 位`);
-                    } catch (e) { this.showToast('置顶失败，请重试'); }
-                },
-                // 插队：插到「下一个执行」，不打断正在处理的那一条
-                async jumpPendingLink(it) {
-                    try {
-                        const res = await fetch('/api/pending-links/' + it.id + '/jump', {
+                        const res = await fetch('/api/pending-links/' + it.id + '/' + op, {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ mode: 'next' })
+                            body: JSON.stringify(op === 'jump' ? { mode: 'next' } : {})
                         });
                         const data = await res.json().catch(() => ({}));
-                        if (!res.ok) { this.showToast(data.detail || '插队失败'); return; }
+                        if (!res.ok) { this.showToast(data.detail || (meta.label + '失败')); return; }
                         this.pendingLinks = data.items || [];
-                        this.showToast(`已插到下一个执行（第 ${data.to} 位）`);
-                    } catch (e) { this.showToast('插队失败，请重试'); }
+                        await this.$nextTick();
+                        this.restoreQueueAnchor(it.id, op, scroller, beforeTop);
+                        if (data.from === data.to) {
+                            this.showToast(meta.edge);
+                        } else {
+                            this.showToast(`${meta.done}：第 ${data.from} 位 → 第 ${data.to} 位`);
+                        }
+                    } catch (e) { this.showToast(meta.label + '失败，请重试'); }
+                },
+                // 重排后把被点的那一行钉回原来的视口位置：
+                // 新 top - 旧 top = 内容整体位移，scrollTop 吃回同样的差值，
+                // 使用者眼里就是「这一行没动，其他行在换」。上移/下移才补偿
+                // 滚动（跨区跳转就让它自然落位，避免整页被甩走）。
+                restoreQueueAnchor(itemId, op, scroller, beforeTop) {
+                    if (!scroller || beforeTop === null) return;
+                    const row = scroller.querySelector('[data-pending-id="' + itemId + '"]');
+                    if (!row) return;
+                    // 只有相邻移动才补滚动；跨区跳转让它自然落位，避免整页被甩走。
+                    if (op === 'up' || op === 'down') {
+                        const delta = row.getBoundingClientRect().top - beforeTop;
+                        if (Math.abs(delta) >= 1) {
+                            scroller.scrollTop = scroller.scrollTop + delta;
+                        }
+                    }
+                    // 焦点留在同一行同一个按钮，preventScroll 阻止浏览器再补一次滚动
+                    const target = row.querySelector('[data-move-op="' + op + '"]');
+                    if (target) target.focus({ preventScroll: true });
                 },
 
                 // ---------- 主输入框「加入队列」：忙时点击 = 加入待解析队列 ----------
@@ -2489,6 +2929,8 @@
                             const st = await this._fetchServiceStatus();
                             if (!st) return;
                             this.driverTask = st.driver_running ? (st.driver || {}) : null;
+                            // 批量视频级进度：以后端权威值为准（前端不另算一套）
+                            if (st.batch_progress) this.batchProgress = st.batch_progress;
                             // 余额不足自动暂停：以后端持久旗标为准，刷新页面不丢
                             this.billingShortage = !!st.billing_shortage;
                             this.billingMessage = st.billing_message || '';
@@ -2595,6 +3037,206 @@
                         this.showToast('配置已保存并生效');
                     } catch (e) {
                         this.showToast(e.message || '保存失败');
+                    }
+                },
+
+                weekdayLabel(d) {
+                    return ['一', '二', '三', '四', '五', '六', '日'][d - 1] || '';
+                },
+
+                toggleScheduleDay(t, d) {
+                    const all = [1, 2, 3, 4, 5, 6, 7];
+                    let cur = (t.weekdays && t.weekdays.length) ? t.weekdays.slice() : all.slice();
+                    if (cur.includes(d)) cur = cur.filter(x => x !== d);
+                    else cur.push(d);
+                    cur.sort((a, b) => a - b);
+                    // 全选 = 每天（空数组），避免「每天都勾」和「不勾」两种表示打架
+                    t.weekdays = cur.length === 7 ? [] : cur;
+                    this.scheduleDirty = true;
+                },
+
+                scheduleIssueClass(code) {
+                    if (code === 'missing' || code === 'query') return 'bg-red-50 text-red-600';
+                    if (code === 'dup_cfg' || code === 'dup_sys') return 'bg-red-50 text-red-600';
+                    return 'bg-amber-50 text-amber-700';
+                },
+
+                scheduleSysText(t) {
+                    if (t.registered) {
+                        return '已登记' + (t.task_state ? '（' + t.task_state + '）' : '');
+                    }
+                    if (t.reg_error) return '未登记｜查询失败：' + t.reg_error;
+                    return t.enabled ? '未登记' : '已停用，且系统无登记';
+                },
+
+                applySchedule(data) {
+                    this.scheduleTasks = (data.tasks || []).map(t => ({
+                        ...t,
+                        weekdays: Array.isArray(t.weekdays) ? t.weekdays.slice() : [],
+                    }));
+                    this.scheduleOrphans = data.orphans || [];
+                    this.scheduleDuplicates = data.duplicates || [];
+                    this.scheduleMismatch = Number(data.mismatch_count) || 0;
+                    this.scheduleScanError = data.scan_error || '';
+                    this.scheduleConfigPath = data.config_path || '';
+                },
+
+                toggleTaskEnabled(t) {
+                    t.enabled = !t.enabled;
+                    this.scheduleDirty = true;
+                },
+
+                startNewTask() {
+                    this.scheduleDraft = {
+                        id: '',
+                        label: '',
+                        task_name: '',
+                        script: 'scripts/scheduled_refresh.py',
+                        arguments: '--once',
+                        time: '03:00',
+                        weekdays: [],
+                        interval_days: 1,
+                        enabled: true,
+                    };
+                },
+
+                commitDraft() {
+                    const d = this.scheduleDraft;
+                    if (!d) return;
+                    const id = (d.id || '').trim();
+                    if (!/^[A-Za-z0-9_-]{1,32}$/.test(id)) {
+                        this.showToast('任务 ID 只允许字母/数字/-/_');
+                        return;
+                    }
+                    if (this.scheduleTasks.some(t => t.id === id)) {
+                        this.showToast('任务 ID 已存在：' + id);
+                        return;
+                    }
+                    if (!(d.label || '').trim() || !(d.task_name || '').trim() || !(d.script || '').trim()) {
+                        this.showToast('显示名称、计划任务名、入口脚本都要填');
+                        return;
+                    }
+                    this.scheduleTasks.push({
+                        ...d,
+                        id,
+                        label: d.label.trim(),
+                        task_name: d.task_name.trim(),
+                        script: d.script.trim(),
+                        arguments: (d.arguments || '').trim(),
+                        weekdays: (d.weekdays || []).slice(),
+                        effective: '待保存',
+                        registered: false,
+                        task_state: '',
+                        next_run: '',
+                        last_task_result: '',
+                        reg_error: '',
+                        issues: [],
+                        last_run: null,
+                    });
+                    this.scheduleDraft = null;
+                    this.scheduleDirty = true;
+                },
+
+                removeTask(t) {
+                    if (!window.confirm('删除任务「' + t.label + '」？保存后会同时注销 Windows 计划任务 ' + t.task_name + '。')) return;
+                    this.scheduleTasks = this.scheduleTasks.filter(x => x.id !== t.id);
+                    if (t.id) this.scheduleDeleted.push(t.id);
+                    if (this.scheduleEditing === t.id) this.scheduleEditing = '';
+                    this.scheduleDirty = true;
+                },
+
+                scheduleStatusLabel(t) {
+                    const s = t.last_run && t.last_run.status;
+                    return ({ ok: '成功', fail: '失败', skip: '跳过', warn: '有待办' })[s] || '暂无记录';
+                },
+
+                scheduleStatusClass(t) {
+                    const s = t.last_run && t.last_run.status;
+                    if (s === 'ok') return 'bg-green-50 text-green-700';
+                    if (s === 'fail') return 'bg-red-50 text-red-600';
+                    if (s === 'skip' || s === 'warn') return 'bg-amber-50 text-amber-700';
+                    return 'bg-douyin-gray-100 text-douyin-gray-500';
+                },
+
+                scheduleStatusDetail(t) {
+                    const r = t.last_run;
+                    if (!r) return '';
+                    const when = r.started_at || '';
+                    let msg = r.message || '';
+                    if (!msg && r.reasons) {
+                        msg = Array.isArray(r.reasons) ? r.reasons.join('；') : String(r.reasons);
+                    }
+                    return (when ? when + ' ' : '') + (msg || '');
+                },
+
+                async loadSchedule() {
+                    this.scheduleLoading = true;
+                    try {
+                        const res = await fetch('/api/schedule');
+                        const data = await res.json().catch(() => ({}));
+                        if (!res.ok) throw new Error(data.detail || '读取失败');
+                        this.applySchedule(data);
+                    } catch (e) {
+                        this.showToast(e.message || '定时任务读取失败');
+                    } finally {
+                        this.scheduleLoading = false;
+                    }
+                },
+
+                openSchedule() {
+                    this.showSchedule = true;
+                    this.scheduleReg = [];
+                    this.scheduleDirty = false;
+                    this.scheduleDeleted = [];
+                    this.scheduleEditing = '';
+                    this.scheduleDraft = null;
+                    this.loadSchedule();
+                },
+
+                async saveSchedule() {
+                    if (this.scheduleSaving) return;
+                    this.scheduleSaving = true;
+                    this.scheduleReg = [];
+                    try {
+                        const tasks = {};
+                        for (const t of this.scheduleTasks) {
+                            tasks[t.id] = {
+                                label: t.label,
+                                enabled: !!t.enabled,
+                                time: t.time,
+                                weekdays: t.weekdays || [],
+                                interval_days: Number(t.interval_days) || 1,
+                                task_name: t.task_name,
+                                script: t.script,
+                                arguments: t.arguments || '',
+                            };
+                            if (t.workers !== null && t.workers !== undefined && t.workers !== '') {
+                                tasks[t.id].workers = Number(t.workers);
+                            }
+                            if (t.force !== null && t.force !== undefined) {
+                                tasks[t.id].force = !!t.force;
+                            }
+                        }
+                        const res = await fetch('/api/schedule', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ tasks, deleted: this.scheduleDeleted })
+                        });
+                        const data = await res.json().catch(() => ({}));
+                        if (!res.ok) throw new Error(data.detail || '保存失败');
+                        // 保存后立即用服务端返回值刷新列表，不重启程序
+                        this.applySchedule(data);
+                        this.scheduleReg = data.registration || [];
+                        this.scheduleDirty = false;
+                        this.scheduleDeleted = [];
+                        const failed = this.scheduleReg.filter(r => !r.ok);
+                        this.showToast(failed.length
+                            ? ('配置已保存，但 ' + failed.length + ' 条计划任务登记失败')
+                            : '定时任务已保存，列表与计划任务状态已刷新');
+                    } catch (e) {
+                        this.showToast(e.message || '保存失败');
+                    } finally {
+                        this.scheduleSaving = false;
                     }
                 },
 
@@ -2987,6 +3629,8 @@
 
                 handleBatchEvent(evt) {
                     const stage = evt.stage;
+                    // 后端随事件下发的视频级进度快照：直接采用，不前端累加
+                    if (evt.batch_progress) this.batchProgress = evt.batch_progress;
                     if (stage === 'list') {
                         if (evt.nickname) this.backgroundLabel = evt.nickname; // URL 粘贴批量：后端解析出昵称后补显到标题
                         if (evt.notice) {

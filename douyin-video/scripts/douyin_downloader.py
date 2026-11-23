@@ -598,6 +598,24 @@ class DouyinProcessor:
                            duration_ms=trace.end("asr"),
                            error=error_text or None)
 
+    def extract_text_from_audio_ex(self, audio_path: Path,
+                                   show_progress: bool = True) -> dict:
+        """Like extract_text_from_audio, plus detected language + verdict.
+
+        The ASR request itself is unchanged (language=None -> auto), so
+        existing callers keep identical behavior; this only adds the
+        metadata needed for language-aware gating and translation.
+        """
+        from asr_backends import detect_text_language, assess_transcript
+        text = self.extract_text_from_audio(audio_path, show_progress=show_progress)
+        language = detect_text_language(text)["language"]
+        return {
+            "text": text,
+            "language": language,
+            "provider": self.provider or "",
+            "verdict": assess_transcript(text, language=language),
+        }
+
     def cleanup_files(self, *file_paths: Path):
         """Clean up given files"""
         for file_path in file_paths:
@@ -655,7 +673,22 @@ def extract_text(share_link: str, api_key: Optional[str] = None, output_dir: Opt
 
     if show_progress:
         print("Extracting text from audio...")
-    text_content = processor.extract_text_from_audio(audio_path, show_progress=show_progress)
+    asr_result = processor.extract_text_from_audio_ex(
+        audio_path, show_progress=show_progress)
+    text_content = asr_result["text"]
+    language = asr_result["language"] or "unknown"
+    if not asr_result["verdict"]["ok"]:
+        v = asr_result["verdict"]
+        raise TranscriptionError(
+            "asr_suspect: %s (lang=%s cjk=%.2f latin=%.2f repeat=%.2f len=%d)" % (
+                v["quality"], language, v["cjk_ratio"],
+                v.get("latin_ratio", 0.0), v["repeat_ratio"], v["length"]))
+
+    # 外文：翻译成中文，原文永不覆盖；失败则只留原文
+    translated_text = ""
+    if language != "zh":
+        from transcript_polish import translate_transcript
+        translated_text = translate_transcript(text_content)
 
     # Record to the global library file (all extractions in one place)
     from transcript_library import append_record
@@ -666,6 +699,9 @@ def extract_text(share_link: str, api_key: Optional[str] = None, output_dir: Opt
         source="single",
         provider=backend['provider'],
         model=backend['model'],
+        language=language,
+        original_text=text_content if language != "zh" else "",
+        translated_text=translated_text,
     )
 
     result = {
@@ -687,11 +723,15 @@ def extract_text(share_link: str, api_key: Optional[str] = None, output_dir: Opt
             f.write(f"| Attribute | Value |\n")
             f.write(f"|------|----|\n")
             f.write(f"| Video ID | `{video_info['video_id']}` |\n")
+            if language != "zh":
+                f.write(f"| Language | {language} |\n")
             f.write(f"| Extracted at | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} |\n")
             f.write(f"| Download link | [Download]({video_info['url']}) |\n\n")
             f.write(f"---\n\n")
             f.write(f"## Transcript\n\n")
             f.write(text_content)
+            if translated_text:
+                f.write(f"\n\n---\n\n## 中文翻译\n\n{translated_text}")
 
         result["output_path"] = str(video_folder)
 

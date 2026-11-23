@@ -147,6 +147,62 @@ output/
 
 ---
 
+## ⏰ 定时任务（用户可配置）
+
+两条每日任务由程序侧的 `schedule.json` 管配置与生效值（WebUI 顶部「定时任务」可直接改时间、开关、星期范围与间隔）；**保存后程序自动重登记 Windows 计划任务**，由计划任务服务按新时间拉起入口脚本，不需要再手工跑 `scripts/register_scheduled_refresh.ps1`。
+
+| 任务 | 入口 | 默认时间 | 做什么 |
+|------|------|----------|--------|
+| `refresh` 全量 UP 拉新 | `scripts/scheduled_refresh.py --once` | 03:00 | 抓主页 → 入队 → 批量提取 → 转写落 `output/` |
+| `absorb` 全量整理＋吸收 | `scripts/scheduled_absorb.py --once` | 05:00 | 跑未收口吸收批点名 + 逐 UP 差额，产出待吸收清单（当前实现；正在改为「机械段可写、语义段出清单」） |
+
+> **absorb 当前实现状态（2026-11-12，会变）**：入口目前只做核对与出清单——`distill_gap_check.py --absorb-pending` 点名未收口吸收批、`absorb_gap.py --json` 统计逐 UP 差额，结果写 `logs/scheduled_absorb/` 与 `last_run.json`，不写知识库。该条正在迁移为「机械段可写、语义段出清单」：能机械处理的部分会在定时任务里直接落盘，需要语义判断的部分仍出清单待人工/Agent 裁决。迁移完成后以代码与 `last_run.json` 为准。
+
+### 配置文件字段（`schedule.json`）
+
+```json
+{
+  "tasks": {
+    "refresh": {
+      "enabled": true,
+      "time": "03:00",
+      "weekdays": [],
+      "interval_days": 1,
+      "task_name": "DouyinRefreshDaily",
+      "script": "scripts/scheduled_refresh.py",
+      "workers": 3,
+      "force": false
+    }
+  }
+}
+```
+
+- `enabled`：启用开关。`false` 时对应 Windows 计划任务会被删除，不会再触发。
+- `time`：执行时间，`时:分`（24 小时制，本地时区）。
+- `weekdays`：星期范围，`1=周一 … 7=周日`；空数组 = 每天。只勾部分星期时按「每周」触发。
+- `interval_days`：每隔几天，`1–30`；仅在 `weekdays` 为空时生效（与「间隔」二选一）。
+- `task_name`：Windows 计划任务名（字母/数字/-/_/.）。
+- `script`：入口脚本（相对 `douyin-mcp-server`）。
+- `workers` / `force`：拉新任务的并发数与是否强制重跑已完成视频。
+
+### 如何改时间 / 如何停用
+
+1. 打开 WebUI（默认 `http://127.0.0.1:8080`；若以 `PORT=8899` 启动则用 `http://127.0.0.1:8899`）→ 顶部「定时任务」。
+2. 改「执行时间 / 星期范围 / 间隔」或关闭开关 → 点「保存并重登记计划任务」。
+3. 保存结果会逐条显示「已登记，下次 …」或「已停用（计划任务已删除）」；同时展示每条任务最近一次运行结果（成功 / 失败 / 跳过原因）。
+
+命令行等价操作：
+
+```bash
+python -B scripts/scheduled_refresh.py --disable   # 停用拉新
+python -B scripts/scheduled_refresh.py --enable    # 恢复拉新
+python -B scripts/scheduled_absorb.py --disable    # 停用整理吸收
+python -B scripts/schedule_config.py status        # 看生效值与计划任务状态
+python -B scripts/schedule_config.py sync          # 按配置重登记全部任务
+```
+
+并发守卫沿用原有机制：`.scheduled_refresh.lock`、`driver_state.json`、`pending_links.json` 与进程表扫描；任务在跑时再次触发会直接跳过并把原因写进 `logs/scheduled_*/last_run.json`。机器休眠/错过触发时间由计划任务的「错过时间后尽快启动」补跑。
+
 ## 🛡️ ASR 质量规则（2026-11-03）
 
 采集/转写链路固定三条判据，防止“噪声当成功”复发：

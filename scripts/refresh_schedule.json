@@ -1,0 +1,7 @@
+{
+  "enabled": true,
+  "time": "03:00",
+  "workers": 3,
+  "force": false,
+  "_note": "每日全量 UP 拉新开关。enabled=false 时定时任务仍会启动但立即跳过；改后无需重注册计划任务。"
+}

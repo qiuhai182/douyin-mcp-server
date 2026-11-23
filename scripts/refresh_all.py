@@ -131,6 +131,8 @@ def main():
 
     authors = json.loads(authors_path.read_text(encoding="utf-8"))
     log(f"UP 数量: {len(authors)}")
+    log_operation("driver.start", workers=workers, force=force,
+                  pid=os.getpid(), authors=len(authors))
 
     # 互斥：WebUI 批量任务运行中（占用 Chrome profile）时不启动
     try:
@@ -221,6 +223,8 @@ def main():
             url = entry.get("profile_url", "")
             if not url:
                 log(f"[{i}/{len(names)}] SKIP {name}: 无 profile_url")
+                log_operation("up.finish", status="skip", author=name,
+                              index=i, total=len(names), reason="无 profile_url")
                 summaries.append({"author": name, "skipped": "no url"})
                 continue
 
@@ -228,6 +232,8 @@ def main():
                         author_total=len(names))
             _cur["author"] = name
             log(f"[{i}/{len(names)}] ▶ {name}  workers={workers} force={force}")
+            log_operation("up.start", author=name, index=i, total=len(names),
+                          workers=workers, force=force)
             t0 = time.time()
             try:
                 summary = batch_extract(
@@ -244,6 +250,8 @@ def main():
                 if summary.get("aborted"):
                     aborted = True
                     log(f"  ■ {name}: 任务已被用户终止，停止后续 UP")
+                    log_operation("up.finish", status="aborted", author=name,
+                                  index=i, duration_s=int(time.time() - t0))
                     summaries.append({**summary, "author": name, "aborted": True,
                                       "duration_s": int(time.time() - t0)})
                     break
@@ -251,6 +259,9 @@ def main():
                     # 余额不足：本条留在待解析队列重试，后续 UP 全部不启动
                     billing_stop = True
                     log(f"  ⛔ {name}: ASR 余额不足已自动暂停，停止后续 UP（充值后重跑即可续传）")
+                    log_operation("up.finish", status="paused", author=name,
+                                  index=i, reason="ASR 余额不足",
+                                  duration_s=int(time.time() - t0))
                     summaries.append({**summary, "author": name,
                                       "billing_paused": True,
                                       "duration_s": int(time.time() - t0)})
@@ -274,6 +285,9 @@ def main():
                 summary["author"] = name
                 summary["duration_s"] = duration
                 summaries.append(summary)
+                log_operation("up.finish", status="fail" if int(fail) else "ok",
+                              author=name, index=i, duration_s=duration,
+                              ok=ok, skip=skip, fail=fail, resumed=resumed)
                 write_state(totals={
                     "ok": sum(int(s.get("ok") or 0) for s in summaries),
                     "skip": sum(int(s.get("skip") or 0) for s in summaries),
@@ -282,6 +296,9 @@ def main():
             except Exception as e:
                 log(f"  ✗ FATAL {name}: {e}")
                 traceback.print_exc()
+                log_operation("up.finish", status="error", author=name, index=i,
+                              error=str(e)[:300],
+                              duration_s=int(time.time() - t0))
                 summaries.append({"author": name, "error": str(e),
                                    "duration_s": int(time.time() - t0)})
 
@@ -301,6 +318,13 @@ def main():
             log(f"\n=== 全 UP 刷新完成 ===")
         log(f"耗时 {total_s}s ({total_s // 60}min {total_s % 60}s)")
         log(f"总计 ok={ok_total} skip={skip_total} fail={fail_total} resumed={resumed_total}")
+        log_operation(
+            "driver.finish",
+            status="paused" if billing_stop else ("aborted" if aborted else
+                                                  ("fail" if fail_total else "ok")),
+            duration_s=total_s, ok=ok_total, skip=skip_total,
+            fail=fail_total, resumed=resumed_total,
+            ups=len(summaries), pid=os.getpid())
         log(f"UP 数 {len([s for s in summaries if 'error' not in s and 'aborted' not in s])}/{len(summaries)}")
 
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")

@@ -54,6 +54,20 @@ POLISH_SYSTEM_PROMPT = (
     "- 不要使用 Markdown 代码块或其他格式包裹输出。"
 )
 
+TRANSLATE_SYSTEM_PROMPT = (
+    "你是专业的字幕翻译助手。用户给你一段外文口播的语音识别(ASR)文稿，"
+    "请把它翻译成简体中文。\n"
+    "要求：\n"
+    "1. 保留原意、信息量与先后顺序，不得增删、不得总结、不得改写；\n"
+    "2. 人名、地名、作品名、术语等专有名词按通行译法处理，无通行译法时保留原文；\n"
+    "3. 按时长与语义合理断句分段，输出可直接作为字幕/文案使用的中文；\n"
+    "4. 若原文含音乐标签等非语音标记，原样保留这些标记的位置，不要翻译标记本身。\n\n"
+    "输出要求：\n"
+    "- 只输出译文本身；\n"
+    "- 不要添加任何解释、说明、评论或前后缀；\n"
+    "- 不要使用 Markdown 代码块或其他格式包裹输出。"
+)
+
 # Split long transcripts into chunks that fit comfortably in a request
 CHUNK_CHARS = 3000
 
@@ -79,6 +93,67 @@ def get_polish_config() -> dict:
         "api_key": api_key,
         "api_base_url": cfg.get("api_base_url") or os.getenv("OPENAI_BASE_URL") or DEFAULT_CHAT_URL,
         "model": cfg.get("model") or os.getenv("POLISH_MODEL") or DEFAULT_CHAT_MODEL,
+    }
+
+
+def _derive_chat_url(base_url: str) -> str:
+    """Derive an OpenAI-compatible chat endpoint from an ASR endpoint.
+
+    Reuses the same vendor/key already configured for ASR - no new provider:
+      .../v1/audio/transcriptions -> .../v1/chat/completions
+      .../v1 (or /v3)             -> .../chat/completions
+      already a chat endpoint     -> unchanged
+    Non-OpenAI-compatible endpoints (e.g. DashScope multimodal) return "".
+    """
+    base = (base_url or "").strip()
+    if not base:
+        return ""
+    if "/chat/completions" in base:
+        return base
+    if base.endswith("/audio/transcriptions"):
+        return base[:-len("/audio/transcriptions")] + "/chat/completions"
+    if base.endswith("/v1") or base.endswith("/v3"):
+        return base + "/chat/completions"
+    return ""
+
+
+def get_translate_config() -> dict:
+    """Resolve translation settings without introducing a new vendor.
+
+    Priority: config "translate" section -> existing "polish" client ->
+    active ASR provider (same key, chat URL derived from its endpoint) ->
+    OPENAI_* env vars.
+    """
+    file_cfg = load_config_file()
+    cfg = file_cfg.get("translate") or {}
+    api_key = cfg.get("api_key") or ""
+    base_url = cfg.get("api_base_url") or ""
+    model = cfg.get("model") or os.getenv("TRANSLATE_MODEL", "")
+
+    # 1) reuse the polish client (already OpenAI-compatible)
+    polish_cfg = get_polish_config()
+    if polish_cfg["api_key"]:
+        api_key = api_key or polish_cfg["api_key"]
+        base_url = base_url or polish_cfg["api_base_url"]
+        model = model or polish_cfg["model"]
+
+    # 2) reuse the active ASR provider's key, derive the chat URL
+    if not api_key or not base_url:
+        active = file_cfg.get("active_provider") or "siliconflow"
+        entry = (file_cfg.get("providers") or {}).get(active) or {}
+        api_key = api_key or entry.get("api_key", "")
+        base_url = base_url or _derive_chat_url(entry.get("api_base_url", ""))
+        model = model or DEFAULT_CHAT_MODEL
+
+    # 3) env fallback
+    api_key = api_key or os.getenv("OPENAI_API_KEY", "")
+    base_url = base_url or os.getenv("OPENAI_BASE_URL", "")
+
+    return {
+        "enabled": bool(cfg.get("enabled", True)) and bool(api_key) and bool(base_url),
+        "api_key": api_key,
+        "api_base_url": base_url,
+        "model": model or DEFAULT_CHAT_MODEL,
     }
 
 
@@ -125,7 +200,8 @@ def _split_chunks(text: str, max_chars: int) -> List[str]:
 
 def _call_polish(api_base_url: str, api_key: str, model: str,
                  chunk: str, retries: int,
-                 stats: Optional[list] = None) -> str:
+                 stats: Optional[list] = None,
+                 system_prompt: str = POLISH_SYSTEM_PROMPT) -> str:
     """Polish a single chunk with retry + backoff. Returns the raw chunk on failure.
 
     stats: optional list, appended once with {"attempts": n, "ok": bool} so
@@ -151,7 +227,7 @@ def _call_polish(api_base_url: str, api_key: str, model: str,
                 json={
                     "model": model,
                     "messages": [
-                        {"role": "system", "content": POLISH_SYSTEM_PROMPT},
+                        {"role": "system", "content": system_prompt},
                         {"role": "user", "content": chunk},
                     ],
                     "temperature": 0,
@@ -228,3 +304,55 @@ def polish_transcript(text: str, api_key: Optional[str] = None,
         polished_parts = [_run(chunk) for chunk in chunks]
 
     return "".join(polished_parts)
+
+
+def translate_transcript(text: str, api_key: Optional[str] = None,
+                         api_base_url: Optional[str] = None,
+                         model: Optional[str] = None,
+                         max_chars: int = 20000,
+                         max_workers: int = 4,
+                         retries: int = _DEFAULT_RETRIES,
+                         stats: Optional[list] = None) -> str:
+    """Translate a foreign-language transcript into Simplified Chinese.
+
+    Reuses the same OpenAI-compatible client / chunking / retry policy as
+    polishing. Returns "" when translation is unavailable or any chunk fails:
+    the caller must then keep the original text untouched (never overwrite it
+    with a half-translated mix).
+    """
+    cfg = get_translate_config()
+    api_key = api_key or cfg["api_key"]
+    api_base_url = api_base_url or cfg["api_base_url"]
+    model = model or cfg["model"]
+
+    if not api_key or not api_base_url or not text:
+        return ""
+
+    text = text[:max_chars] if len(text) > max_chars else text
+    chunks = _split_chunks(text, CHUNK_CHARS)
+
+    def _run(chunk: str) -> str:
+        chunk_stats: list = []
+        out = _call_polish(
+            api_base_url, api_key, model, chunk, retries, chunk_stats,
+            system_prompt=TRANSLATE_SYSTEM_PROMPT,
+        )
+        if stats is not None:
+            stats.extend(chunk_stats)
+        # 任一分块失败即整体判失败：混着原文的“译文”不能落盘
+        if not chunk_stats or not chunk_stats[0].get("ok"):
+            return ""
+        return out
+
+    if max_workers and max_workers > 1 and len(chunks) > 1:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            parts = list(executor.map(_run, chunks))
+    else:
+        parts = [_run(chunk) for chunk in chunks]
+
+    if not parts or any(p == "" for p in parts):
+        return ""
+
+    translated = "".join(parts).strip()
+    # 模型原样回吐原文＝没翻译，按失败处理，避免把原文当译文落盘
+    return "" if translated == text.strip() else translated

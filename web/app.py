@@ -72,6 +72,9 @@ _silence_child_consoles()
 
 
 # Import douyin processing module
+sys.path.insert(0, str(ROOT / "scripts"))
+import schedule_config  # noqa: E402  定时任务配置（schedule.json）+ 计划任务登记
+
 from douyin_downloader import get_video_info, HEADERS
 from asr_backends import (
     resolve_backend, transcribe_audio_file, PROVIDERS,
@@ -280,6 +283,116 @@ async def set_config(payload: ConfigPayload):
     return {"status": "ok", "active_provider": payload.active_provider}
 
 
+class SchedulePayload(BaseModel):
+    """Timed-task settings payload.
+
+    tasks   {task_id: {...}} 新增或修改（存在即更新）
+    deleted [task_id, ...]   删除并注销对应计划任务
+    """
+    tasks: dict = {}
+    deleted: list = []
+
+
+@app.get("/api/schedule")
+async def get_schedule():
+    """List every configured task with its real Windows registration state."""
+    try:
+        snap = schedule_config.status_snapshot()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="读取定时任务配置失败：%s" % e)
+    return {
+        "ok": True,
+        "config_path": str(schedule_config.CONFIG),
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        **snap,
+    }
+
+
+@app.post("/api/schedule")
+async def set_schedule(payload: SchedulePayload):
+    """Create / update / delete tasks and sync the Windows registrations.
+
+    Time / weekday range / interval / script / arguments all come from the
+    config; nothing here hard-codes 03:00. Disabling or deleting a task
+    removes its Windows task so it cannot fire at all. Renaming task_name
+    unregisters the old name first so no duplicate registration is left.
+    """
+    cfg = schedule_config.load()
+    old_names = {tid: t.get("task_name") for tid, t in cfg["tasks"].items()}
+    incoming_tasks = payload.tasks or {}
+    deleted_ids = [str(t) for t in (payload.deleted or [])]
+    if not incoming_tasks and not deleted_ids:
+        raise HTTPException(status_code=400, detail="没有收到任何任务设置")
+
+    removed_tasks = []
+    for tid in deleted_ids:
+        task = cfg["tasks"].pop(tid, None)
+        if task is not None:
+            removed_tasks.append((tid, task))
+
+    for tid, incoming in incoming_tasks.items():
+        if not isinstance(incoming, dict):
+            continue
+        cur = cfg["tasks"].get(tid)
+        if cur is None:
+            cfg["tasks"][tid] = dict(incoming)
+            continue
+        for k in ("label", "enabled", "time", "weekdays", "interval_days",
+                  "task_name", "script", "arguments", "workers", "force"):
+            if k in incoming and incoming[k] is not None:
+                cur[k] = incoming[k]
+
+    try:
+        cfg = schedule_config.save(cfg)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # 只重登记这次动过的任务，避免刷新其它任务的 LastRunTime / 运行历史
+    results = [schedule_config.unregister(tid, task) for tid, task in removed_tasks]
+    for tid in dict.fromkeys(incoming_tasks.keys()):
+        task = cfg["tasks"].get(tid)
+        if not task:
+            continue
+        if task.get("enabled"):
+            old = old_names.get(tid)
+            if old and old != task.get("task_name"):
+                schedule_config.unregister(tid, {"task_name": old})
+            results.append(schedule_config.register(tid, task))
+        else:
+            results.append(schedule_config.unregister(tid, task))
+
+    removed_ids = {tid for tid, _ in removed_tasks}
+    removed_labels = {tid: t.get("label") or tid for tid, t in removed_tasks}
+    for r in results:
+        tid = r.get("task_id")
+        task = cfg["tasks"].get(tid) or {}
+        label = task.get("label", tid)
+        if tid in removed_ids:
+            r["readable"] = "%s：已删除（计划任务已注销）" % removed_labels.get(tid, tid)
+        elif task.get("enabled"):
+            r["readable"] = ("%s：已登记，%s 下次 %s"
+                             % (label, schedule_config.describe(task),
+                                r.get("next_run") or "（待系统计算）")) if r.get("ok") else \
+                            ("%s：登记失败 — %s" % (label, r.get("message", "")))
+        else:
+            r["readable"] = "%s：已停用（计划任务已注销）" % label
+
+    log_operation("schedule.save", status="ok",
+                  tasks={tid: {"enabled": t.get("enabled"), "time": t.get("time"),
+                               "weekdays": t.get("weekdays"),
+                               "interval_days": t.get("interval_days"),
+                               "arguments": t.get("arguments")}
+                         for tid, t in (cfg.get("tasks") or {}).items()},
+                  deleted=deleted_ids)
+    return {
+        "ok": True,
+        "config_path": str(schedule_config.CONFIG),
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        **schedule_config.status_snapshot(),
+        "registration": results,
+    }
+
+
 @app.post("/api/video/info", response_model=VideoInfoResponse)
 async def get_info(req: VideoRequest):
     """Get video info (no API_KEY required)"""
@@ -367,6 +480,12 @@ _queue_continues_manual = False
 _batch_job = {"label": "", "history": [], "subs": [], "seq": 0}
 _BATCH_HISTORY_MAX = 2000
 
+# 当前批次视频级进度（后端权威）：页面刷新/断流重连后前端直接读这份数字，
+# 不再靠前端自己累加事件。与抢占让位、处理中置顶共用同一份运行态。
+#   done / total      - 已处理条数 / 本批总条数
+#   current_id/title  - 正在处理的视频（批量或单条）
+_batch_progress = {"done": 0, "total": 0, "current_id": "", "current_title": ""}
+
 # Increments on every new job (manual batch or next queue item). The seq
 # counter restarts from 0 per job, so clients need the epoch to tell
 # "replayed event of the same job" apart from "event of a NEW job whose
@@ -384,6 +503,8 @@ def _batch_new_job(label: str, run_ctx: dict = None) -> None:
     _batch_job["label"] = label
     _batch_job["seq"] = 0
     del _batch_job["history"][:]
+    _batch_progress.update({"done": 0, "total": 0,
+                            "current_id": "", "current_title": ""})
     # Per-run refresh-log context (written to output/刷新日志/ on finish)
     _run_ctx = run_ctx if run_ctx is not None else {
         "trigger": "", "url": "", "params": "", "note": "",
@@ -396,6 +517,19 @@ def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+def _sub_push(sub: dict, item) -> None:
+    """Hand one event to an attached progress stream from ANY thread.
+
+    Subscribers hold an asyncio.Queue so waiting costs no thread; worker
+    threads publish through call_soon_threadsafe. A closed loop (page gone,
+    service shutting down) just drops the event.
+    """
+    try:
+        sub["loop"].call_soon_threadsafe(sub["queue"].put_nowait, item)
+    except Exception:
+        pass
+
+
 def _batch_publish(event: dict) -> None:
     """Record a batch event and fan it out to every attached progress stream."""
     _batch_job["seq"] += 1
@@ -403,6 +537,25 @@ def _batch_publish(event: dict) -> None:
     event["epoch"] = _batch_epoch
     history = _batch_job["history"]
     history.append(event)
+    # 视频级进度（后端唯一口径）：开始事件更新「正在处理」，结果事件累加
+    # 已完成。前端只展示这里的数字，断流/刷新不会重复计数或归零。
+    stage = event.get("stage")
+    if stage == "video_start":
+        if event.get("aweme_id"):
+            _batch_progress["current_id"] = str(event["aweme_id"])
+        _batch_progress["current_title"] = str(event.get("title") or "")
+        total = event.get("total")
+        if isinstance(total, int) and total > 0:
+            _batch_progress["total"] = total
+    elif stage == "extract":
+        total = event.get("total")
+        if isinstance(total, int) and total > 0:
+            _batch_progress["total"] = total
+        if event.get("status") in ("ok", "skip", "fail"):
+            _batch_progress["done"] += 1
+    # 每条事件都附带后端算好的进度快照：前端直接赋值展示，
+    # 既不自己累加，也不用等下一次状态轮询。
+    event["batch_progress"] = dict(_batch_progress)
     # 视频级结果写入执行日志（/api/logs/videos 按执行时间倒序展示）
     # Pre-filter skips (already-ok / known non-video, never actually
     # re-parsed this run) stay on the progress stream but do not pollute
@@ -446,13 +599,13 @@ def _batch_publish(event: dict) -> None:
     if len(history) > _BATCH_HISTORY_MAX:
         del history[: len(history) - _BATCH_HISTORY_MAX]
     for sub in list(_batch_job["subs"]):
-        sub.put(event)
+        _sub_push(sub, event)
 
 
 def _batch_finish() -> None:
     """Tells every attached progress stream that the job is over."""
     for sub in list(_batch_job["subs"]):
-        sub.put(None)
+        _sub_push(sub, None)
 
 
 # ---------------------------------------------------------------------------
@@ -683,9 +836,8 @@ async def _batch_stream():
     live tail then keeps it in sync. Events are deduped by seq, so an event
     published between the replay snapshot and the subscription is not doubled.
     """
-    sub: "queue.Queue" = queue.Queue()
+    sub = {"loop": asyncio.get_running_loop(), "queue": asyncio.Queue()}
     _batch_job["subs"].append(sub)
-    loop = asyncio.get_event_loop()
     last = 0
     try:
         for evt in list(_batch_job["history"]):
@@ -696,7 +848,7 @@ async def _batch_stream():
             yield _sse({"stage": "closed"})
             return
         while True:
-            item = await loop.run_in_executor(None, sub.get)
+            item = await sub["queue"].get()
             if item is None:
                 break
             if item.get("seq", 0) <= last:
@@ -761,10 +913,19 @@ def _restart_when_settled(status: str) -> None:
                 log_operation("batch.winddown", reason="restart")
             except Exception:
                 pass
-        while _batch_state["running"]:
+        # 收尾等待必须有上限：单条视频若卡在浏览器兜底/网络读且不检查
+        # cancel_flag，_batch_state["running"] 永远不会落地，重启会一直挂着。
+        settle_timeout = 240
+        deadline = time.time() + settle_timeout
+        while _batch_state["running"] and time.time() < deadline:
             time.sleep(2.0)
-        log_operation("service.restart", status=status,
-                      msg=f"服务重启：等待任务收尾后执行（调度态 {status}）")
+        if _batch_state["running"]:
+            log_operation("service.restart", status="forced",
+                          msg=f"等待任务收尾超过 {settle_timeout}s 仍未结束"
+                              "（疑似单条卡死），强制重启")
+        else:
+            log_operation("service.restart", status=status,
+                          msg=f"服务重启：等待任务收尾后执行（调度态 {status}）")
         _restart_now(delay=1.0)
 
     threading.Thread(target=_run, daemon=True).start()
@@ -854,12 +1015,34 @@ def _queue_url_key(url: str) -> str:
     return u
 
 
+def _pending_normalize(items: list) -> list:
+    """Canonical queue order (persisted, not CSS): 插队 → 处理中 → 其余。
+
+    1. ``pending`` + ``jumped``：插队条目，排在处理中任务之上；
+    2. ``running``：正在处理的那一条，固定最上方（除插队外无人可越过）；
+    3. 其余条目：保持原有相对顺序。
+
+    The runner takes the first ``pending`` row, so keeping jumped rows above
+    ``running`` still means "run next" without preempting the running row.
+    """
+    jumped = [it for it in items
+              if it.get("status") == "pending" and it.get("jumped")]
+    running = [it for it in items if it.get("status") == "running"]
+    pinned = {id(it) for it in jumped} | {id(it) for it in running}
+    rest = [it for it in items if id(it) not in pinned]
+    return jumped + running + rest
+
+
 def _load_pending() -> dict:
     try:
         if PENDING_LINKS_FILE.exists():
             data = json.loads(PENDING_LINKS_FILE.read_text(encoding="utf-8"))
             if isinstance(data, dict) and isinstance(data.get("items"), list):
                 data.setdefault("next_id", 1)
+                # Read-side normalization: an old file that predates the
+                # 插队→处理中→其余 rule still renders in canonical order before
+                # the next write persists it.
+                data["items"] = _pending_normalize(data["items"])
                 return data
     except Exception:
         pass
@@ -867,6 +1050,9 @@ def _load_pending() -> dict:
 
 
 def _save_pending(data: dict) -> None:
+    # Every write re-applies the canonical order so "running pinned to the top,
+    # jumped above it" survives reloads/restarts instead of being a CSS trick.
+    data["items"] = _pending_normalize(data.get("items") or [])
     PENDING_LINKS_FILE.write_text(
         json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -1073,6 +1259,7 @@ def _pending_add(urls: list, titles: list = None) -> tuple:
             if reuse is not None:
                 reuse.update({
                     "status": "pending",
+                    "jumped": False,  # 重新入队不得继承上一次的插队优先级
                     "title": title or reuse.get("title", ""),
                     "result": "",
                     "terminal": False,
@@ -1091,7 +1278,7 @@ def _pending_add(urls: list, titles: list = None) -> tuple:
                 continue
             data["items"].append({
                 "id": data["next_id"], "url": url,
-                "kind": kind, "status": "pending",
+                "kind": kind, "status": "pending", "jumped": False,
                 "title": title,
                 "attempts": 0, "terminal": False,
                 "added_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1228,34 +1415,32 @@ def _pending_reorder(ids: list) -> bool:
         return True
 
 
-# 抢占正在跑的那一条不可行的原因（如实告知，不硬做）：
-# 队列 runner 对单个条目串行执行「分享页解析 → 下载 → 抽音 → ASR → 落盘」，
-# 整条链没有任何中断点（HTTP 请求、ffmpeg、ASR 都是阻塞调用），要中止只能杀
-# 线程，留下半截临时文件和未回收的进程。因此只做「插到下一个执行」。
-PREEMPT_UNSUPPORTED = (
-    "不支持抢占正在处理的那一条：队列 runner 会在单条内串行跑完"
-    "分享页解析→下载→抽音→ASR→落盘，全程没有可中断的检查点，强行中止只能"
-    "杀线程并留下半截文件/孤儿进程。请用「插到下一个执行」：当前这条跑完就"
-    "立刻轮到它，不打断在跑的工作。")
-
-
 def _pending_move(item_id: int, op: str, mode: str = "next") -> dict:
     """Move one PENDING item inside the persisted queue (order = dispatch order).
 
-    op="pin"  - 置顶: put it at the queue head (index 0); the next dispatch
-                takes it first.
-    op="jump" - 插队: mode="next" inserts it right after the running item (or
-                at the head of the pending block when nothing is running), so
-                it becomes the next dispatch without touching the running one.
-                mode="preempt" is refused (see PREEMPT_UNSUPPORTED).
+    op="pin"  - 置顶: head of the normal pending zone (below running / 插队区);
+                the next dispatch among normal work takes it first.
+    op="jump" - 插队: highest priority. Marks it jumped, puts it above the
+                running row, and trips graceful preemption: the running batch
+                stops taking new videos at the next video boundary, the slot
+                is handed to this item, and the batch resumes afterwards.
+                Both mode values are accepted and behave the same (the
+                in-flight video is never killed mid-way).
+    op="up"     - 上移: swap with the previous row of the same zone (jumped
+                zone above running, normal pending zone below it).
+    op="down"   - 下移: swap with the next row of the same zone.
+    op="bottom" - 置底: last row of the normal pending zone (clears jumped).
+
+    Persistent order is 插队区 → 处理中 → 其余（见 _pending_normalize）；the
+    running row is pinned to the top except for jumped rows, so this survives
+    a browser refresh instead of being a CSS-only arrangement.
 
     Only status == "pending" moves: the running item is inside an
     uninterruptible call chain and done/fail rows are history, not work.
-    Returns {"ok", "reason", "from", "to", "item"} (positions are 1-based).
+    Returns {"ok", "reason", "from", "to", "item"} (positions are 1-based);
+    from == to means the item is already at that edge.
     """
-    if op == "jump" and (mode or "next") == "preempt":
-        return {"ok": False, "reason": "preempt_unsupported"}
-    if op not in ("pin", "jump"):
+    if op not in ("pin", "jump", "up", "down", "bottom"):
         return {"ok": False, "reason": "unknown_op"}
     with _pending_lock:
         data = _load_pending()
@@ -1268,18 +1453,39 @@ def _pending_move(item_id: int, op: str, mode: str = "next") -> dict:
             return {"ok": False, "reason": "not_pending"}
         before = _pending_positions(items)
         moving = items.pop(idx)
-        if op == "pin":
+        if op == "jump":
+            # 插队：排到处理中任务之上（最新插队的最靠前）；执行上仍是「下一个」。
+            moving["jumped"] = True
             target = 0
         else:
-            run_idx = next((i for i, it in enumerate(items)
-                            if it.get("status") == "running"), None)
-            if run_idx is not None:
-                target = run_idx + 1
-            else:
-                target = next((i for i, it in enumerate(items)
-                               if it.get("status") == "pending"), len(items))
+            # 其余四种只在同一分区内移动：插队区在 running 之上，普通待执行区
+            # 在 running 之下，互不越界（running 固定最上方）。
+            if op in ("pin", "bottom"):
+                moving["jumped"] = False  # 置顶/置底 = 回到普通待执行区
+            is_jumped = bool(moving.get("jumped"))
+            zone = [i for i, it in enumerate(items)
+                    if it.get("status") == "pending"
+                    and bool(it.get("jumped")) == is_jumped]
+            if op == "pin":
+                if zone:
+                    target = zone[0]
+                else:
+                    target = sum(
+                        1 for it in items
+                        if it.get("status") == "running"
+                        or (it.get("status") == "pending" and it.get("jumped")))
+            elif op == "bottom":
+                target = zone[-1] + 1 if zone else len(items)
+            elif op == "up":
+                prev = [i for i in zone if i < idx]
+                target = prev[-1] if prev else idx
+            else:  # down
+                nxt = [i for i in zone if i >= idx]
+                target = nxt[0] + 1 if nxt else idx
         items.insert(min(target, len(items)), moving)
+        items = _pending_normalize(items)
         after = _pending_positions(items)
+        data["items"] = items
         _save_pending(data)
     return {"ok": True, "reason": "", "from": before[item_id],
             "to": after[item_id], "item": dict(moving)}
@@ -1299,7 +1505,7 @@ def _queue_actor(request, who: str = "") -> str:
 
 
 def _pending_mark(item_id: int, status: str, result: str = "",
-                  terminal: bool = False) -> None:
+                  terminal: bool = False, extra: dict = None) -> None:
     from datetime import datetime
     with _pending_lock:
         data = _load_pending()
@@ -1308,6 +1514,8 @@ def _pending_mark(item_id: int, status: str, result: str = "",
                 it["status"] = status
                 it["result"] = (result or "")[:300]
                 it["terminal"] = bool(terminal)
+                if extra:
+                    it.update(extra)
                 if status in ("done", "fail", "ignored"):
                     it["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 break
@@ -1517,6 +1725,15 @@ def _pending_run_up(item: dict) -> None:
             start_paused=_batch_pause_flag(),
             on_progress=_batch_publish,
         )
+        if summary.get("preempted"):
+            # 插队抢占：批量在视频边界让位，条目回到 pending，插队跑完自动续跑
+            _batch_publish({"stage": "preempted",
+                            "ok": summary.get("ok", 0),
+                            "skip": summary.get("skip", 0),
+                            "fail": summary.get("fail", 0)})
+            _pending_mark(item["id"], "pending",
+                          result="插队任务抢占：批量已让位，插队完成后自动续跑")
+            return
         if summary.get("aborted"):
             _batch_publish({"stage": "aborted",
                             "ok": summary.get("ok", 0),
@@ -1538,14 +1755,23 @@ def _pending_run_up(item: dict) -> None:
         _batch_publish({"stage": "aborted"})
         _pending_mark(item["id"], "pending", result="批量任务被终止，重新排队")
         return
+    # 逐条结果计数落到条目上：批量跑完但整批有失败时，徽标不能再只显示
+    # 「已完成」——失败数必须露出来（此前只藏在 hover 的 title 里＝所见非所得）。
     _pending_mark(item["id"], "done",
-                  result=f"新增 {summary.get('ok', 0)}，跳过 {summary.get('skip', 0)}，失败 {summary.get('fail', 0)}")
+                  result=f"新增 {summary.get('ok', 0)}，跳过 {summary.get('skip', 0)}，失败 {summary.get('fail', 0)}",
+                  extra={"ok_count": int(summary.get("ok", 0) or 0),
+                         "skip_count": int(summary.get("skip", 0) or 0),
+                         "fail_count": int(summary.get("fail", 0) or 0)})
 
 
 def _pending_run_video(item: dict) -> None:
     api_key = _pending_api_key()
     if not api_key:
         raise RuntimeError("未配置 API Key")
+    # 单条视频也走同一份视频级进度：先报「正在处理」，前端进度区不用区分
+    # 批量还是单条。
+    _batch_publish({"stage": "video_start", "index": 1, "total": 1,
+                    "title": item.get("title") or item.get("url", "")})
     trace = StageTrace(batch_id=new_batch_id(),
                        worker_id=threading.current_thread().name)
     video_info, _text = _extract_single_video(item["url"], api_key, trace=trace)
@@ -1599,6 +1825,8 @@ async def pending_links_add(req: PendingLinksRequest):
 @app.post("/api/pending-links/clear-finished")
 async def pending_links_clear_finished():
     removed = _pending_clear_finished()
+    if removed:
+        log_operation("queue.clear_finished", removed=removed)
     return {"removed": removed, "items": _pending_items()}
 
 
@@ -1714,7 +1942,7 @@ class PendingReorderRequest(BaseModel):
 
 
 class PendingJumpRequest(BaseModel):
-    mode: str = "next"     # "next" (default) | "preempt" (refused)
+    mode: str = "next"     # accepted for compatibility; both modes yield gracefully
     who: str = ""
 
 
@@ -1726,9 +1954,41 @@ def _queue_move_error(res: dict) -> HTTPException:
         return HTTPException(
             status_code=409,
             detail="只有「待执行」条目可以调整顺序（处理中/已完成/失败的条目不动）")
-    if reason == "preempt_unsupported":
-        return HTTPException(status_code=409, detail=PREEMPT_UNSUPPORTED)
     return HTTPException(status_code=400, detail="不支持的队列操作")
+
+
+def _signal_jump_preempt(item: dict) -> None:
+    """插队进入时，让正在跑的批量在「下一个视频之前」让位。
+
+    The batch checks preempt_flag at every video boundary, never mid-video, so
+    the in-flight video finishes; the UP queue item is then requeued and
+    resumes automatically after the jumped task completes.
+    """
+    if not _batch_state.get("running"):
+        return
+    try:
+        from batch_extractor import preempt_flag
+        preempt_flag.set()
+        log_operation("queue.preempt", status="requested",
+                      item_id=item.get("id"), kind=item.get("kind"),
+                      url=item.get("url"), title=item.get("title") or None,
+                      msg="插队任务进入：批量停止取新视频，当前条完成后让位")
+    except Exception:
+        pass
+
+
+def _queue_order_response(item_id: int, op: str, request: Request) -> dict:
+    """Apply one order op and write the same queue.order audit line as pin/jump."""
+    actor = _queue_actor(request)
+    res = _pending_move(item_id, op)
+    if not res["ok"]:
+        raise _queue_move_error(res)
+    log_operation("queue.order", op=op, who=actor, item_id=item_id,
+                  kind=res["item"].get("kind"), url=res["item"].get("url"),
+                  from_pos=res["from"], to_pos=res["to"],
+                  title=res["item"].get("title") or None)
+    return {"ok": True, "from": res["from"], "to": res["to"],
+            "items": _pending_items()}
 
 
 @app.put("/api/pending-links/{item_id}")
@@ -1738,6 +1998,7 @@ async def pending_links_update(item_id: int, req: PendingLinkUpdateRequest):
         raise HTTPException(
             status_code=409,
             detail="条目不存在、已在处理中，或链接格式无效")
+    log_operation("queue.edit", item_id=item_id, url=req.url)
     return {"ok": True, "items": _pending_items()}
 
 
@@ -1786,14 +2047,34 @@ async def pending_links_jump(item_id: int, req: PendingJumpRequest,
                   url=res["item"].get("url"),
                   from_pos=res["from"], to_pos=res["to"],
                   title=res["item"].get("title") or None)
+    _signal_jump_preempt(res["item"])
     return {"ok": True, "from": res["from"], "to": res["to"],
             "items": _pending_items()}
+
+
+@app.post("/api/pending-links/{item_id}/bottom")
+async def pending_links_bottom(item_id: int, request: Request):
+    """置底：排到所有「待执行」条目之后，队列里最后才轮到它。"""
+    return _queue_order_response(item_id, "bottom", request)
+
+
+@app.post("/api/pending-links/{item_id}/up")
+async def pending_links_up(item_id: int, request: Request):
+    """上移：与上一条待执行条目交换位置。"""
+    return _queue_order_response(item_id, "up", request)
+
+
+@app.post("/api/pending-links/{item_id}/down")
+async def pending_links_down(item_id: int, request: Request):
+    """下移：与下一条待执行条目交换位置。"""
+    return _queue_order_response(item_id, "down", request)
 
 
 @app.delete("/api/pending-links/{item_id}")
 async def pending_links_remove(item_id: int):
     if not _pending_remove(item_id):
         raise HTTPException(status_code=409, detail="条目不存在或正在运行")
+    log_operation("queue.remove", item_id=item_id)
     return {"ok": True, "items": _pending_items()}
 
 
@@ -1801,6 +2082,7 @@ async def pending_links_remove(item_id: int):
 async def _resume_pending_queue():
     """After a crash/restart, requeue an item that died mid-run and resume
     the queue - links the user queued must not be lost to a service restart."""
+    requeued = 0
     with _pending_lock:
         data = _load_pending()
         changed = False
@@ -1808,12 +2090,25 @@ async def _resume_pending_queue():
             if it["status"] == "running":
                 it["status"] = "pending"
                 changed = True
+                requeued += 1
         if changed:
             _save_pending(data)
+    log_operation("service.start", status="ok", pid=os.getpid(),
+                  port=int(os.getenv("PORT", "8080")),
+                  restart_env=bool(os.getenv("DOUYIN_RESTART")),
+                  requeued=requeued,
+                  pending=sum(1 for it in data["items"] if it["status"] == "pending"),
+                  paused=_batch_pause_flag())
     _maybe_start_pending(delay=8.0)
     # 占位名回填：把「未解析UP-xxxxxx」条目补成真实昵称（后台串行，尽力而为）
     threading.Thread(target=_backfill_placeholder_names, daemon=True,
                      name="nickname-backfill").start()
+
+
+@app.on_event("shutdown")
+async def _log_service_stop():
+    log_operation("service.stop", status="ok", pid=os.getpid(),
+                  batch_running=bool(_batch_state["running"]))
 
 
 @app.post("/api/service/restart")
@@ -2002,6 +2297,9 @@ async def service_status():
         "batch_running": running,
         "batch_paused": paused,
         "batch_label": _batch_job["label"] if running else "",
+        # 本批视频级进度（已完成/总数 + 正在处理的视频）：后端权威值，
+        # 前端不自行累加，刷新页面/重连后保持同一份数字。
+        "batch_progress": dict(_batch_progress),
         # ASR 余额不足：解析已自动暂停，前端常驻横幅提醒充值
         "billing_shortage": bool(billing),
         "billing_message": billing.get("message", ""),
@@ -2040,7 +2338,10 @@ async def run_stats_reset():
     """
     if _batch_state["running"]:
         raise HTTPException(status_code=409, detail="任务运行中，结束后才能清空统计")
+    prev = dict(_run_stats)
     _reset_run_stats()
+    log_operation("stats.reset", ok=prev.get("ok", 0), skip=prev.get("skip", 0),
+                  fail=prev.get("fail", 0), ignored=prev.get("ignored", 0))
     return {"status": "ok"}
 
 
@@ -2065,6 +2366,8 @@ async def run_stats_seed(req: RunStatsSeedRequest):
     _run_stats["skip"] = max(0, int(req.skip))
     _run_stats["fail"] = max(0, int(req.fail))
     _run_stats["ignored"] = max(0, int(req.ignored))
+    log_operation("stats.seed", ok=_run_stats["ok"], skip=_run_stats["skip"],
+                  fail=_run_stats["fail"], ignored=_run_stats["ignored"])
     return {"status": "ok"}
 
 
@@ -2155,12 +2458,15 @@ async def refresh_all_start(req: RefreshAllRequest):
         args.append("-Force")
     _clear_billing_flag()  # 新一次全 UP 刷新：撤下旧的欠费横幅
     try:
-        subprocess.Popen(
+        proc = subprocess.Popen(
             args, cwd=str(ROOT), close_fds=True,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
     except Exception as e:
+        log_operation("refreshall.start", status="error", error=str(e)[:300],
+                      workers=req.workers, force=req.force)
         raise HTTPException(status_code=500, detail=f"启动失败: {e}")
-    log_operation("refreshall.start", workers=req.workers, force=req.force)
+    log_operation("refreshall.start", workers=req.workers, force=req.force,
+                  driver_pid=proc.pid)
     return {"status": "starting",
             "notice": "全 UP 刷新已在后台启动（关闭浏览器不影响）；进度会显示在页面上"}
 
@@ -2383,6 +2689,10 @@ async def refresh_task_put(req: RefreshTaskRequest):
     data["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
     REFRESH_TASK_FILE.write_text(
         json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    log_operation("task.persist", total=data.get("total", 0),
+                  current=data.get("current", ""),
+                  pending=len(data.get("pending") or []),
+                  done=len(data.get("done") or []))
     return {"ok": True}
 
 
@@ -2393,8 +2703,11 @@ async def refresh_task_delete():
         REFRESH_TASK_FILE.unlink()
     except FileNotFoundError:
         pass
-    except Exception:
-        pass
+    except Exception as e:
+        # 不吞异常：磁盘/权限问题必须留痕并让调用方知道清理失败
+        log_operation("task.clear", status="error", error=str(e)[:300])
+        raise HTTPException(status_code=500, detail=f"清除续跑任务失败：{e}")
+    log_operation("task.clear")
     return {"ok": True}
 
 
@@ -2590,6 +2903,7 @@ async def authors_open_dir(req: AuthorNameRequest):
     if not d.is_dir():
         raise HTTPException(status_code=404, detail="Output folder not found")
     subprocess.Popen(["explorer", str(d)])
+    log_operation("authors.open_dir", name=req.name, path=str(d))
     return {"ok": True}
 
 
@@ -2705,9 +3019,22 @@ def _extract_single_video(url: str, api_key: str, provider: str = None,
         video_path = processor.download_video(video_info, show_progress=False)
         audio_path = processor.extract_audio(video_path, show_progress=False)
         try:
-            text = processor.extract_text_from_audio(audio_path, show_progress=False)
+            asr_result = processor.extract_text_from_audio_ex(
+                audio_path, show_progress=False)
         finally:
             processor.cleanup_files(video_path, audio_path)
+        text = asr_result["text"]
+        language = asr_result["language"] or "unknown"
+        # Language-aware quality gate (same rules as the batch path).
+        from asr_backends import TranscriptionError
+        verdict = asr_result["verdict"]
+        if not verdict["ok"]:
+            raise TranscriptionError(
+                "asr_suspect: %s (lang=%s cjk=%.2f latin=%.2f repeat=%.2f len=%d music=%.3f hint=%s)" % (
+                    verdict["quality"], language, verdict["cjk_ratio"],
+                    verdict.get("latin_ratio", 0.0), verdict["repeat_ratio"],
+                    verdict["length"], verdict.get("music_ratio", 0.0),
+                    verdict.get("lyric_hint", False)))
     except Exception as e:
         # 重试失败也要把这次的时间和错误写回 history.json：否则「失败文案
         # 清单」永远停留在首次失败的记录上，看起来像重试没生效。
@@ -2728,9 +3055,10 @@ def _extract_single_video(url: str, api_key: str, provider: str = None,
             pass
         trace.flush()
         raise
-    # Optional LLM polish (fixes homophones/punctuation)
+    # Optional LLM polish (fixes homophones/punctuation). The prompt is
+    # Chinese-specific, so it only runs for Chinese transcripts.
     polish_cfg = (load_config_file().get("polish") or {})
-    if polish_cfg.get("enabled"):
+    if language == "zh" and polish_cfg.get("enabled"):
         _parse_in = len(text)
         trace.start("parse")
         try:
@@ -2753,6 +3081,26 @@ def _extract_single_video(url: str, api_key: str, provider: str = None,
                        input_chars=_parse_in, output_chars=len(text),
                        retry="", duration_ms=trace.end("parse"),
                        error=str(e)[:300])
+    # Foreign video: translate after polish, before writing md / library.
+    # A failed translation leaves the original untouched.
+    translated_text = ""
+    if language != "zh":
+        trace.start("translate")
+        try:
+            from transcript_polish import translate_transcript
+            _tr_stats = []
+            translated_text = translate_transcript(text, stats=_tr_stats)
+            trace.emit("translate", status="ok" if translated_text else "skip",
+                       mode="llm", model=(polish_cfg.get("model") or ""),
+                       input_chars=len(text), output_chars=len(translated_text),
+                       retry="", duration_ms=trace.end("translate"),
+                       error=None if translated_text else "translation unavailable or failed")
+        except Exception as e:
+            trace.emit("translate", status="error", mode="llm",
+                       model=(polish_cfg.get("model") or ""),
+                       input_chars=len(text), output_chars=0,
+                       retry="", duration_ms=trace.end("translate"),
+                       error=str(e)[:300])
     # Record to the global library file
     append_record(
         video_id=video_info["video_id"],
@@ -2761,6 +3109,9 @@ def _extract_single_video(url: str, api_key: str, provider: str = None,
         source="single",
         provider=backend['provider'],
         model=backend['model'],
+        language=language,
+        original_text=text if language != "zh" else "",
+        translated_text=translated_text,
     )
     # Save into the per-author directory (one dir per UP) and
     # refresh that author's catalog; never fail the request on it.
@@ -2772,7 +3123,9 @@ def _extract_single_video(url: str, api_key: str, provider: str = None,
                       / "output" / safe_author)
         trace.start("kb_write")
         md_path = save_transcript(author_dir, video_info["video_id"],
-                                  video_info["title"], author, text)
+                                  video_info["title"], author, text,
+                                  language=language,
+                                  translated_text=translated_text)
         trace.emit("kb.write", path=str(md_path),
                    bytes=_safe_file_size(md_path),
                    duration_ms=trace.end("kb_write"))
@@ -2825,7 +3178,13 @@ async def extract_transcript(req: VideoRequest):
 
     ev = _pending_wait(item_id)
     _maybe_start_pending(delay=0.3 if added else 2.0)
-    finished = await asyncio.to_thread(ev.wait, 600)
+    # Wait without occupying a thread-pool worker: this can block for up to
+    # 10 minutes, and the old to_thread(ev.wait, 600) held one of the 16
+    # shared workers the whole time (starving the log endpoints).
+    deadline = time.time() + 600
+    while not ev.is_set() and time.time() < deadline:
+        await asyncio.sleep(0.2)
+    finished = ev.is_set()
     payload = _pending_texts.get(item_id) or {}
     item = _pending_get(item_id) or {}
 
@@ -2855,10 +3214,12 @@ async def extract_transcript(req: VideoRequest):
 
 
 @app.get("/api/logs")
-async def get_operation_logs(limit: int = 200, action: str = "", status: str = ""):
+def get_operation_logs(limit: int = 200, action: str = "", status: str = ""):
     """Query recent runtime operation logs (newest last).
 
     Optional filters: action (e.g. video.extract), status (ok/error).
+    Sync endpoint: Starlette runs it in its own threadpool, so a slow read
+    can never block the event loop (it used to hold it for ~3.5s).
     """
     return {
         "count": limit,
@@ -2868,8 +3229,8 @@ async def get_operation_logs(limit: int = 200, action: str = "", status: str = "
 
 
 @app.get("/api/logs/videos")
-async def get_video_execution_logs(limit: int = 500, status: str = "",
-                                   author: str = ""):
+def get_video_execution_logs(limit: int = 500, status: str = "",
+                             author: str = ""):
     """视频执行日志：哪个 UP 的哪个视频 成功/跳过/失败，按执行时间倒序。
 
     Optional filters: status (ok/skip/fail/error), author (substring).
@@ -2878,18 +3239,39 @@ async def get_video_execution_logs(limit: int = 500, status: str = "",
     return {"count": len(items), "logs": items}
 
 
+@app.get("/api/logs/coverage")
+def get_log_coverage():
+    """动作日志覆盖自查：列出「有入口但没落 operation_logs」的清单。
+
+    静态扫描 web/app.py 路由与 scripts 下定时脚本，结果缓存 60 秒；
+    新增动作后打开本接口即可确认是否漏日志（也可跑 scripts/log_coverage.py）。
+    """
+    try:
+        scripts_dir = str(Path(__file__).parent.parent / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        import log_coverage
+        return log_coverage.audit()
+    except Exception as e:
+        return {"error": str(e)[:300]}
+
+
 @app.get("/api/logs/runtime")
-async def get_runtime_logs(limit: int = 200, before: str = "",
-                           status: str = ""):
+def get_runtime_logs(limit: int = 200, before: str = "",
+                     status: str = "", kinds: str = ""):
     """统一日志流：driver 实时输出 + WebUI 操作 + 每视频执行结果，最新在前。
 
     before="YYYY-MM-DD HH:MM:SS" 为「加载更早历史」的时间锚点，
-    只返回严格早于该时间的条目。status 可按状态筛选（ok/skip/fail/error…）。
-    http.request 噪音已被剔除。
+    只返回严格早于该时间的条目。status 可按状态筛选（ok/skip/fail/error…），
+    kinds 可按来源筛选（video/driver/action/progress，逗号分隔；新增可选参数，
+    不传＝旧行为）。http.request 噪音已被剔除。
+
+    同步端点（走 Starlette 线程池），不占 asyncio 默认线程池——后者曾被
+    常驻 SSE 连接占满，导致本接口永远排队（实测 >150s 不返回）。
     """
-    return await asyncio.to_thread(
-        read_runtime_logs, limit=max(1, min(limit, 1000)),
-        before=before or "", status=status or "")
+    return read_runtime_logs(limit=max(1, min(limit, 1000)),
+                             before=before or "", status=status or "",
+                             kinds=kinds or "")
 
 
 def _content_disposition(filename: str) -> str:
@@ -2928,6 +3310,8 @@ async def download_video(video_id: str, filename: str = "video.mp4"):
         response.raise_for_status()
 
         content_length = response.headers.get("content-length", "")
+        log_operation("video.download.proxy", video_id=video_id,
+                      bytes=content_length or None, url=info.get("url", "")[:200])
 
         def iter_content():
             for chunk in response.iter_content(chunk_size=8192):
@@ -2946,8 +3330,12 @@ async def download_video(video_id: str, filename: str = "video.mp4"):
             headers=headers
         )
     except requests.exceptions.HTTPError as e:
+        log_operation("video.download.proxy", status="error", video_id=video_id,
+                      error=f"HTTP {e.response.status_code if e.response is not None else '?'}")
         raise HTTPException(status_code=e.response.status_code, detail=f"Download failed: {e.response.status_code}")
     except Exception as e:
+        log_operation("video.download.proxy", status="error", video_id=video_id,
+                      error=str(e)[:300])
         raise HTTPException(status_code=500, detail=str(e))
 
 

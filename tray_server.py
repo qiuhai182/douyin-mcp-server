@@ -64,6 +64,15 @@ import pystray  # noqa: E402
 import uvicorn  # noqa: E402
 from PIL import Image, ImageDraw  # noqa: E402
 
+# 进程启停也要进 operation_logs；日志模块不可用时降级为 no-op，
+# 绝不能让托盘因日志依赖起不来。
+sys.path.insert(0, str(ROOT / "douyin-video" / "scripts"))
+try:
+    from operation_logger import log_operation as _oplog  # noqa: E402
+except Exception:  # pragma: no cover
+    def _oplog(*_a, **_k):  # type: ignore
+        pass
+
 
 _SESSION = requests.Session()
 _SESSION.trust_env = False  # never route localhost checks through a proxy
@@ -204,8 +213,13 @@ def main():
         return
 
     if not _port_free():
+        _oplog("service.start", status="error", pid=os.getpid(), port=PORT,
+               error="端口被其它程序占用")
         _fatal(f"端口 {PORT} 被其它程序占用，且不是本服务的响应。")
         return
+
+    # service.start 由 web/app.py 的 startup 钩子统一落（带 requeued 等读数），
+    # 这里不再重复记一条。
 
     webapp = _load_webapp()
     config = uvicorn.Config(webapp.app, host=HOST, port=PORT, log_level="info")
@@ -227,6 +241,7 @@ def main():
         return
 
     def _quit(icon=None, item=None):
+        _oplog("service.stop", status="ok", pid=os.getpid(), source="tray")
         server.should_exit = True
         server_thread.join(timeout=10)
         icon.stop()

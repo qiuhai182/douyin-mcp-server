@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "tasks": {
+    "refresh": {
+      "label": "全量 UP 拉新",
+      "enabled": true,
+      "time": "03:00",
+      "weekdays": [],
+      "interval_days": 1,
+      "task_name": "DouyinRefreshDaily",
+      "script": "scripts/scheduled_refresh.py",
+      "arguments": "--once --retry-on-skip",
+      "workers": 3,
+      "force": false
+    },
+    "absorb": {
+      "label": "全量整理＋吸收",
+      "enabled": true,
+      "time": "05:00",
+      "weekdays": [],
+      "interval_days": 1,
+      "task_name": "DouyinAbsorbDaily",
+      "script": "scripts/scheduled_absorb.py",
+      "arguments": "--once --retry-on-skip"
+    }
+  }
+}
